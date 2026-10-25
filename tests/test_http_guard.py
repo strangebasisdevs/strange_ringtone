@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 import threading
+import time
 import unittest
 
 import helpers  # noqa: F401  (puts core/ on sys.path)
@@ -373,6 +374,32 @@ class RateLimiterTest(unittest.TestCase):
             thread.join()
         self.assertEqual(results.count(True), 50)
         self.assertEqual(len(results), 160)
+
+    def test_check_and_count_happen_under_one_lock(self) -> None:
+        # The race the lock prevents sits between "is there room?" and "count
+        # this call", which the GIL alone rarely splits. `len(stamps) < limit`
+        # calls the subclass's reflected __gt__ first, so this limit hands the
+        # GIL to the other threads right inside that window.
+        class SlowLimit(int):
+            def __gt__(self, other: int) -> bool:
+                time.sleep(0.01)
+                return int.__gt__(self, other)
+
+        limiter = RateLimiter(SlowLimit(3), clock=FakeClock())
+        barrier = threading.Barrier(8)
+        results: list[bool] = []
+
+        def call() -> None:
+            barrier.wait(5)
+            results.append(limiter.allow("shared")[0])
+
+        threads = [threading.Thread(target=call) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(results.count(True), 3)
+        self.assertEqual(len(results), 8)
 
     def test_has_room_answers_like_allow_without_counting(self) -> None:
         # The server asks before the concurrency gate and counts only after
