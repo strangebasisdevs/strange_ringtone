@@ -24,7 +24,7 @@ import helpers  # noqa: F401  (puts core/ on sys.path)
 from strange_ringtone import static
 from strange_ringtone.config import Settings
 from strange_ringtone.http_guard import GuardError
-from strange_ringtone.server import Handler, RingtoneServer
+from strange_ringtone.server import CHUNK_BYTES, Handler, RingtoneServer
 
 ORIGIN = "https://example.internal"
 DEADLINE = 5.0
@@ -875,6 +875,45 @@ class BodyTest(ServerTestCase):
         self.assertEqual(hook.calls, [])
         self.wait_for_log("POST /api/render 400")
         self.assertScratchEmpty()
+
+    def test_body_is_streamed_in_bounded_reads(self) -> None:
+        reads: list[int] = []
+        original_setup = Handler.setup
+
+        class ReadSpy:
+            def __init__(self, inner: Any) -> None:
+                self._inner = inner
+
+            def read(self, size: int = -1) -> bytes:
+                reads.append(size)
+                return self._inner.read(size)
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._inner, name)
+
+        def spying_setup(handler: Handler) -> None:
+            original_setup(handler)
+            handler.rfile = ReadSpy(handler.rfile)
+
+        hook = RenderHook()
+        with mock.patch.object(Handler, "setup", spying_setup):
+            self.start(render_hook=hook, max_clip_seconds=2)
+            body = os.urandom(3 * CHUNK_BYTES + 123)
+            response = self.post_render(self.render_headers(len(body)), body)
+        self.assertEqual(response.status, 200, response.body)
+        self.assertEqual(hook.calls[0][2], body)
+        # Never the whole body at once, and never more than one chunk per read.
+        self.assertGreaterEqual(len(reads), 4)
+        self.assertTrue(all(0 < size <= CHUNK_BYTES for size in reads), reads)
+        self.wait_for_log("POST /api/render 200")
+        self.assertScratchEmpty()
+
+    def test_handler_has_a_finite_socket_timeout(self) -> None:
+        # At this layer the socket timeout is the only thing that ends a
+        # stalled body read; test_stalled_body_times_out patches it shorter.
+        self.assertIsNotNone(Handler.timeout)
+        self.assertGreater(Handler.timeout, 0)
+        self.assertLessEqual(Handler.timeout, 60)
 
     def test_stalled_body_times_out(self) -> None:
         hook = RenderHook()
