@@ -43,6 +43,12 @@ WAV_TYPE = "audio/wav"
 # The body is copied to disk in pieces, so a 5.8 MB upload never sits in memory
 # whole and a read never asks for more than the declared length.
 CHUNK_BYTES = 65536
+# Wall-clock budget for receiving a whole body, counted from when it holds a
+# render slot. The socket timeout alone only bounds the gap between two reads,
+# so a client trickling one byte every few seconds could keep a slot for ever
+# and, with two connections, lock everyone else out of rendering. 60 s moves
+# the largest body (MAX_CLIP_SECONDS 40, about 7.7 MB) at roughly 1 Mbit/s.
+BODY_DEADLINE_SECONDS = 60
 IMMUTABLE = "public, max-age=31536000, immutable"
 NO_STORE = "no-store"
 # Caps what one log line can carry from a client-chosen path.
@@ -103,7 +109,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     # the checks have run.
     protocol_version = "HTTP/1.0"
     # Socket timeout for each read and write, so a client that stalls mid-body
-    # frees its worker. Slow-client defence beyond that is the proxy's job.
+    # frees its worker. BODY_DEADLINE_SECONDS bounds the whole body; other
+    # slow-client defence is the proxy's job.
     timeout = 30
     server_version = SERVER_NAME
     sys_version = ""
@@ -334,19 +341,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # A fresh directory per job, with names the server picked: nothing a
             # client sends ever becomes part of a path.
             job_dir = Path(tempfile.mkdtemp(prefix="job-", dir=settings.scratch_dir))
+            answer = b""
             try:
-                if self._receive_body(job_dir / "in.wav", length):
-                    answer: bytes | None = self._run_hook(job_dir)
-                else:
-                    answer = None
+                failure = self._receive_body(job_dir / "in.wav", length)
+                if failure is None:
+                    answer = self._run_hook(job_dir)
             finally:
                 shutil.rmtree(job_dir, ignore_errors=True)
         # Sent only now, after the job directory is gone and the slot is free:
         # a client that sends its next request as soon as it has read this
         # answer must not find its own render still holding the slot.
-        if answer is None:
+        if failure is not None:
             try:
-                self.send_json_error(400, "incomplete_body")
+                self.send_json_error(failure.status, failure.code)
             except OSError:
                 # The client is gone; there is nobody to tell.
                 pass
@@ -384,26 +391,46 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._status = None
         self._headers_buffer = []
 
-    def _receive_body(self, target: Path, length: int) -> bool:
-        """Stream exactly length body bytes into target; False if the body ends early."""
+    def _receive_body(self, target: Path, length: int) -> GuardError | None:
+        """Stream exactly length body bytes into target; the refusal if that fails."""
         remaining = length
-        # 'x': the file must not exist yet, in a directory created just now.
-        # The with-block closes the handle before the hook or the cleanup runs,
-        # because Windows can't delete a file that is still open.
-        with open(target, "xb") as out:
-            while remaining > 0:
-                try:
-                    # Never ask for more than is left: bytes past the declared
-                    # length are not part of this request and are never read.
-                    chunk = self.rfile.read(min(CHUNK_BYTES, remaining))
-                except OSError:
-                    # Includes the socket timeout of a stalled upload.
-                    return False
-                if not chunk:
-                    return False
-                out.write(chunk)
-                remaining -= len(chunk)
-        return True
+        deadline = time.monotonic() + BODY_DEADLINE_SECONDS
+        try:
+            # 'x': the file must not exist yet, in a directory created just now.
+            # The with-block closes the handle before the hook or the cleanup
+            # runs, because Windows can't delete a file that is still open.
+            with open(target, "xb") as out:
+                while remaining > 0:
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        return GuardError(408, "body_timeout")
+                    # No single wait may run past the deadline either.
+                    wait = min(self.timeout, left)
+                    self.connection.settimeout(wait)
+                    try:
+                        # read1 makes at most one recv. read() would loop until
+                        # it had the whole chunk, so a trickle of bytes could
+                        # keep one call alive past the deadline. Never ask for
+                        # more than is left: bytes past the declared length are
+                        # not part of this request and are never read.
+                        chunk = self.rfile.read1(min(CHUNK_BYTES, remaining))
+                    except TimeoutError:
+                        # Decided by which limit the wait had, not by the clock
+                        # afterwards, which a timer that fires early can fool.
+                        if wait < self.timeout:
+                            return GuardError(408, "body_timeout")
+                        # The socket timeout of a stalled upload.
+                        return GuardError(400, "incomplete_body")
+                    except OSError:
+                        return GuardError(400, "incomplete_body")
+                    if not chunk:
+                        return GuardError(400, "incomplete_body")
+                    out.write(chunk)
+                    remaining -= len(chunk)
+        finally:
+            # The answer is written with the usual per-write timeout.
+            self.connection.settimeout(self.timeout)
+        return None
 
 
 class RingtoneServer(http.server.ThreadingHTTPServer):

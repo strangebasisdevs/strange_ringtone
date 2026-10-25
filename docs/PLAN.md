@@ -477,7 +477,9 @@ going off-site.
   is the sanitised tone name, sent as `filename*` with an ASCII `filename`
   fallback (5.6).
 - **Process limits:** `python -I`. A fixed thread pool and global concurrency
-  caps. Body reads have socket timeouts. The proxy handles slow-client defence.
+  caps. Body reads have socket timeouts, and a whole body must arrive within
+  60 s of taking a render slot (408 otherwise), so a trickled upload can't hold
+  a slot indefinitely. The proxy handles slow-client defence beyond that.
 
 ## 9. Supply chain, CI and releases
 

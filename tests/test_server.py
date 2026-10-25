@@ -23,6 +23,7 @@ from unittest import mock
 
 import helpers  # noqa: F401  (puts core/ on sys.path)
 from strange_ringtone import __main__ as entry
+from strange_ringtone import server as server_module
 from strange_ringtone import static
 from strange_ringtone.config import Settings
 from strange_ringtone.http_guard import GuardError
@@ -181,6 +182,9 @@ class ServerTestCase(unittest.TestCase):
 
         wait_for(found, f"a log line starting {prefix!r}")
         return [line for line in self.log.lines() if line.startswith(prefix)]
+
+    def log_has(self, prefix: str) -> bool:
+        return any(line.startswith(prefix) for line in self.log.lines())
 
     # --- assertions ---------------------------------------------------------------
 
@@ -890,6 +894,10 @@ class BodyTest(ServerTestCase):
                 reads.append(size)
                 return self._inner.read(size)
 
+            def read1(self, size: int = -1) -> bytes:
+                reads.append(size)
+                return self._inner.read1(size)
+
             def __getattr__(self, name: str) -> Any:
                 return getattr(self._inner, name)
 
@@ -924,6 +932,45 @@ class BodyTest(ServerTestCase):
             with socket.create_connection(("127.0.0.1", self.port), timeout=DEADLINE) as sock:
                 sock.sendall(build_request("POST", "/api/render", self.render_headers(1000), b"x" * 10))
                 self.wait_for_log("POST /api/render 400")
+        self.assertEqual(hook.calls, [])
+        self.assertScratchEmpty()
+
+    def test_body_has_a_finite_overall_deadline(self) -> None:
+        self.assertGreater(server_module.BODY_DEADLINE_SECONDS, 0)
+        self.assertLessEqual(server_module.BODY_DEADLINE_SECONDS, 120)
+
+    def test_trickled_body_loses_its_slot_at_the_deadline(self) -> None:
+        # One byte at a time, each well inside the 30 s socket timeout: without
+        # an overall deadline this one request holds the only render slot for
+        # as long as the client keeps trickling.
+        hook = RenderHook()
+        with mock.patch.object(server_module, "BODY_DEADLINE_SECONDS", 0.5):
+            self.start(render_hook=hook, render_concurrency=1)
+            with socket.create_connection(("127.0.0.1", self.port), timeout=DEADLINE) as sock:
+                sock.sendall(build_request("POST", "/api/render", self.render_headers(1000), b"x"))
+                give_up = time.monotonic() + 3
+                while time.monotonic() < give_up and not self.log_has("POST /api/render 408"):
+                    try:
+                        sock.sendall(b"x")
+                    except OSError:
+                        break
+                    time.sleep(0.05)
+                self.wait_for_log("POST /api/render 408")
+            # The slot is free again for everyone else.
+            self.assertEqual(self.post_render(self.render_headers(4), b"RIFF").status, 200)
+        self.assertEqual(len(hook.calls), 1)
+        self.wait_for_log("POST /api/render 200")
+        self.assertScratchEmpty()
+
+    def test_body_deadline_answers_408(self) -> None:
+        hook = RenderHook()
+        with mock.patch.object(server_module, "BODY_DEADLINE_SECONDS", 0.3):
+            self.start(render_hook=hook)
+            data = build_request("POST", "/api/render", self.render_headers(1000), b"x" * 10)
+            # The client stops sending but keeps its side open to read the answer.
+            response = exchange(self.port, data)
+        assert response is not None
+        self.assertJsonError(response, 408, "body_timeout")
         self.assertEqual(hook.calls, [])
         self.assertScratchEmpty()
 
