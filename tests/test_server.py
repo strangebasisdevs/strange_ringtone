@@ -947,8 +947,11 @@ class BodyTest(ServerTestCase):
         with mock.patch.object(server_module, "BODY_DEADLINE_SECONDS", 0.5):
             self.start(render_hook=hook, render_concurrency=1)
             with socket.create_connection(("127.0.0.1", self.port), timeout=DEADLINE) as sock:
+                started = time.monotonic()
                 sock.sendall(build_request("POST", "/api/render", self.render_headers(1000), b"x"))
-                give_up = time.monotonic() + 3
+                # The client keeps trickling for 4 s, far past the deadline, so
+                # only the deadline can end this read early.
+                give_up = started + 4
                 while time.monotonic() < give_up and not self.log_has("POST /api/render 408"):
                     try:
                         sock.sendall(b"x")
@@ -956,11 +959,59 @@ class BodyTest(ServerTestCase):
                         break
                     time.sleep(0.05)
                 self.wait_for_log("POST /api/render 408")
+                self.assertLess(time.monotonic() - started, 0.5 + 1.5)
             # The slot is free again for everyone else.
             self.assertEqual(self.post_render(self.render_headers(4), b"RIFF").status, 200)
         self.assertEqual(len(hook.calls), 1)
         self.wait_for_log("POST /api/render 200")
         self.assertScratchEmpty()
+
+    def test_body_deadline_is_checked_before_every_read(self) -> None:
+        # Driven by a fake clock, so the order of checks is exact: each read
+        # takes 30 s, and the third read would start at the 60 s deadline.
+        now = [0.0]
+        timeouts: list[float] = []
+        reads: list[int] = []
+
+        class Clock:
+            @staticmethod
+            def monotonic() -> float:
+                return now[0]
+
+        class Connection:
+            @staticmethod
+            def settimeout(value: float) -> None:
+                timeouts.append(value)
+
+        class Body:
+            @staticmethod
+            def read1(size: int) -> bytes:
+                reads.append(size)
+                now[0] += 30
+                return b"x"
+
+            @staticmethod
+            def read(size: int = -1) -> bytes:
+                # read() loops until it has size bytes, so a trickle of bytes
+                # could keep one call alive past the deadline.
+                raise AssertionError("read() instead of read1()")
+
+        handler = Handler.__new__(Handler)
+        handler.connection = Connection()  # type: ignore[assignment]
+        handler.rfile = Body()  # type: ignore[assignment]
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            mock.patch.object(server_module, "time", Clock),
+            mock.patch.object(server_module, "BODY_DEADLINE_SECONDS", 60),
+        ):
+            failure = handler._receive_body(Path(temp) / "in.wav", 1000)
+            self.assertEqual(len(list(Path(temp).iterdir())), 1)
+        assert failure is not None
+        self.assertEqual((failure.status, failure.code), (408, "body_timeout"))
+        self.assertEqual(reads, [1000, 999])
+        # Every wait was positive and within the deadline, and the per-write
+        # timeout is back for the answer.
+        self.assertEqual(timeouts, [30, 30, Handler.timeout])
 
     def test_body_deadline_answers_408(self) -> None:
         hook = RenderHook()
