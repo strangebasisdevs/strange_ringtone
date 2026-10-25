@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -21,6 +22,7 @@ from typing import Any
 from unittest import mock
 
 import helpers  # noqa: F401  (puts core/ on sys.path)
+from strange_ringtone import __main__ as entry
 from strange_ringtone import static
 from strange_ringtone.config import Settings
 from strange_ringtone.http_guard import GuardError
@@ -951,14 +953,33 @@ class ScratchTest(ServerTestCase):
     def test_scratch_directory_is_owner_only(self) -> None:
         self.assertEqual(self.scratch.stat().st_mode & 0o777, 0o700)
 
-    @unittest.skipUnless(hasattr(os, "symlink") and sys.platform != "win32", "POSIX symlinks")
+    @unittest.skipUnless(hasattr(os, "getuid"), "POSIX permissions")
+    def test_an_existing_scratch_directory_is_made_owner_only(self) -> None:
+        # Created by someone else's umask, or loosened later: startup tightens it.
+        os.chmod(self.scratch, 0o777)
+        self.start()
+        self.assertEqual(self.scratch.stat().st_mode & 0o777, 0o700)
+
+    @unittest.skipUnless(hasattr(os, "getuid"), "POSIX ownership")
+    def test_scratch_directory_owned_by_another_user_is_refused(self) -> None:
+        other = os.lstat(self.scratch).st_uid + 1
+        with mock.patch("os.getuid", return_value=other):
+            with self.assertRaisesRegex(RuntimeError, "owned by another user"):
+                RingtoneServer(("127.0.0.1", 0), self.settings)
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlinks")
     def test_symlinked_scratch_directory_is_refused(self) -> None:
         target = self.temp / "elsewhere"
         target.mkdir()
         link = self.temp / "link"
-        link.symlink_to(target, target_is_directory=True)
-        with self.assertRaises(RuntimeError):
+        try:
+            link.symlink_to(target, target_is_directory=True)
+        except OSError:
+            # Windows allows symlinks only with Developer Mode or elevation.
+            self.skipTest("cannot create a symlink here")
+        with self.assertRaisesRegex(RuntimeError, "not a plain directory"):
             RingtoneServer(("127.0.0.1", 0), Settings(public_origin=ORIGIN, scratch_dir=link))
+        self.assertEqual(list(target.iterdir()), [])
 
 
 class WorkerCapTest(ServerTestCase):
@@ -1074,6 +1095,68 @@ class MainTest(unittest.TestCase):
         result = self.run_main(PUBLIC_ORIGIN=ORIGIN, MAX_CLIP_SECONDS="41")
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("MAX_CLIP_SECONDS", result.stderr)
+
+
+class SigtermTest(unittest.TestCase):
+    """As PID 1 in a container, a process with no SIGTERM handler ignores the signal."""
+
+    def setUp(self) -> None:
+        previous = signal.getsignal(signal.SIGTERM)
+        self.addCleanup(signal.signal, signal.SIGTERM, previous)
+
+    def test_sigterm_unwinds_serve_forever_and_closes_the_server(self) -> None:
+        closed: list[bool] = []
+
+        class FakeServer:
+            def __init__(self, address: tuple[str, int], settings: Settings) -> None:
+                pass
+
+            def serve_forever(self) -> None:
+                # What the interpreter does when the signal arrives.
+                handler = signal.getsignal(signal.SIGTERM)
+                assert callable(handler), handler
+                handler(signal.SIGTERM, None)
+
+            def server_close(self) -> None:
+                closed.append(True)
+
+        env = {name: value for name, value in os.environ.items() if name not in MainTest.CONTRACT}
+        env["PUBLIC_ORIGIN"] = ORIGIN
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(entry, "RingtoneServer", FakeServer), \
+                contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as raised:
+                entry.main(["--bind", "127.0.0.1"])
+        self.assertEqual(raised.exception.code, 0)
+        self.assertEqual(closed, [True])
+
+    @unittest.skipIf(sys.platform == "win32", "Windows has no catchable SIGTERM between processes")
+    def test_sigterm_stops_a_running_server_promptly(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            env = {name: value for name, value in os.environ.items() if name not in MainTest.CONTRACT}
+            # The default scratch path is under the temporary directory.
+            env.update(PUBLIC_ORIGIN=ORIGIN, TMPDIR=temp)
+            # Port 0 instead of the contract's 8080, so a busy port or a second
+            # test run can't collide; everything else is the real main().
+            code = ("import sys; sys.path.insert(0, sys.argv[1]); "
+                    "from strange_ringtone import __main__ as entry; entry.PORT = 0; "
+                    "sys.exit(entry.main(['--bind', '127.0.0.1']))")
+            process = subprocess.Popen(
+                [sys.executable, "-I", "-c", code, str(helpers.CORE)],
+                env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+            )
+            try:
+                assert process.stderr is not None
+                line = process.stderr.readline()
+                self.assertIn("listening on 127.0.0.1:", line)
+                process.send_signal(signal.SIGTERM)
+                self.assertEqual(process.wait(timeout=DEADLINE), 0)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+                if process.stderr is not None:
+                    process.stderr.close()
 
 
 class ServerBindTest(unittest.TestCase):
