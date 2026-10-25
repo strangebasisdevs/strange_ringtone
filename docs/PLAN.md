@@ -719,6 +719,13 @@ docs/PLAN.md
    vulnerability reporting in the repository settings.
 2. **Core server:** `/healthz`, headers, the Origin check, XFF and rate limits,
    static files and config, with tests.
+
+   From a checkout the server runs as `python -I core [--bind HOST]`, not
+   `python -I -m strange_ringtone`: `-I` keeps the current directory off
+   `sys.path`, so `-m` finds the package only where it is installed, while a
+   directory that Python runs is always on `sys.path`. `POST /api/render` ends
+   in 501 `render_unavailable` until milestone 3. How the image starts the
+   server is settled with the Dockerfile.
 3. **Render:** the minimal ffmpeg build, WAV validation, measure and render,
    results with TTL, the corpus, and the build-configuration tests.
 4. **Web app:** decode, waveform, selection, preview (fades and JS loudness),

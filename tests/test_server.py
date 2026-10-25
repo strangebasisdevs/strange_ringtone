@@ -1127,6 +1127,15 @@ class MainTest(unittest.TestCase):
             cwd=helpers.ROOT, env=env, capture_output=True, text=True, timeout=60,
         )
 
+    def test_docs_name_the_command_run_here(self) -> None:
+        # Under -I a checkout can't run `python -I -m strange_ringtone` (see
+        # core/__main__.py), so the README and the plan must name the form
+        # that these tests run, or a reader follows a command that never starts.
+        readme = (helpers.ROOT / "README.md").read_text(encoding="utf-8")
+        plan = (helpers.ROOT / "docs" / "PLAN.md").read_text(encoding="utf-8")
+        self.assertIn("python -I core --bind 127.0.0.1", readme)
+        self.assertIn("python -I core [--bind HOST]", plan)
+
     def test_missing_public_origin_refuses_to_start(self) -> None:
         result = self.run_main()
         self.assertEqual(result.returncode, 2, result.stderr)
