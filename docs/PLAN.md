@@ -665,7 +665,8 @@ LICENSE  README.md  SECURITY.md  CHANGELOG.md  CLAUDE.md  .env.example
 compose.example.yaml        # hardened example, ports only in a commented dev snippet
 core/
   Dockerfile  ffmpeg/{build.sh,VERSION,SHA256SUMS}
-  strange_ringtone/{config.py,server.py,http_guard.py,wav.py,render.py,names.py,results.py}
+  __main__.py               # checkout entry point: python -I core
+  strange_ringtone/{__main__.py,config.py,server.py,http_guard.py,static.py,wav.py,render.py,names.py,results.py}
   static/{index.html,app.js,waveform.js,loudness.js,suggest.js,share.js,style.css}
 fetcher/
   Dockerfile  requirements.in  requirements.txt
