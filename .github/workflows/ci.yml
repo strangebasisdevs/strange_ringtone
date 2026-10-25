@@ -47,26 +47,12 @@ jobs:
         # Stdlib only, so nothing to install. -I keeps the environment and user site out.
         run: python -I -m unittest discover --start-directory tests --verbose
 
-  semgrep:
-    name: Semgrep scan
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Install Semgrep
-        # Hashed lockfile, no resolver: every transitive dependency is pinned.
-        run: |
-          python -m pip install --disable-pip-version-check --require-hashes --no-deps --only-binary :all: -r .github/semgrep/requirements.txt
-
-      - name: Run Semgrep
-        run: semgrep scan --config p/default --error .
-
-  trivy:
-    name: Trivy and gitleaks scans
+  # Interim backstop. The organisation's security gate (security_gate.yml)
+  # only reports HIGH/CRITICAL secrets and doesn't read git history, while
+  # this repository's rules want any secret to fail the build. Delete this job
+  # once strange_security closes those gaps (docs/PLAN.md, 9.4).
+  secrets:
+    name: Secret scans (interim)
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -99,18 +85,6 @@ jobs:
           scan-type: fs
           scan-ref: .
           scanners: secret
-          format: table
-          exit-code: "1"
-          skip-setup-trivy: true
-
-      - name: Run Trivy vulnerability scan
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          scan-type: fs
-          scan-ref: .
-          scanners: vuln
-          severity: HIGH,CRITICAL
-          ignore-unfixed: true
           format: table
           exit-code: "1"
           skip-setup-trivy: true

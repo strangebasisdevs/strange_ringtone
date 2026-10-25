@@ -1,0 +1,27 @@
+name: Security gate
+
+# Semgrep and Trivy come from the organisation's shared security repository.
+# These are referenced at @main, the owner's explicit exception (2026-10-25) to
+# pinning by commit SHA. It applies only to strangebasisdevs-owned reusable
+# workflows, so fixes made there reach every repository at once (CLAUDE.md,
+# Supply chain). Gaps in those scans are tracked upstream (docs/PLAN.md, 9.4).
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+# security-events: write lets the shared workflows upload SARIF to code scanning.
+permissions:
+  actions: read
+  contents: read
+  security-events: write
+
+jobs:
+  semgrep:
+    name: Semgrep
+    uses: strangebasisdevs/strange_security/.github/workflows/semgrep.yml@main
+
+  trivy:
+    name: Trivy
+    uses: strangebasisdevs/strange_security/.github/workflows/trivy.yml@main

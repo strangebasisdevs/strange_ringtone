@@ -16,11 +16,11 @@ updates:
       prefix: chore
       include: scope
 
-  # Hashed pip-compile lockfiles (requirements.in -> requirements.txt) for the CI tools.
+  # The hashed pip-compile lockfile (requirements.in -> requirements.txt) for ruff.
+  # Semgrep and Trivy versions live in strange_security, whose own Dependabot
+  # keeps them current.
   - package-ecosystem: pip
-    directories:
-      - /.github/lint
-      - /.github/semgrep
+    directory: /.github/lint
     schedule:
       interval: weekly
       day: monday

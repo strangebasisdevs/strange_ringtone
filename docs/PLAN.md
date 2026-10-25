@@ -437,8 +437,14 @@ going off-site.
 
 - Every Action is pinned by full commit SHA with a `# vX.Y.Z` comment. Base
   images are pinned by digest. There is no `curl | sh`.
-- The core has no Python dependencies. The fetcher's yt-dlp lock and the dev
-  tools (ruff, semgrep) use hashed pip-tools locks.
+- **Exception (owner's decision, 2026-10-25):** reusable workflows owned by
+  `strangebasisdevs` are called at `@main`, so a fix in the organisation's
+  security repository reaches every repository at once. This applies only to
+  organisation-owned reusable workflows. Third-party actions stay SHA-pinned.
+  The cost: a change merged to `strange_security`'s `main` runs here without a
+  PR in this repository.
+- The core has no Python dependencies. The fetcher's yt-dlp lock and ruff use
+  hashed pip-tools locks. Semgrep and Trivy versions live in `strange_security`.
 - Dependabot covers `pip`, `github-actions` and `docker` for both Dockerfiles,
   with a 7-day cooldown.
 - `ffmpeg-watch.yml` runs weekly with `contents: read` and **fails** when a newer
@@ -446,17 +452,18 @@ going off-site.
   alert, so the job needs no issue-write permission. Bumping it means a PR that
   changes the version and SHA-256, with release notes reviewed.
 
-### 9.2 CI on every PR (`permissions: contents: read`)
+### 9.2 CI on every PR
+
+Local jobs run with `permissions: contents: read`:
 
 - ruff lint.
 - Unit tests.
 - A core image build and an integration test run inside it with
   `--network none` (the real ffmpeg, the corpus, and the build-configuration
-  checks).
-- Semgrep `p/default`.
-- A Trivy filesystem scan that fails on any secret or any HIGH or CRITICAL
-  finding.
-- A gitleaks history scan.
+  checks), from the render milestone on.
+- **Interim secret scans** (`ci.yml`, job `secrets`): a Trivy secret scan at
+  any severity and a gitleaks scan of the full history. They cover the gaps
+  listed in 9.4 and are deleted once strange_security closes them.
 - A **PR-title check** (conventional commits, so release-please works). It is a
   stdlib script that reads the title from an `env:` variable, never from inline
   `${{ }}`.
@@ -466,6 +473,13 @@ going off-site.
   `.release-please-manifest.json` records a released version. Before that, the
   contract is a draft and the check only reports. An unreadable manifest fails
   the check.
+
+The **organisation security gate** (`security_gate.yml`) calls
+`strangebasisdevs/strange_security`'s `semgrep.yml` and `trivy.yml` at `@main`.
+Its permissions are `actions: read`, `contents: read` and
+`security-events: write`; the shared workflows upload SARIF to code scanning,
+which needs the last of those. A PR from a fork gets a read-only token, so the
+SARIF upload fails there.
 
 No workflow uses `pull_request_target` or `workflow_run`.
 
@@ -495,6 +509,31 @@ No workflow uses `pull_request_target` or `workflow_run`.
   vulnerability reporting through GitHub Security Advisories) and `CHANGELOG.md`
   (maintained by release-please). Branch protection and tag rules are set by
   hand in the GitHub settings.
+
+### 9.4 Gaps tracked upstream in strange_security
+
+As of `strange_security` `main` at `4bca5bb` (2026-10-25), checked against this
+repository's rules:
+
+1. **Semgrep never fails the build.** `semgrep scan` runs without `--error`, so
+   findings only appear in code scanning. A code-scanning merge rule in the
+   branch ruleset could block on them in the meantime.
+2. **Trivy only reports HIGH and CRITICAL secrets.** `--severity HIGH,CRITICAL`
+   applies to the secret scanner too, and the brief wants any secret to fail.
+   This repository's interim `secrets` job covers it.
+3. **There is no git-history secret scan.** This repository's interim gitleaks
+   step covers it.
+4. **Suspected, not yet verified:** each shared workflow finds its own
+   repository and ref from `github.workflow_ref`. In a called workflow, the
+   `github` context belongs to the *caller*, so for external callers the
+   "shared workflow repository" checkout may fetch the caller instead and fail
+   to find the Dockerfile. strange_security's own gate calls the workflows
+   locally, which would hide this. The first gate run on this repository's PR #1
+   settles it.
+
+The owner wants these fixed in strange_security, the organisation's one-stop
+security repository, rather than duplicated here. When they are fixed, delete
+the interim `secrets` job and this list.
 
 ## 10. Tests (stdlib `unittest`)
 
@@ -590,8 +629,12 @@ docs/PLAN.md
    - README, CLAUDE.md, SECURITY.md and CHANGELOG.md
    - `.gitattributes` (LF) and `.gitignore`
    - Dependabot
-   - the CI skeleton: ruff, unit tests, Semgrep, the Trivy and gitleaks scans,
-     and the PR-title and contract-change checks with their tests
+   - the CI skeleton: ruff, unit tests, the organisation security gate, the
+     interim secret scans, and the PR-title and contract-change checks with
+     their tests
+
+   On 2026-10-25 the repository moved to the `strangebasisdevs` organisation,
+   and its security scanning moved to strange_security (sections 9.2 and 9.4).
 
    Docker and image jobs arrive with the first Dockerfile (Phase 3). Set the
    branch ruleset (required checks, squash-only), the tag rules and private

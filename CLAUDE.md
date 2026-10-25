@@ -79,9 +79,9 @@ ruff check .                                   # ruff from .github/lint/requirem
 python -I tools/spike/phase0.py                # regenerate the iOS test tones into spike-out/ (needs local ffmpeg)
 ```
 
-To recompile a CI tool's lock (`.github/lint` or `.github/semgrep`), edit its
-`requirements.in`, then run the command below in Git Bash from the repository
-root. It uses the Python of the CI runner, 3.12.
+To recompile ruff's lock, edit `.github/lint/requirements.in`, then run the
+command below in Git Bash from the repository root. It uses the Python of the CI
+runner, 3.12.
 
 ```bash
 MSYS_NO_PATHCONV=1 docker run --rm -v "$(cygpath -w "$PWD/.github/lint"):/work" -w /work python:3.12-slim sh -c 'pip install -q pip-tools==7.5.3 && pip-compile --generate-hashes --strip-extras --output-file=requirements.txt requirements.in'
@@ -96,14 +96,26 @@ starts enforcing once `.release-please-manifest.json` records a release.
 - Pin Actions by full commit SHA with a `# vX.Y.Z` comment, and base images by
   digest. No `curl | sh`. Dependabot covers pip, github-actions and docker,
   with a 7-day cooldown.
+- **Exception, the owner's decision on 2026-10-25:** reusable workflows owned by
+  the `strangebasisdevs` organisation are called at `@main`, for example
+  `strangebasisdevs/strange_security/.github/workflows/semgrep.yml@main`. This
+  covers organisation-owned reusable workflows only. Every third-party action
+  stays SHA-pinned.
+- **Security scanning belongs to `strangebasisdevs/strange_security`,** the
+  organisation's one-stop security repository. `security_gate.yml` calls its
+  Semgrep and Trivy workflows. Fix gaps in those scans there, not with local
+  copies. The one exception is the interim `secrets` job in `ci.yml` (Trivy at
+  any severity, plus gitleaks over the history). It stays until
+  strange_security covers both, and then it is deleted. See `docs/PLAN.md`,
+  section 9.4.
 - Workflows default to `contents: read`. Never use `pull_request_target` or
   `workflow_run` with secrets. Write scopes exist only in the release-please and
-  publish jobs.
+  publish jobs, plus `security-events: write` in the security gate, which the
+  shared workflows need to upload SARIF.
 - Every PR runs ruff, the tests (including an in-image run with
-  `--network none`), Semgrep `p/default`, the Trivy fs scan (failing on any
-  secret or any HIGH or CRITICAL finding), gitleaks, the PR-title check and the
-  contract-change check. Releases also scan the image and publish provenance
-  and an SBOM.
+  `--network none`, once the image exists), the organisation security gate, the
+  interim secret scans, the PR-title check and the contract-change check.
+  Releases also scan the image and publish provenance and an SBOM.
 
 ## Local machine
 
