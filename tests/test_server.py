@@ -907,6 +907,21 @@ class BodyTest(ServerTestCase):
         self.wait_for_log("POST /api/render 422")
         self.assertScratchEmpty()
 
+    def test_hook_guard_error_after_starting_a_response_replaces_it(self) -> None:
+        # The begun 200 is dropped whole: the client gets the refusal with the
+        # full header set, and the log records the refusal, not the 200.
+        def refuse_halfway(job_dir: Path, handler: Handler) -> None:
+            handler.send_json(200, {"partial": 1})
+            raise GuardError(422, "bad_wav")
+
+        self.start(render_hook=RenderHook(refuse_halfway))
+        response = self.post_render(self.render_headers(4), b"RIFF")
+        self.assertJsonError(response, 422, "bad_wav")
+        self.assertNotIn(b"partial", response.body)
+        self.wait_for_log("POST /api/render 422")
+        self.assertFalse(self.log_has("POST /api/render 200"))
+        self.assertScratchEmpty()
+
     def test_upload_never_writes_through_a_file_already_at_its_name(self) -> None:
         # in.wav is opened with exclusive create. Here a hard link to a file
         # outside scratch already sits at that name: writing through it would
