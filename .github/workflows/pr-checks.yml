@@ -1,0 +1,61 @@
+name: PR checks
+
+# Separate from CI so that editing a PR's title or body re-runs only these
+# metadata checks. Plain pull_request (never pull_request_target): a fork's PR
+# gets a read-only token and no secrets.
+on:
+  pull_request:
+    types:
+      - opened
+      - edited
+      - reopened
+      - synchronize
+
+permissions:
+  contents: read
+
+jobs:
+  title:
+    name: Conventional PR title
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check the PR title
+        env:
+          # Through the environment, never ${{ }} inside the script: a crafted
+          # title would otherwise become shell code.
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: python -I scripts/check_pr_title.py
+
+  contract:
+    name: Deployment contract change
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The base branch's README is read from history.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Extract the base branch's README
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          if git cat-file -e "origin/${BASE_REF}:README.md" 2>/dev/null; then
+            git show "origin/${BASE_REF}:README.md" > "$RUNNER_TEMP/base-README.md"
+          else
+            : > "$RUNNER_TEMP/base-README.md"
+          fi
+
+      - name: Check the contract section
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: python -I scripts/check_contract_change.py "$RUNNER_TEMP/base-README.md" README.md .release-please-manifest.json
