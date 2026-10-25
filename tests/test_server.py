@@ -1558,6 +1558,30 @@ class ServerBindTest(unittest.TestCase):
             finally:
                 server.server_close()
 
+    def test_ipv6_literal_binds_an_ipv6_socket(self) -> None:
+        # --bind takes IPv6 literals too, and those need an AF_INET6 socket.
+        try:
+            with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as probe:
+                probe.bind(("::1", 0))
+        except OSError:
+            self.skipTest("no IPv6 loopback here")
+        with tempfile.TemporaryDirectory() as temp, contextlib.redirect_stderr(io.StringIO()):
+            settings = Settings(public_origin=ORIGIN, scratch_dir=Path(temp) / "scratch")
+            server = _TestServer(("::1", 0), settings)
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+            thread.start()
+            try:
+                self.assertEqual(server.address_family, socket.AF_INET6)
+                connection = http.client.HTTPConnection("::1", server.server_address[1], timeout=DEADLINE)
+                try:
+                    connection.request("GET", "/healthz")
+                    response = connection.getresponse()
+                    self.assertEqual((response.status, response.read()), (200, b""))
+                finally:
+                    connection.close()
+            finally:
+                ServerTestCase._stop(server, thread)
+
 
 if __name__ == "__main__":
     unittest.main()
