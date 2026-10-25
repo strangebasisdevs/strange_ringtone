@@ -465,7 +465,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 class RingtoneServer(http.server.ThreadingHTTPServer):
     # Worker threads never keep the process alive, and stopping does not wait
     # for them: the container must stop promptly on SIGTERM, and scratch is
-    # cleared at the next start anyway.
+    # cleared at the next start anyway. daemon_threads is what does it: the
+    # stdlib never records daemon threads to join, so block_on_close = False
+    # changes nothing today and only states the intent if that ever changes.
     daemon_threads = True
     block_on_close = False
     # On Windows SO_REUSEADDR lets a second process bind the same port and take

@@ -1582,6 +1582,42 @@ class ServerBindTest(unittest.TestCase):
             finally:
                 ServerTestCase._stop(server, thread)
 
+    def test_a_stalled_connection_does_not_delay_stopping(self) -> None:
+        # Handler threads are daemons and server_close() does not join them:
+        # a client that sent half a request (its worker waits up to the 30 s
+        # socket timeout) must not hold up a container that was told to stop.
+        code = (
+            "import pathlib, socket, sys, threading, time; sys.path.insert(0, sys.argv[1]); "
+            "from strange_ringtone.config import Settings; "
+            "from strange_ringtone.server import RingtoneServer; "
+            "settings = Settings(public_origin=sys.argv[3], scratch_dir=pathlib.Path(sys.argv[2])); "
+            "server = RingtoneServer(('127.0.0.1', 0), settings); "
+            "threading.Thread(target=server.serve_forever, daemon=True).start(); "
+            "before = threading.active_count(); "
+            "stalled = socket.create_connection(server.server_address[:2]); "
+            "stalled.sendall(b'GET /healthz HTTP/1.1\\r\\n'); "
+            "deadline = time.monotonic() + 5\n"
+            "while threading.active_count() == before and time.monotonic() < deadline: time.sleep(0.01)\n"
+            "assert threading.active_count() > before, 'no worker started'; "
+            "server.shutdown(); started = time.monotonic(); server.server_close(); "
+            "print('closed in %.3f' % (time.monotonic() - started), flush=True)"
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            started = time.monotonic()
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-I", "-c", code, str(helpers.CORE), str(Path(temp) / "scratch"), ORIGIN],
+                    capture_output=True, text=True, timeout=10,
+                )
+            except subprocess.TimeoutExpired:
+                self.fail("the process waited for the stalled connection's worker")
+            elapsed = time.monotonic() - started
+        self.assertEqual(result.returncode, 0, result.stderr)
+        match = re.fullmatch(r"closed in ([0-9.]+)\n", result.stdout)
+        assert match is not None, result.stdout
+        self.assertLess(float(match.group(1)), 2.0)
+        self.assertLess(elapsed, 10.0)
+
 
 if __name__ == "__main__":
     unittest.main()
