@@ -1192,6 +1192,27 @@ class ScratchTest(ServerTestCase):
             RingtoneServer(("127.0.0.1", 0), Settings(public_origin=ORIGIN, scratch_dir=link))
         self.assertEqual(list(target.iterdir()), [])
 
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlinks")
+    def test_startup_removes_planted_symlinks_without_following_them(self) -> None:
+        # A link inside scratch is removed as a link: its target, outside
+        # scratch, is neither emptied nor left reachable from scratch.
+        outside_dir = self.temp / "outside"
+        outside_dir.mkdir()
+        (outside_dir / "keep").write_bytes(b"keep")
+        outside_file = self.temp / "outside.wav"
+        outside_file.write_bytes(b"keep")
+        try:
+            (self.scratch / "planted").symlink_to(outside_dir, target_is_directory=True)
+            (self.scratch / "planted.wav").symlink_to(outside_file)
+        except OSError:
+            # Windows allows symlinks only with Developer Mode or elevation.
+            self.skipTest("cannot create a symlink here")
+        self.start()
+        self.assertScratchEmpty()
+        self.assertEqual(sorted(p.name for p in outside_dir.iterdir()), ["keep"])
+        self.assertEqual((outside_dir / "keep").read_bytes(), b"keep")
+        self.assertEqual(outside_file.read_bytes(), b"keep")
+
 
 class WorkerCapTest(ServerTestCase):
     server_class = _CappedServer
