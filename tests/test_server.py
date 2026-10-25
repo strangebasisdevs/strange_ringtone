@@ -418,6 +418,13 @@ class StaticTest(ServerTestCase):
             "/strange_ringtone/server.py",
             "http://example.internal/static/dev/app.js",
             "*",
+            # The stdlib collapses leading slashes and splits the request line on
+            # any whitespace, so these reach the handler as "/static/dev/app.js".
+            "//static/dev/app.js",
+            "///static/dev/app.js",
+            "/static/dev/app.js",
+            "/static/dev/app.js ",
+            "/static/dev/app.js",
         ]
         for path in paths:
             with self.subTest(path):
@@ -447,6 +454,18 @@ class StaticTest(ServerTestCase):
         self.assertIsNone(files.get("nope.js"))
         self.assertIsNone(files.get("../static/app.js"))
         self.assertIsNotNone(files.get("app.js"))
+
+    def test_routing_never_trusts_a_rewritten_or_double_slash_target(self) -> None:
+        # Called directly, so the "//" refusal is pinned even on a stdlib that
+        # no longer collapses leading slashes before the handler sees them.
+        def route(requestline: str, path: str) -> str | None:
+            return Handler._route_path(mock.Mock(requestline=requestline, path=path))
+
+        self.assertEqual(route("GET /static/dev/app.js HTTP/1.1", "/static/dev/app.js"), "/static/dev/app.js")
+        self.assertIsNone(route("GET //static/dev/app.js HTTP/1.1", "//static/dev/app.js"))
+        self.assertIsNone(route("GET //static/dev/app.js HTTP/1.1", "/static/dev/app.js"))
+        self.assertIsNone(route("GET /static/dev/app.js\x0b HTTP/1.1", "/static/dev/app.js"))
+        self.assertIsNone(route("GET  /static/dev/app.js HTTP/1.1", "/static/dev/app.js"))
 
 
 class MethodTest(ServerTestCase):
@@ -617,6 +636,15 @@ class LengthTest(ServerTestCase):
 class CheckOrderTest(ServerTestCase):
     def test_path_before_origin(self) -> None:
         self.assertJsonError(self.post_render([("Content-Length", "4")], path="/api/nope"), 404, "not_found")
+
+    def test_aliases_of_the_render_path_are_not_found(self) -> None:
+        hook = RenderHook()
+        self.start(render_hook=hook)
+        for path in ("//api/render", "/api/render", "/api/render "):
+            with self.subTest(path):
+                self.assertJsonError(self.post_render(self.render_headers(4), b"RIFF", path=path), 404, "not_found")
+        self.assertEqual(hook.calls, [])
+        self.assertScratchEmpty()
 
     def test_origin_before_content_type_and_length(self) -> None:
         headers = [("Origin", "https://other.example.internal"), ("Content-Type", "text/plain"),

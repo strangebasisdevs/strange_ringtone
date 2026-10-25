@@ -231,6 +231,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # variants simply match no route.
         if not self.path.startswith("/"):
             return None
+        # The stdlib rewrites the target before it reaches self.path: it splits
+        # the request line on any whitespace (so a trailing \x0b or \xa0
+        # vanishes) and collapses leading slashes (gh-87389). Route only a
+        # target that is exactly what the client sent between single spaces,
+        # so no alias of a route is ever served. "//" stays refused even if a
+        # stdlib stops collapsing it, because urlsplit would read the first
+        # segment as a host and route what follows.
+        fields = self.requestline.split(" ")
+        if len(fields) != 3 or fields[1] != self.path or self.path.startswith("//"):
+            return None
         try:
             return urlsplit(self.path).path
         except ValueError:
