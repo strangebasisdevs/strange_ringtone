@@ -996,6 +996,25 @@ class ScratchTest(ServerTestCase):
         self.start()
         self.assertScratchEmpty()
 
+    def test_scratch_directory_removed_while_running_answers_500(self) -> None:
+        # Not recreated: whatever removed it could have left something in its
+        # place, and the checks that make it safe run only at startup.
+        hook = RenderHook()
+        self.start(render_hook=hook, render_concurrency=1)
+        shutil.rmtree(self.scratch)
+        for _ in range(2):
+            response = self.post_render(self.render_headers(4), b"RIFF")
+            self.assertJsonError(response, 500, "internal_error")
+        self.assertEqual(hook.calls, [])
+        self.assertFalse(self.scratch.exists())
+        self.wait_for_log("POST /api/render 500", count=2)
+        self.assertNotIn("error while handling a request", self.log.getvalue())
+        # The render slot was given back each time.
+        self.scratch.mkdir()
+        self.assertEqual(self.post_render(self.render_headers(4), b"RIFF").status, 200)
+        self.wait_for_log("POST /api/render 200")
+        self.assertScratchEmpty()
+
     def test_missing_parent_is_refused_not_created(self) -> None:
         # Without the /tmp tmpfs the core must not create /tmp on the root
         # filesystem and write uploads there.

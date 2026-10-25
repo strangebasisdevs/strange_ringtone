@@ -346,7 +346,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         with self.server.gate.slot():
             # A fresh directory per job, with names the server picked: nothing a
             # client sends ever becomes part of a path.
-            job_dir = Path(tempfile.mkdtemp(prefix="job-", dir=settings.scratch_dir))
+            try:
+                job_dir = Path(tempfile.mkdtemp(prefix="job-", dir=settings.scratch_dir))
+            except OSError:
+                # The scratch directory is gone or full. It is not recreated
+                # here: the checks that make it safe to use run only at
+                # startup. Every render fails, with the usual headers, until
+                # a restart.
+                raise GuardError(500, "internal_error") from None
             answer = b""
             try:
                 failure = self._receive_body(job_dir / "in.wav", length)
