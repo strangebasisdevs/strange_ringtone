@@ -78,7 +78,13 @@ def _log_path(raw: str) -> str:
 
 def _prepare_scratch(directory: Path) -> None:
     """Create the scratch directory owner-only and empty it."""
-    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        # No parents: if /tmp itself is missing, the container lacks the tmpfs
+        # the contract requires, and creating /tmp would write to the root
+        # filesystem instead. Refusing to start says so plainly.
+        directory.mkdir(mode=0o700, exist_ok=True)
+    except OSError as error:
+        raise RuntimeError(f"cannot create the scratch directory {directory}: {error.strerror}") from error
     info = os.lstat(directory)
     # Outside the container the default lives in a shared /tmp, where another
     # user could have planted a symlink or a directory of their own to collect

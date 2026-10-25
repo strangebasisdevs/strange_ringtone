@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import ipaddress
+import os
 import re
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import helpers  # puts core/ on sys.path
 from strange_ringtone import config
@@ -34,7 +37,7 @@ class DefaultsTest(unittest.TestCase):
         self.assertIs(settings.fetch_enabled, False)
         self.assertEqual(settings.source_url, config.DEFAULT_SOURCE_URL)
         self.assertEqual(settings.version, "dev")
-        self.assertEqual(settings.scratch_dir, Path(tempfile.gettempdir()) / "strange_ringtone")
+        self.assertEqual(settings.scratch_dir, config._default_scratch_dir())
 
     def test_direct_construction_uses_the_same_defaults(self) -> None:
         # Server tests build Settings directly; their defaults must match from_env's.
@@ -52,6 +55,24 @@ class DefaultsTest(unittest.TestCase):
         # The writable paths are part of the contract, not an operator choice.
         settings = from_env(SCRATCH_DIR="/srv", TMPDIR_OVERRIDE="/srv")
         self.assertEqual(settings.scratch_dir, Settings(public_origin=ORIGIN).scratch_dir)
+
+    def test_scratch_dir_is_fixed_under_tmp(self) -> None:
+        # The contract makes /tmp the only writable path. tempfile.gettempdir()
+        # would follow TMPDIR, or fall back to the working directory when /tmp
+        # is not writable, so it must not be consulted at all.
+        self.assertEqual(config.SCRATCH_DIR.as_posix(), "/tmp/strange_ringtone")
+        with (
+            mock.patch.object(config, "_WINDOWS", False),
+            mock.patch.object(tempfile, "gettempdir", side_effect=AssertionError("gettempdir called")),
+            mock.patch.dict(os.environ, {"TMPDIR": "/srv", "TEMP": "/srv", "TMP": "/srv"}),
+        ):
+            self.assertEqual(Settings(public_origin=ORIGIN).scratch_dir, config.SCRATCH_DIR)
+            self.assertEqual(from_env(TMPDIR="/srv").scratch_dir, config.SCRATCH_DIR)
+
+    @unittest.skipIf(sys.platform == "win32", "Windows checkouts use the user's temporary directory")
+    def test_scratch_dir_ignores_tmpdir_here(self) -> None:
+        with mock.patch.dict(os.environ, {"TMPDIR": "/srv"}), mock.patch.object(tempfile, "tempdir", None):
+            self.assertEqual(Settings(public_origin=ORIGIN).scratch_dir, Path("/tmp/strange_ringtone"))
 
     def test_settings_are_frozen(self) -> None:
         settings = Settings(public_origin=ORIGIN)

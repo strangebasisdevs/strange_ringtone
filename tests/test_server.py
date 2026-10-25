@@ -996,6 +996,14 @@ class ScratchTest(ServerTestCase):
         self.start()
         self.assertScratchEmpty()
 
+    def test_missing_parent_is_refused_not_created(self) -> None:
+        # Without the /tmp tmpfs the core must not create /tmp on the root
+        # filesystem and write uploads there.
+        parent = self.temp / "no-tmpfs"
+        with self.assertRaisesRegex(RuntimeError, "cannot create the scratch directory"):
+            RingtoneServer(("127.0.0.1", 0), Settings(public_origin=ORIGIN, scratch_dir=parent / "scratch"))
+        self.assertFalse(parent.exists())
+
     @unittest.skipUnless(hasattr(os, "getuid"), "POSIX permissions")
     def test_scratch_directory_is_owner_only(self) -> None:
         self.assertEqual(self.scratch.stat().st_mode & 0o777, 0o700)
@@ -1190,15 +1198,16 @@ class SigtermTest(unittest.TestCase):
     def test_sigterm_stops_a_running_server_promptly(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             env = {name: value for name, value in os.environ.items() if name not in MainTest.CONTRACT}
-            # The default scratch path is under the temporary directory.
-            env.update(PUBLIC_ORIGIN=ORIGIN, TMPDIR=temp)
+            env.update(PUBLIC_ORIGIN=ORIGIN)
             # Port 0 instead of the contract's 8080, so a busy port or a second
-            # test run can't collide; everything else is the real main().
-            code = ("import sys; sys.path.insert(0, sys.argv[1]); "
-                    "from strange_ringtone import __main__ as entry; entry.PORT = 0; "
+            # test run can't collide, and a scratch directory of the test's own
+            # instead of the shared /tmp one; everything else is the real main().
+            code = ("import pathlib, sys; sys.path.insert(0, sys.argv[1]); "
+                    "from strange_ringtone import __main__ as entry, config; entry.PORT = 0; "
+                    "config.SCRATCH_DIR = pathlib.Path(sys.argv[2]); "
                     "sys.exit(entry.main(['--bind', '127.0.0.1']))")
             process = subprocess.Popen(
-                [sys.executable, "-I", "-c", code, str(helpers.CORE)],
+                [sys.executable, "-I", "-c", code, str(helpers.CORE), str(Path(temp) / "scratch")],
                 env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
             )
             try:

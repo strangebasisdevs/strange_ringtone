@@ -79,6 +79,9 @@ PUBLIC_ORIGIN=http://127.0.0.1:8080 python -I core --bind 127.0.0.1
 
 The other settings in [.env.example](.env.example) are read from the
 environment the same way, and an invalid value stops the server at startup.
+Uploads are written only under `/tmp/strange_ringtone` (on Windows, which is
+for development only, under the user's temporary directory); `TMPDIR` does
+not move it.
 Without `--bind` the server listens on `0.0.0.0:8080`, which is meant for the
 container; don't expose it on your LAN. The command passes the `core`
 directory rather than `-m strange_ringtone`: `-I` leaves the current directory

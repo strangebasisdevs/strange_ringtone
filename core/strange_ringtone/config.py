@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
+import sys
 import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -43,11 +44,22 @@ class ConfigError(ValueError):
     """A setting is missing or invalid; the server must not start."""
 
 
+# In the image /tmp is the only writable path (a tmpfs), so the scratch
+# directory lives under it. It is fixed, not taken from tempfile.gettempdir():
+# that reads TMPDIR, TEMP and TMP even under -I, and falls back to /var/tmp,
+# /usr/tmp and then the working directory when /tmp is not writable, so uploads
+# could land on a path the deployment contract never made writable. Nor is it
+# an environment variable: the writable paths are part of the contract.
+SCRATCH_DIR = Path("/tmp/strange_ringtone")
+# Windows has no /tmp. It is a development platform only, never a deployment
+# target, so a checkout there uses the user's temporary directory.
+_WINDOWS = sys.platform == "win32"
+
+
 def _default_scratch_dir() -> Path:
-    # In the image /tmp is the only writable path (a tmpfs), so the scratch
-    # directory lives under it. It is not an environment variable on purpose:
-    # the writable paths are part of the deployment contract.
-    return Path(tempfile.gettempdir()) / "strange_ringtone"
+    if _WINDOWS:
+        return Path(tempfile.gettempdir()) / "strange_ringtone"
+    return SCRATCH_DIR
 
 
 @dataclass(frozen=True)
