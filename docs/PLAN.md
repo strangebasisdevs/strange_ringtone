@@ -523,13 +523,14 @@ repository's rules:
    This repository's interim `secrets` job covers it.
 3. **There is no git-history secret scan.** This repository's interim gitleaks
    step covers it.
-4. **Suspected, not yet verified:** each shared workflow finds its own
-   repository and ref from `github.workflow_ref`. In a called workflow, the
-   `github` context belongs to the *caller*, so for external callers the
-   "shared workflow repository" checkout may fetch the caller instead and fail
-   to find the Dockerfile. strange_security's own gate calls the workflows
-   locally, which would hide this. The first gate run on this repository's PR #1
-   settles it.
+4. **The gate breaks for every external caller (confirmed 2026-10-25).** Each
+   shared workflow finds its own repository and ref from `github.workflow_ref`.
+   In a called workflow, the `github` context belongs to the *caller*. The
+   "shared workflow repository" checkout therefore fetched
+   `strangebasisdevs/strange_ringtone` at `refs/pull/1/merge`, and the image
+   build failed on a missing `.strange-security/.github/docker` (PR #1, Actions
+   run 40170938163). strange_security's own gate calls the workflows locally,
+   which hides the bug. Until it is fixed, both gate jobs fail here.
 
 The owner wants these fixed in strange_security, the organisation's one-stop
 security repository, rather than duplicated here. When they are fixed, delete
