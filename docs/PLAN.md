@@ -466,7 +466,12 @@ going off-site.
   - `Cross-Origin-Opener-Policy` and `-Resource-Policy: same-origin`.
   - A `Permissions-Policy` that denies camera, microphone, geolocation, payment
     and USB.
-  - HSTS when `PUBLIC_ORIGIN` is https.
+  - `Strict-Transport-Security: max-age=63072000; includeSubDomains` when
+    `PUBLIC_ORIGIN` is https, and none for http. Two years is the common
+    preload-grade value. The cost of `includeSubDomains`: browsers then insist
+    on HTTPS for every subdomain of the `PUBLIC_ORIGIN` host as well, so serve
+    the app on a host of its own rather than on a domain whose other hosts
+    lack TLS.
 - **CSRF:** every state change is a POST, and each requires exactly one `Origin`
   equal to `PUBLIC_ORIGIN` (no `Referer` fallback). Request bodies are
   `audio/wav` or `application/json` only.

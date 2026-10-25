@@ -60,6 +60,12 @@ class SecurityHeadersTest(unittest.TestCase):
     def test_http_origin_gets_the_set_without_hsts(self) -> None:
         self.assertEqual(sorted(http_guard.security_headers("http://ringtones.example.internal")), sorted(self.BASE))
 
+    def test_plan_records_the_exact_hsts_value(self) -> None:
+        # HSTS reaches past this app (includeSubDomains, two years), so the
+        # value sent must be the one the design record states.
+        plan = (helpers.ROOT / "docs" / "PLAN.md").read_text(encoding="utf-8")
+        self.assertIn(f"`{self.HSTS[0]}: {self.HSTS[1]}`", plan)
+
     def test_each_header_appears_once(self) -> None:
         names = [name.lower() for name, _ in http_guard.security_headers(ORIGIN)]
         self.assertEqual(len(names), len(set(names)))

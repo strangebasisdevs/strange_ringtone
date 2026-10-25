@@ -60,6 +60,8 @@ def security_headers(public_origin: str) -> list[tuple[str, str]]:
     ]
     # HSTS only makes sense, and only takes effect, over https. Sending it for an
     # http origin would do nothing at best and confuse a later TLS setup at worst.
+    # includeSubDomains covers the PUBLIC_ORIGIN host's subdomains too; docs/PLAN.md
+    # section 8 records the value and that cost.
     if public_origin.startswith("https://"):
         headers.append(("Strict-Transport-Security", "max-age=63072000; includeSubDomains"))
     return headers
