@@ -103,18 +103,21 @@ starts enforcing once `.release-please-manifest.json` records a release.
   stays SHA-pinned.
 - **Security scanning belongs to `strangebasisdevs/strange_security`,** the
   organisation's one-stop security repository. `security_gate.yml` calls its
-  Semgrep and Trivy workflows. Fix gaps in those scans there, not with local
-  copies. The one exception is the interim `secrets` job in `ci.yml` (Trivy at
-  any severity, plus gitleaks over the history). It stays until
-  strange_security covers both, and then it is deleted. See `docs/PLAN.md`,
-  section 9.4.
+  Semgrep, Trivy and Gitleaks workflows, and this repository runs no security
+  scans of its own. Fix gaps in those scans in strange_security, never with a
+  local copy here (`docs/PLAN.md`, section 9.4).
+- **`main` is protected by a ruleset:** changes go through a PR, squash-merge
+  only, and the required checks are Ruff, Unit tests, Conventional PR title,
+  Deployment contract change, and the gate's Semgrep, Trivy and Gitleaks jobs.
+  Renaming a job means updating the ruleset in the same change. `v*` tags can
+  be created, moved or deleted only by organisation admins.
 - Workflows default to `contents: read`. Never use `pull_request_target` or
   `workflow_run` with secrets. Write scopes exist only in the release-please and
   publish jobs, plus `security-events: write` in the security gate, which the
   shared workflows need to upload SARIF.
 - Every PR runs ruff, the tests (including an in-image run with
   `--network none`, once the image exists), the organisation security gate, the
-  interim secret scans, the PR-title check and the contract-change check.
+  PR-title check and the contract-change check.
   Releases also scan the image and publish provenance and an SBOM.
 
 ## Local machine

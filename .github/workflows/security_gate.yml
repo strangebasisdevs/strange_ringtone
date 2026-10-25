@@ -1,10 +1,10 @@
 name: Security gate
 
-# Semgrep and Trivy come from the organisation's shared security repository.
-# These are referenced at @main, the owner's explicit exception (2026-10-25) to
-# pinning by commit SHA. It applies only to strangebasisdevs-owned reusable
-# workflows, so fixes made there reach every repository at once (CLAUDE.md,
-# Supply chain). Gaps in those scans are tracked upstream (docs/PLAN.md, 9.4).
+# Every security scan comes from the organisation's shared security repository;
+# this repository runs none of its own. These are referenced at @main, the
+# owner's explicit exception (2026-10-25) to pinning by commit SHA. It applies
+# only to strangebasisdevs-owned reusable workflows, so a fix made there reaches
+# every repository at once (CLAUDE.md, Supply chain).
 on:
   pull_request:
   push:
@@ -25,3 +25,7 @@ jobs:
   trivy:
     name: Trivy
     uses: strangebasisdevs/strange_security/.github/workflows/trivy.yml@main
+
+  gitleaks:
+    name: Gitleaks
+    uses: strangebasisdevs/strange_security/.github/workflows/gitleaks.yml@main

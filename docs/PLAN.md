@@ -461,9 +461,6 @@ Local jobs run with `permissions: contents: read`:
 - A core image build and an integration test run inside it with
   `--network none` (the real ffmpeg, the corpus, and the build-configuration
   checks), from the render milestone on.
-- **Interim secret scans** (`ci.yml`, job `secrets`): a Trivy secret scan at
-  any severity and a gitleaks scan of the full history. They cover the gaps
-  listed in 9.4 and are deleted once strange_security closes them.
 - A **PR-title check** (conventional commits, so release-please works). It is a
   stdlib script that reads the title from an `env:` variable, never from inline
   `${{ }}`.
@@ -475,11 +472,35 @@ Local jobs run with `permissions: contents: read`:
   the check.
 
 The **organisation security gate** (`security_gate.yml`) calls
-`strangebasisdevs/strange_security`'s `semgrep.yml` and `trivy.yml` at `@main`.
-Its permissions are `actions: read`, `contents: read` and
+`strangebasisdevs/strange_security`'s `semgrep.yml`, `trivy.yml` and
+`gitleaks.yml` at `@main`. They are this repository's only security scans:
+
+- Semgrep `p/default` fails on any finding.
+- Trivy fails on any secret at any severity, and on HIGH or CRITICAL fixable
+  vulnerabilities.
+- Gitleaks scans the full history, merge commits included.
+
+The gate's permissions are `actions: read`, `contents: read` and
 `security-events: write`; the shared workflows upload SARIF to code scanning,
 which needs the last of those. A PR from a fork gets a read-only token, so the
 SARIF upload fails there.
+
+**Branch ruleset on `main`** (set 2026-10-25): every change needs a PR, merges
+are squash only, and force pushes and deletion are blocked. These checks are
+required, all reported by GitHub Actions:
+
+- Ruff
+- Unit tests
+- Conventional PR title
+- Deployment contract change
+- Semgrep / Semgrep scan
+- Trivy / Trivy filesystem scan
+- Gitleaks / Gitleaks history scan
+
+The repository squash-merges with the PR title as the commit subject, which is
+what release-please reads. A **tag ruleset** on `v*` lets only organisation
+admins create, move or delete release tags. Phase 6 must add the release
+workflow's identity to that ruleset before release-please can tag.
 
 No workflow uses `pull_request_target` or `workflow_run`.
 
@@ -510,31 +531,23 @@ No workflow uses `pull_request_target` or `workflow_run`.
   (maintained by release-please). Branch protection and tag rules are set by
   hand in the GitHub settings.
 
-### 9.4 Gaps tracked upstream in strange_security
+### 9.4 Security scan gaps are fixed upstream
 
-As of `strange_security` `main` at `4bca5bb` (2026-10-25), checked against this
-repository's rules:
+On 2026-10-25, checking `strange_security` (`main` at `4bca5bb`) against this
+repository's rules found four gaps:
 
-1. **Semgrep never fails the build.** `semgrep scan` runs without `--error`, so
-   findings only appear in code scanning. A code-scanning merge rule in the
-   branch ruleset could block on them in the meantime.
-2. **Trivy only reports HIGH and CRITICAL secrets.** `--severity HIGH,CRITICAL`
-   applies to the secret scanner too, and the brief wants any secret to fail.
-   This repository's interim `secrets` job covers it.
-3. **There is no git-history secret scan.** This repository's interim gitleaks
-   step covers it.
-4. **The gate breaks for every external caller (confirmed 2026-10-25).** Each
-   shared workflow finds its own repository and ref from `github.workflow_ref`.
-   In a called workflow, the `github` context belongs to the *caller*. The
-   "shared workflow repository" checkout therefore fetched
-   `strangebasisdevs/strange_ringtone` at `refs/pull/1/merge`, and the image
-   build failed on a missing `.strange-security/.github/docker` (PR #1, Actions
-   run 40170938163). strange_security's own gate calls the workflows locally,
-   which hides the bug. Until it is fixed, both gate jobs fail here.
+1. Semgrep never failed on findings.
+2. Trivy's secret scan only reported HIGH and CRITICAL.
+3. There was no git-history secret scan.
+4. The gate broke for every external caller. It used `github.workflow_ref`,
+   which names the *caller*, so it checked out the wrong repository (PR #1,
+   Actions run 40170938163).
 
-The owner wants these fixed in strange_security, the organisation's one-stop
-security repository, rather than duplicated here. When they are fixed, delete
-the interim `secrets` job and this list.
+While they were open, this repository kept an interim local secret-scan job.
+All four were fixed in strangebasisdevs/strange_security#12, merged the same
+day, and the interim job was removed in PR #1. The rule going forward: a gap
+in security scanning is fixed in strange_security, the organisation's one-stop
+security repository, and never patched with a local copy here.
 
 ## 10. Tests (stdlib `unittest`)
 
@@ -630,9 +643,8 @@ docs/PLAN.md
    - README, CLAUDE.md, SECURITY.md and CHANGELOG.md
    - `.gitattributes` (LF) and `.gitignore`
    - Dependabot
-   - the CI skeleton: ruff, unit tests, the organisation security gate, the
-     interim secret scans, and the PR-title and contract-change checks with
-     their tests
+   - the CI skeleton: ruff, unit tests, the organisation security gate, and
+     the PR-title and contract-change checks with their tests
 
    On 2026-10-25 the repository moved to the `strangebasisdevs` organisation,
    and its security scanning moved to strange_security (sections 9.2 and 9.4).
