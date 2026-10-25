@@ -1,4 +1,7 @@
-"""Run the core server: python -m strange_ringtone [--bind HOST].
+"""Run the core server: python -I core [--bind HOST] from a checkout.
+
+An installed package runs as python -I -m strange_ringtone; core/__main__.py
+explains why a checkout needs the directory form.
 
 Settings come from the environment (docs/PLAN.md 5.7). The port is fixed by the
 deployment contract; only the bind address can change, and only on the command
@@ -27,7 +30,7 @@ def _stop(signum: int, frame: FrameType | None) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="python -m strange_ringtone", description="Serve strange_ringtone's core on port 8080."
+        prog="strange_ringtone", description="Serve strange_ringtone's core on port 8080."
     )
     parser.add_argument(
         "--bind",

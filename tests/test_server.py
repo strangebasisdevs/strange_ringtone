@@ -934,13 +934,14 @@ class MainTest(unittest.TestCase):
     def run_main(self, **variables: str) -> subprocess.CompletedProcess[str]:
         # Keep the rest of the environment: Windows needs SYSTEMROOT to start Python.
         env = {name: value for name, value in os.environ.items() if name not in self.CONTRACT}
-        env.pop("PYTHONSAFEPATH", None)
         env.update(variables)
-        # Every case here is a configuration that must refuse to start, so the
-        # server never binds. --bind keeps it on loopback if one ever didn't.
+        # The documented command, -I included: an exit code of 2 shows that the
+        # package was found and main() ran. Every case here is a configuration
+        # that must refuse to start, so the server never binds. --bind keeps it
+        # on loopback if one ever didn't.
         return subprocess.run(
-            [sys.executable, "-m", "strange_ringtone", "--bind", "127.0.0.1"],
-            cwd=helpers.CORE, env=env, capture_output=True, text=True, timeout=60,
+            [sys.executable, "-I", str(helpers.CORE), "--bind", "127.0.0.1"],
+            cwd=helpers.ROOT, env=env, capture_output=True, text=True, timeout=60,
         )
 
     def test_missing_public_origin_refuses_to_start(self) -> None:
