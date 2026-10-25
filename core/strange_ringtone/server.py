@@ -340,10 +340,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         client = client_address(
             self.client_address[0], headers.get_all("X-Forwarded-For") or [], settings.trusted_proxies
         )
-        allowed, retry_after = self.server.limiter.allow(client)
+        # Step 4: both limits must have room. A client over its limit gets 429
+        # whether or not the gate is full, but a render is counted only once
+        # the gate admits it: a 503 busy ran no render, so a client retrying
+        # after its Retry-After must not burn its budget on refusals.
+        allowed, retry_after = self.server.limiter.has_room(client)
         if not allowed:
             raise GuardError(429, "rate_limited", retry_after=retry_after)
         with self.server.gate.slot():
+            # Counted here, atomically: a parallel request from the same client
+            # may have taken the last hit since has_room answered.
+            allowed, retry_after = self.server.limiter.allow(client)
+            if not allowed:
+                raise GuardError(429, "rate_limited", retry_after=retry_after)
             # A fresh directory per job, with names the server picked: nothing a
             # client sends ever becomes part of a path.
             try:

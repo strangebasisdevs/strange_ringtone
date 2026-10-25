@@ -374,6 +374,21 @@ class RateLimiterTest(unittest.TestCase):
         self.assertEqual(results.count(True), 50)
         self.assertEqual(len(results), 160)
 
+    def test_has_room_answers_like_allow_without_counting(self) -> None:
+        # The server asks before the concurrency gate and counts only after
+        # it, so a 503 busy never uses up a client's renders.
+        clock = FakeClock()
+        limiter = RateLimiter(1, clock=clock)
+        for _ in range(3):
+            self.assertEqual(limiter.has_room("a"), (True, 0))
+        # Asking adds no key, so it can't grow the table either.
+        self.assertEqual(len(limiter), 0)
+        self.assertEqual(limiter.allow("a"), (True, 0))
+        clock.now += 10
+        self.assertEqual(limiter.has_room("a"), (False, 50))
+        self.assertEqual(limiter.allow("a"), (False, 50))
+        self.assertEqual(limiter.has_room("b"), (True, 0))
+
 
 class ConcurrencyGateTest(unittest.TestCase):
     def test_acquire_up_to_the_limit(self) -> None:

@@ -761,6 +761,53 @@ class GateTest(ServerTestCase):
         self.wait_for_log("POST /api/render 200", count=2)
         self.assertScratchEmpty()
 
+    def hold_the_slot(self, **overrides: Any) -> tuple[threading.Event, threading.Thread, list[Response]]:
+        """Start a server with one render slot and a first render that holds it until released."""
+        entered = threading.Event()
+        release = threading.Event()
+
+        def block(job_dir: Path, handler: Handler) -> None:
+            entered.set()
+            release.wait(DEADLINE)
+            handler.send_json(200, {"ok": True})
+
+        self.start(render_hook=RenderHook(block), render_concurrency=1, **overrides)
+        results: list[Response] = []
+        first = threading.Thread(target=lambda: results.append(self.post_render(self.render_headers(4), b"RIFF")))
+        first.start()
+        self.addCleanup(first.join, DEADLINE)
+        self.addCleanup(release.set)
+        self.assertTrue(entered.wait(DEADLINE))
+        return release, first, results
+
+    def test_busy_refusals_do_not_use_up_the_rate_limit(self) -> None:
+        # A 503 ran no render. Counting it would let a UI that retries after
+        # Retry-After: 1 burn its budget and then meet 429 for up to a minute.
+        release, first, results = self.hold_the_slot(rate_limit_renders_per_minute=2)
+        for _ in range(3):
+            self.assertJsonError(self.post_render(self.render_headers(4), b"RIFF"), 503, "busy")
+        release.set()
+        first.join(DEADLINE)
+        self.assertEqual(results[0].status, 200)
+        # One render ran, so one of the two is left.
+        self.assertEqual(self.post_render(self.render_headers(4), b"RIFF").status, 200)
+        self.assertJsonError(self.post_render(self.render_headers(4)), 429, "rate_limited")
+        self.wait_for_log("POST /api/render 200", count=2)
+        self.assertScratchEmpty()
+
+    def test_a_client_over_its_limit_gets_429_even_while_busy(self) -> None:
+        # The rate limit is still asked first: a client out of renders learns
+        # how long to wait, not that a retry in a second might work.
+        release, first, results = self.hold_the_slot(rate_limit_renders_per_minute=1)
+        response = self.post_render(self.render_headers(4), b"RIFF")
+        self.assertJsonError(response, 429, "rate_limited")
+        self.assertIsNotNone(response.headers.get("Retry-After"))
+        release.set()
+        first.join(DEADLINE)
+        self.assertEqual(results[0].status, 200)
+        self.wait_for_log("POST /api/render 200")
+        self.assertScratchEmpty()
+
     def test_slot_is_released_after_a_failed_hook(self) -> None:
         def fail(job_dir: Path, handler: Handler) -> None:
             raise RuntimeError("boom")

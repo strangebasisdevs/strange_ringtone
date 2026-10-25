@@ -199,6 +199,17 @@ class RateLimiter:
 
     def allow(self, key: str) -> tuple[bool, int]:
         """(True, 0) and count the call, or (False, seconds until a slot frees)."""
+        return self._check(key, record=True)
+
+    def has_room(self, key: str) -> tuple[bool, int]:
+        """What allow() would answer now, without counting the call.
+
+        Lets the server refuse an over-limit client with 429 before it asks the
+        concurrency gate, yet count a render only once the gate has admitted it.
+        """
+        return self._check(key, record=False)
+
+    def _check(self, key: str, record: bool) -> tuple[bool, int]:
         now = self._clock()
         with self._lock:
             # Prune on every call so a stream of one-off client addresses can't
@@ -210,9 +221,13 @@ class RateLimiter:
                     stamps.popleft()
                 if not stamps:
                     del self._hits[name]
-            stamps = self._hits.setdefault(key, collections.deque())
+            stamps = self._hits.get(key, collections.deque())
+            # The check and the append happen under one lock, so concurrent
+            # requests from one client can't all see the last free slot.
             if len(stamps) < self._per_minute:
-                stamps.append(now)
+                if record:
+                    stamps.append(now)
+                    self._hits[key] = stamps
                 return True, 0
             return False, max(1, math.ceil(stamps[0] + _WINDOW_SECONDS - now))
 
