@@ -907,6 +907,30 @@ class BodyTest(ServerTestCase):
         self.wait_for_log("POST /api/render 422")
         self.assertScratchEmpty()
 
+    def test_upload_never_writes_through_a_file_already_at_its_name(self) -> None:
+        # in.wav is opened with exclusive create. Here a hard link to a file
+        # outside scratch already sits at that name: writing through it would
+        # overwrite the outside file with the upload.
+        outside = self.temp / "outside.wav"
+        outside.write_bytes(b"KEEP")
+        real_mkdtemp = tempfile.mkdtemp
+
+        def planted(*args: Any, **kwargs: Any) -> str:
+            job_dir = real_mkdtemp(*args, **kwargs)
+            os.link(outside, Path(job_dir) / "in.wav")
+            return job_dir
+
+        hook = RenderHook()
+        self.start(render_hook=hook)
+        with mock.patch.object(server_module.tempfile, "mkdtemp", planted):
+            response = self.post_render(self.render_headers(4), b"RIFF")
+        self.assertJsonError(response, 500, "internal_error")
+        self.assertEqual(hook.calls, [])
+        self.assertEqual(outside.read_bytes(), b"KEEP")
+        self.wait_for_log("POST /api/render 500")
+        self.assertNotIn("error while handling a request", self.log.getvalue())
+        self.assertScratchEmpty()
+
     def test_body_shorter_than_length_client_closes(self) -> None:
         hook = RenderHook()
         self.start(render_hook=hook)

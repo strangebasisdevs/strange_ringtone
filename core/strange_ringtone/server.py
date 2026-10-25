@@ -419,9 +419,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         deadline = time.monotonic() + BODY_DEADLINE_SECONDS
         try:
             # 'x': the file must not exist yet, in a directory created just now.
+            # Anything already at that name (a file, a hard link to somewhere
+            # else, a symlink) was not put there by this request, so the upload
+            # never writes through it; the request fails with a clean 500.
+            out = open(target, "xb")
+        except OSError:
+            return GuardError(500, "internal_error")
+        try:
             # The with-block closes the handle before the hook or the cleanup
             # runs, because Windows can't delete a file that is still open.
-            with open(target, "xb") as out:
+            with out:
                 while remaining > 0:
                     left = deadline - time.monotonic()
                     if left <= 0:
