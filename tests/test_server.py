@@ -767,6 +767,41 @@ class GateTest(ServerTestCase):
         self.wait_for_log("POST /api/render 500", count=3)
         self.assertScratchEmpty()
 
+    def test_slot_and_job_directory_are_free_before_the_client_sees_the_answer(self) -> None:
+        # A slow cleanup widens the window between the answer and the release
+        # of the slot. A client that sends its next request as soon as it has
+        # read an answer must never find its own render still holding the slot.
+        real_rmtree = shutil.rmtree
+
+        def slow_rmtree(*args: Any, **kwargs: Any) -> None:
+            time.sleep(0.2)
+            real_rmtree(*args, **kwargs)
+
+        def fail(job_dir: Path, handler: Handler) -> None:
+            raise RuntimeError("boom")
+
+        for label, action, status in (("answered", None, 200), ("failed", fail, 500)):
+            with self.subTest(label):
+                hook = RenderHook(action)
+                self.start(render_hook=hook, render_concurrency=1)
+                with mock.patch("shutil.rmtree", slow_rmtree):
+                    for _ in range(3):
+                        response = self.post_render(self.render_headers(4), b"RIFF")
+                        self.assertEqual(response.status, status, response.body)
+                        self.assertFalse(hook.calls[-1][0].exists())
+                self.assertEqual(len(hook.calls), 3)
+                self.assertScratchEmpty()
+
+    def test_a_hook_that_fails_halfway_still_gets_a_clean_500(self) -> None:
+        def fail_halfway(job_dir: Path, handler: Handler) -> None:
+            handler.send_response(200)
+            handler.send_header("Content-Type", "audio/mp4")
+            raise RuntimeError("boom")
+
+        self.start(render_hook=RenderHook(fail_halfway))
+        self.assertJsonError(self.post_render(self.render_headers(4), b"RIFF"), 500, "internal_error")
+        self.assertScratchEmpty()
+
 
 class BodyTest(ServerTestCase):
     def test_default_hook_answers_501(self) -> None:

@@ -8,6 +8,7 @@ applies them in the order of docs/PLAN.md 5.2 and turns refusals into JSON.
 from __future__ import annotations
 
 import http.server
+import io
 import json
 import os
 import shutil
@@ -334,23 +335,54 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # client sends ever becomes part of a path.
             job_dir = Path(tempfile.mkdtemp(prefix="job-", dir=settings.scratch_dir))
             try:
-                if not self._receive_body(job_dir / "in.wav", length):
-                    try:
-                        self.send_json_error(400, "incomplete_body")
-                    except OSError:
-                        # The client is gone; there is nobody to tell.
-                        pass
-                    return
-                try:
-                    self.server.render_hook(job_dir, self)
-                except GuardError:
-                    raise
-                except Exception:
-                    # Details stay out of the response and the log: an exception
-                    # message could carry a tone name or a path.
-                    self.send_json_error(500, "internal_error")
+                if self._receive_body(job_dir / "in.wav", length):
+                    answer: bytes | None = self._run_hook(job_dir)
+                else:
+                    answer = None
             finally:
                 shutil.rmtree(job_dir, ignore_errors=True)
+        # Sent only now, after the job directory is gone and the slot is free:
+        # a client that sends its next request as soon as it has read this
+        # answer must not find its own render still holding the slot.
+        if answer is None:
+            try:
+                self.send_json_error(400, "incomplete_body")
+            except OSError:
+                # The client is gone; there is nobody to tell.
+                pass
+            return
+        self.wfile.write(answer)
+
+    def _run_hook(self, job_dir: Path) -> bytes:
+        """Run the render hook with its response held in memory, and return that response.
+
+        A result is a ringtone of at most 40 seconds, so holding it costs little,
+        and an answer can be replaced whole if the hook fails halfway.
+        """
+        socket_file = self.wfile
+        held = io.BytesIO()
+        self.wfile = held
+        try:
+            try:
+                self.server.render_hook(job_dir, self)
+            except GuardError:
+                self._discard_response()
+                raise
+            except Exception:
+                # Details stay out of the response and the log: an exception
+                # message could carry a tone name or a path.
+                self._discard_response()
+                held.seek(0)
+                held.truncate()
+                self.send_json_error(500, "internal_error")
+        finally:
+            self.wfile = socket_file
+        return held.getvalue()
+
+    def _discard_response(self) -> None:
+        # Forget a response the hook began, so a clean error replaces it.
+        self._status = None
+        self._headers_buffer = []
 
     def _receive_body(self, target: Path, length: int) -> bool:
         """Stream exactly length body bytes into target; False if the body ends early."""
