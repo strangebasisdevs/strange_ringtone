@@ -314,7 +314,7 @@ the user types becomes the filename. Decision 9 keeps it readable:
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `PUBLIC_ORIGIN` | *(required)* | For example `https://ringtones.example.internal`. The server refuses to start without it. |
-| `TRUSTED_PROXIES` | empty | CIDRs whose `X-Forwarded-For` is honoured. The rightmost untrusted hop is the client. Behind a proxy with this empty, every client shares the proxy's address and the per-client rate limit becomes global. |
+| `TRUSTED_PROXIES` | empty | CIDRs whose `X-Forwarded-For` is honoured. The rightmost untrusted hop is the client. The walk from the right stops at the first malformed hop, and without an untrusted hop before it (or when the header is missing or lists only trusted proxies) the socket peer is the client. Behind a proxy with this empty, every client shares the proxy's address and the per-client rate limit becomes global. |
 | `MAX_CLIP_SECONDS` | 30 | 1 to 40 |
 | `DEFAULT_TARGET_LUFS` | −14 | −24 to −9 |
 | `RENDER_TIMEOUT_SECONDS` | 20 | Wall clock, per ffmpeg run |

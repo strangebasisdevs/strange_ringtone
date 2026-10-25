@@ -159,6 +159,11 @@ def client_address(peer: str, forwarded_for_values: list[str], trusted: tuple[Ne
     peer is a trusted proxy. Each proxy appends the address it saw, so walking
     from the right, the first hop that is not a trusted proxy is the real client:
     anything further left is whatever the client chose to write.
+
+    Without such a hop the peer is the client: when the header is missing or
+    empty, when the walk meets a malformed hop first, and when every hop is a
+    trusted proxy. Those requests then share the proxy's budget, which fails
+    closed instead of keying on an address no untrusted party was seen at.
     """
     peer_address = _parse_address(peer)
     if peer_address is None:
@@ -166,17 +171,15 @@ def client_address(peer: str, forwarded_for_values: list[str], trusted: tuple[Ne
     if not _is_trusted(peer_address, trusted):
         return str(peer_address)
     hops = [hop.strip(" \t") for hop in ",".join(forwarded_for_values).split(",")]
-    client = peer_address
     for hop in reversed(hops):
         address = _parse_hop(hop)
         if address is None:
             # Garbage ends the walk: what lies left of it can't be trusted to
             # have been written by one of our proxies.
             break
-        client = address
         if not _is_trusted(address, trusted):
             return str(address)
-    return str(client)
+    return str(peer_address)
 
 
 class RateLimiter:

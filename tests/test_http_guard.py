@@ -228,19 +228,20 @@ class ClientAddressTest(unittest.TestCase):
             with self.subTest(values=values):
                 self.assertEqual(http_guard.client_address("192.0.2.10", values, self.PROXY), "192.0.2.10")
 
-    def test_garbage_ends_the_walk(self) -> None:
-        # The last good address before the garbage wins; nothing left of it is read.
+    def test_garbage_ends_the_walk_at_the_peer(self) -> None:
+        # An untrusted hop right of the garbage is still the client; otherwise
+        # the peer is, never a trusted hop and never anything left of the garbage.
         cases = {
             "203.0.113.5, unknown": "192.0.2.10",
             "unknown, 203.0.113.5": "203.0.113.5",
-            "203.0.113.5, unknown, 192.0.2.20": "192.0.2.20",
+            "203.0.113.5, unknown, 192.0.2.20": "192.0.2.10",
             "203.0.113.5, 300.1.1.1": "192.0.2.10",
             "203.0.113.5, 192.0.2.20:abc": "192.0.2.10",
             "203.0.113.5, [2001:db8::1": "192.0.2.10",
             "203.0.113.5, [2001:db8::1]x": "192.0.2.10",
             "203.0.113.5, [2001:db8::1]:": "192.0.2.10",
             "203.0.113.5, 192.0.2.20:": "192.0.2.10",
-            "203.0.113.5,,192.0.2.20": "192.0.2.20",
+            "203.0.113.5,,192.0.2.20": "192.0.2.10",
             "203.0.113.5; 192.0.2.20": "192.0.2.10",
             "\x00": "192.0.2.10",
             "203.0.113.5‮": "192.0.2.10",
@@ -249,9 +250,9 @@ class ClientAddressTest(unittest.TestCase):
             with self.subTest(header=header):
                 self.assertEqual(http_guard.client_address("192.0.2.10", [header], self.PROXY), expected)
 
-    def test_all_trusted_hops_means_the_leftmost(self) -> None:
+    def test_all_trusted_hops_means_the_peer(self) -> None:
         self.assertEqual(http_guard.client_address("192.0.2.10", ["192.0.2.30, 192.0.2.20"], self.PROXY),
-                         "192.0.2.30")
+                         "192.0.2.10")
 
     def test_ports_and_bracketed_ipv6(self) -> None:
         cases = {
