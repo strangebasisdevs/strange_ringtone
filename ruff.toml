@@ -1,0 +1,13 @@
+# The images run Python 3.12 (CLAUDE.md), whatever the local interpreter is.
+target-version = "py312"
+line-length = 120
+
+[lint]
+select = [
+    "E",  # pycodestyle errors
+    "W",  # pycodestyle warnings
+    "F",  # pyflakes
+    "B",  # bugbear
+    "I",  # import order
+    "UP", # pyupgrade, bounded by target-version
+]

@@ -1,0 +1,137 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Ruff
+    # Pinned runner image: its Python (3.12) is the one the lockfiles were compiled for.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install ruff
+        # Hashed lockfile, no resolver: the exact wheel CI runs is pinned.
+        run: |
+          python -m pip install --disable-pip-version-check --require-hashes --no-deps --only-binary :all: -r .github/lint/requirements.txt
+
+      - name: Run ruff
+        run: ruff check --no-cache --output-format=github .
+
+  test:
+    name: Unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run unit tests
+        # Stdlib only, so nothing to install. -I keeps the environment and user site out.
+        run: python -I -m unittest discover --start-directory tests --verbose
+
+  semgrep:
+    name: Semgrep scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Semgrep
+        # Hashed lockfile, no resolver: every transitive dependency is pinned.
+        run: |
+          python -m pip install --disable-pip-version-check --require-hashes --no-deps --only-binary :all: -r .github/semgrep/requirements.txt
+
+      - name: Run Semgrep
+        run: semgrep scan --config p/default --error .
+
+  trivy:
+    name: Trivy and gitleaks scans
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history, so gitleaks sees a secret that was added and removed inside a PR.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Trivy
+        # The release binary, checked against its published sha256 before it runs.
+        shell: bash
+        run: |
+          archive="trivy_0.70.0_Linux-64bit.tar.gz"
+          curl --fail --location --silent --show-error \
+            --output "$RUNNER_TEMP/$archive" \
+            "https://github.com/aquasecurity/trivy/releases/download/v0.70.0/$archive"
+          echo "8b4376d5d6befe5c24d503f10ff136d9e0c49f9127a4279fd110b727929a5aa9  $RUNNER_TEMP/$archive" \
+            | sha256sum --check --status
+          mkdir -p "$RUNNER_TEMP/trivy-bin"
+          tar --extract --gzip --file "$RUNNER_TEMP/$archive" \
+            --directory "$RUNNER_TEMP/trivy-bin" trivy
+          echo "$RUNNER_TEMP/trivy-bin" >> "$GITHUB_PATH"
+
+      # Unfiltered by severity: some built-in secret rules are below HIGH.
+      - name: Run Trivy secret scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: secret
+          format: table
+          exit-code: "1"
+          skip-setup-trivy: true
+
+      - name: Run Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          format: table
+          exit-code: "1"
+          skip-setup-trivy: true
+
+      # Trivy's secret scan reads the working tree only; gitleaks reads every
+      # commit. Not the gitleaks GitHub Action (one more action to trust): the
+      # release binary, checked against its published sha256. A finding means
+      # the credential is public, so rotate it first.
+      - name: Install gitleaks
+        shell: bash
+        run: |
+          archive="gitleaks_8.30.1_linux_x64.tar.gz"
+          curl --fail --location --silent --show-error \
+            --output "$RUNNER_TEMP/$archive" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/$archive"
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $RUNNER_TEMP/$archive" \
+            | sha256sum --check --status
+          mkdir -p "$RUNNER_TEMP/gitleaks-bin"
+          tar --extract --gzip --file "$RUNNER_TEMP/$archive" \
+            --directory "$RUNNER_TEMP/gitleaks-bin" gitleaks
+          echo "$RUNNER_TEMP/gitleaks-bin" >> "$GITHUB_PATH"
+
+      - name: Run gitleaks history scan
+        run: gitleaks git --no-banner --redact --exit-code 1 .

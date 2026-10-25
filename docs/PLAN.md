@@ -1,0 +1,660 @@
+# strange_ringtone: research and v0.1.0 plan
+
+Status: design agreed on 2026-10-24 (decisions in section 3). No code has been
+written. This file is the design record; the README's "Deployment contract"
+becomes the source of truth for operators once v0.1.0 ships.
+
+## 1. Short answer
+
+- **iOS 26 added Share → "Use as Ringtone" for audio files.** GarageBand,
+  syncing through the Music library, and a computer are no longer needed.
+  Tested on 2026-10-24 (section 12, Phase 0):
+  - Clips up to **30.0 s** are accepted. 30.5 s is refused with "File Too Large:
+    Choose a ringtone under 30 seconds".
+  - `.m4a`, `.m4r` and `.mp3` all work.
+  - iOS names the tone after the **filename** and ignores the title tag.
+  - Custom tones also appear in the Text Tone list.
+- **Installing a tone with no taps on the phone is impossible.** No public API,
+  and no Shortcuts action, installs a ringtone. Tethered computer sync (Finder or
+  Music on a Mac, iTunes on Windows, iMazing) needs no phone taps, but none of
+  those can be scripted, and each needs the computer and a paired phone. A few
+  taps on the phone is the minimum, and this project aims to reach it.
+- **Target flow on the phone:**
+  1. In the YouTube app, tap Share → **Make Ringtone** (an iOS Shortcut). The
+     trimmer opens with the audio loaded and the hook pre-selected. Or open the
+     web app and pick a file.
+  2. Adjust the selection, the fades and the loudness, and preview the result.
+  3. Tap **Get on this iPhone** to open the share sheet, then **Use as Ringtone**.
+     That uses Web Share, which Phase 4 still has to test on the real site. The
+     fallback was confirmed in Phase 0: download the file, open Safari's
+     downloads list, tap the file, then Share → Use as Ringtone.
+  4. Choose it in Settings → Sounds & Haptics → Ringtone, or assign it to a
+     contact.
+
+## 2. Research: ways to get a custom tone onto an iPhone
+
+| Path | Phone taps per tone | Needs | Can it be automated? | Notes |
+| --- | --- | --- | --- | --- |
+| **A. This project + iOS 26 share sheet** | about 3 to 5 after trimming | iOS 26+, an HTTPS origin the phone trusts | Everything except the final tap | Recommended |
+| B. GarageBand on iPhone | about 12 to 15 | any iOS | No | Fallback for iOS < 26. Import straight from Files (no Music-library sync), then My Songs → long-press → Share → Ringtone. GarageBand caps tones at 30 s. |
+| C. Mac Finder or Music: drag an `.m4r` onto the phone | 0 on the phone | Mac, cable or Wi-Fi sync | No (no CLI) | Up to 40 s. Reported broken on some macOS 15 releases, working again via the Music view on 15.7. |
+| D. iMazing (Mac/PC) | 0 on the phone | computer, paired phone | GUI only | Ringtone import is free. The paired computer gets backup-level access to the phone. Closed source. |
+| E. A native iOS app | n/a | Apple Developer Program | n/a | Dead end: no public API installs ringtones. |
+| F. Ringtone apps and websites | same as A or B | n/a | No | Ads and tracking, and they still end in the share sheet or GarageBand. |
+
+Another finding: custom tones reportedly don't always survive a move to a new
+iPhone. The server keeps nothing (decision 3), so keep your own copies of tones
+you care about, for example in Files.
+
+### What each path costs
+
+| Path | Money | Ongoing cost |
+| --- | --- | --- |
+| A (self-hosted) | US$0. Runs on an existing home server. GitHub Actions and GHCR are free for public repos. Remote access can use a free WireGuard-based VPN tier (Tailscale's Personal plan is free). | Maintenance time: yt-dlp breaks when YouTube changes, plus ffmpeg bumps and Dependabot PRs |
+| B (GarageBand) | US$0 | Taps per tone |
+| C (Finder) | US$0, plus a Mac | Cable or Wi-Fi sync per tone, and flaky across macOS versions |
+| D (iMazing) | Ringtones are free; the full licence lists at about US$35 (deals lower) | Closed source, plus a pairing trust relationship |
+| E (native app) | US$99 a year | Can't do the job |
+
+## 3. Decisions (interview, 2026-10-24)
+
+| # | Question | Decision | Cost accepted |
+| --- | --- | --- | --- |
+| 0 | Interface | Mobile web first. A TUI may come later on the same HTTP API. Targets iOS 26+. | No terminal app in v0.1.0 |
+| 1 | YouTube | **Opt-in fetcher sidecar in v0.1.0.** This is the owner's explicit exception to the no-URL-fetching rule, and it applies only to a *separate* image. The core image still never fetches. | One container with internet egress. yt-dlp churn. A Deno runtime. YouTube ToS gray area. |
+| 2 | Length and type | `MAX_CLIP_SECONDS` defaults to 30, with a hard ceiling of 40. One AAC encode, offered as `.m4a` (share sheet) and `.m4r` (Finder, iMazing). | v0.1.0 "done" differs from the original brief's wording, so the contract documents both names. |
+| 3 | Library | **No library (revised 2026-10-25).** The core is as stateless as it can be: no database, no data directory, and results deleted after a short TTL. A shared library sits on the Later list (section 14). The first answer, on 2026-10-24, was an opt-in library in v0.1.0. | No shared gallery. Re-getting a tone means trimming it again. |
+| 4 | Decoding | **The browser decodes, and the server accepts PCM WAV only** (the trimmed selection). | Needs JavaScript. Only formats the browser can decode. CLI users convert to WAV first. |
+| 5 | Web layer | **Stdlib-only Python 3.12** (`http.server`, `wave`), with no third-party runtime packages in the core | Hand-written routing and limits. Relies on the reverse proxy for slow-client timeouts. |
+| 6 | ffmpeg | **Minimal build from a pinned source release**, WAV in and AAC/MP4 out, with no network protocols | Dependabot can't see it, so a scheduled job flags new releases. Slower CI builds. |
+| 7 | Licence | **AGPL-3.0-or-later.** The full text, with the "how to apply" lines naming this project. | Section 13 of the licence: the UI must offer users the source (section 7.5). |
+| 8 | Releases | **release-please** opens release PRs from conventional commits | The release-please job needs `contents` and `pull-requests` write, and commit prefixes are mandatory (section 9.3). |
+| 9 | Tone names (2026-10-25) | **Readable Unicode.** iOS shows the download's filename as the tone name (section 5.6). | A bigger sanitiser and test set. Look-alike characters are possible, which is harmless for names on your own phone. |
+
+Phase 0 confirmed decision 2: the share sheet accepts `.m4a`, `.m4r` and
+`.mp3` up to 30.0 s. A `MAX_CLIP_SECONDS` above 30 only helps people who
+install through Finder or iMazing.
+
+### Defaults I chose (overrule any of these before Phase 1)
+
+- linux/amd64 only for v0.1.0. arm64 can come later, because the ffmpeg build
+  under QEMU is slow.
+- The fetcher is served under `/fetch/` on the **same origin** as the core (the
+  proxy routes that prefix), so the strict CSP and the Origin check hold. The
+  core and the fetcher never talk to each other.
+- The fetcher sends no cookies and uses no PO-token provider. If YouTube blocks
+  the server's IP, the fetch fails with a clear message, and cookies (a
+  credential) become a separate, later decision.
+- The 7-day Dependabot cooldown also applies to yt-dlp. When YouTube breaks
+  extraction, the maintainer opens a manual bump PR after reading the release
+  notes.
+- The tone name goes to `/api/render` in an `X-Tone-Name` header
+  (percent-encoded UTF-8), not in the query string. Proxy access logs usually
+  record query strings, and the name is often a song title.
+- Fades default to 0.2 s in and 1.5 s out, each with its own toggle and a range
+  of 0 to 5 s. Ringtones loop while ringing, so a fade-out plus a short fade-in
+  makes the loop seamless and avoids clicks.
+- Loudness normalisation is on by default. The baseline (`DEFAULT_TARGET_LUFS`)
+  is −14 LUFS, with a slider from −24 (softer) to −9 (louder) and a true-peak
+  ceiling of −1 dBTP. Phase 0 didn't compare it by ear with a built-in tone, so
+  the baseline is adjusted later through the slider or the env var.
+- The frontend has no dependencies: plain ES modules, with a canvas waveform
+  written for this project. wavesurfer.js can be vendored later if the polish is
+  worth the extra supply chain.
+
+## 4. Architecture
+
+```
+ iPhone Safari (HTTPS origin the phone trusts)
+ ┌────────────────────────────────────────────────────────┐
+ │ decode (Web Audio) → waveform → select / fade / gain   │
+ │ preview locally → encode the selection as PCM WAV      │
+ └──────┬─────────────────────────────────┬───────────────┘
+        │ POST /api/render  (audio/wav)   │ POST /fetch/api/jobs {video_id}
+        │ GET  /api/result/<id>.m4a / .m4r│ GET  /fetch/api/jobs/<id>[/audio]
+        ▼                                 ▼
+ ┌──────────────────────────┐   ┌───────────────────────────────┐
+ │ core image               │   │ fetcher image (opt-in)        │
+ │ stdlib HTTP server       │   │ stdlib HTTP server            │
+ │ WAV check → ffmpeg       │   │ yt-dlp + yt-dlp-ejs + Deno    │
+ │ (minimal build, file I/O)│   │ egress: YouTube only          │
+ │ no egress, internal net  │   │ never reaches the core        │
+ │ stateless, /tmp tmpfs    │   │ /tmp tmpfs only               │
+ └──────────────────────────┘   └───────────────────────────────┘
+```
+
+The browser is the only bridge. Audio from the fetcher reaches the core only as
+WAV that the browser made, so the core's input surface is the same with or
+without the fetcher.
+
+## 5. Core image
+
+### 5.1 Endpoints
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| GET | `/` | App page. Static HTML, config in escaped `data-*` attributes, no inline script. |
+| GET | `/static/…` | JS, CSS and icons from an in-memory allowlist, `immutable` caching |
+| GET | `/healthz` | `200`, empty body |
+| POST | `/api/render` | Body: `audio/wav`. Query: `fade_in`, `fade_out`, `normalize`, `target_lufs`. The name goes in the `X-Tone-Name` header. Returns JSON `{result_id, duration, measured_lufs, applied_gain_db}`. |
+| GET | `/api/result/<id>.m4a` and `.m4r` | The rendered tone (attachment). `<id>` is 128 random bits and expires after `RESULT_TTL_SECONDS`. |
+
+That is the whole API. Nothing else reads or writes state.
+
+`<audio>` elements play responses regardless of `Content-Disposition`, so
+"Hear final" can use the attachment URL.
+
+### 5.2 Input checks, in order, before ffmpeg runs
+
+1. The method and path are allowed, and the request has exactly one `Origin`
+   equal to `PUBLIC_ORIGIN`. A missing `Origin` is refused (fail closed).
+2. `Content-Type` is exactly `audio/wav`. This also forces a CORS preflight for
+   any cross-origin attempt.
+3. There is exactly one well-formed `Content-Length` and no `Transfer-Encoding`,
+   and the length is at most `MAX_BODY_BYTES`. That limit is derived from
+   `MAX_CLIP_SECONDS × 48000 × 2 ch × 2 B` plus 4 KiB, which is about 5.8 MB at
+   30 s.
+4. The per-client rate limit and the render concurrency limit have room.
+5. The body streams into a fresh per-job directory under the scratch path, with
+   a server-generated name.
+6. Stdlib `wave` parses it, and a strict RIFF walk rejects duplicate `fmt `/`data`
+   chunks or a declared size that disagrees with the file. Allowed: PCM s16le, 1
+   or 2 channels, 44.1 or 48 kHz, duration from 0.5 s to exactly
+   `MAX_CLIP_SECONDS`. The frame count may not exceed seconds × rate, with no
+   tolerance, because iOS accepted 30.000 s and refused 30.5 s.
+7. Only then does ffmpeg run, still with explicit `-f wav`.
+
+The job directory is deleted in a `finally`. Tests prove that nothing is left
+behind on any path (section 10).
+
+### 5.3 Render pipeline (sketch; exact flags are checked against the pinned build)
+
+ffmpeg runs twice, each time as a subprocess with an argument list (never a
+shell). Both runs go through `prlimit` (address space, CPU seconds, file size,
+open files) and `subprocess.run(timeout=RENDER_TIMEOUT_SECONDS)`, which kills the
+process group. Each run uses `-nostdin -hide_banner -threads 1
+-protocol_whitelist file -f wav -i <job>/in.wav`.
+
+1. **Measure:** `-af ebur128=peak=true -f null -`. A strict regex reads the
+   integrated loudness and true peak from the summary. If parsing fails, the
+   render fails.
+2. **Render:** `-af volume=<gain>dB,alimiter=limit=<ceiling>:level=false:latency=true,afade=t=in:…,afade=t=out:…`,
+   then `-ar 44100 -map_metadata -1 -fflags +bitexact -metadata title=<sanitised>
+   -c:a aac -b:a 256k -movflags +faststart -f ipod <job>/out.m4a`.
+   `alimiter` defaults to `level=true`, which re-normalises its output and
+   silently undoes the gain. `latency=true` keeps the clip length exact.
+   `+bitexact` drops the encoder tag, so the title is the only metadata. iOS
+   ignores the title tag and names the tone after the filename (Phase 0), so
+   the title only matters to other players.
+
+The gain is the target minus the measured loudness, clamped to ±20 dB. Louder
+targets push the limiter harder, and the UI warns past −11 LUFS.
+
+Measured in the Phase 0 spike (ffmpeg 8.1.1, synthetic loop, 2026-10-24):
+
+- **Loudness:** a single pass landed within 0.2 LU of −14 and −11 LUFS. At −9 the
+  limiter cost 0.5 LU (−9.5 measured). The render should re-measure its output
+  and run one corrective pass when the error exceeds 0.5 LU.
+- **True peak:** with the limiter at −1.0 dBFS, the AAC output measured −0.8 dBTP
+  at −9 LUFS, because encoding adds inter-sample overs. With the ceiling at
+  −1.5 dBFS every render stayed at or below −1.3 dBTP. At −9 LUFS that took the
+  corrective pass (−9.7, then −9.3 LUFS), so −1.5 dBFS is the default.
+- **Duration:** the ipod muxer reports exact durations (29.900 s in, 29.900 s
+  out), so the encoder's priming samples don't push a clip over the cap. The `.m4a` and
+`.m4r` downloads are the same bytes. Only the name and `Content-Type` differ
+(`audio/mp4` and `audio/x-m4r`).
+
+**Minimal ffmpeg build:** a pinned release tarball, checked against a committed
+SHA-256 and the FFmpeg release signature. Configure flags:
+`--disable-everything --disable-network --disable-autodetect --disable-doc
+--disable-ffplay --disable-ffprobe --enable-static --disable-shared`, then
+enable only these:
+
+- demuxer `wav`
+- decoders `pcm_s16le`
+- encoder `aac`
+- muxers `ipod`, `null`
+- protocol `file`
+- filters `ebur128`, `volume`, `alimiter`, `afade`, `aformat`, `aresample`,
+  `anull`
+
+The licence stays LGPL-2.1+. A CI test runs `ffmpeg -protocols`, `-demuxers`,
+`-decoders` and `-filters` in the built image and fails on anything outside this
+list.
+
+### 5.4 Fades and loudness preview
+
+The browser previews everything immediately. Fades are gain ramps on an
+`AudioBufferSourceNode`. Loudness uses a small JS BS.1770 meter (K-weighting
+filters, 400 ms blocks, absolute and relative gating) applied to the selection,
+so the slider moves the preview gain live. The server's measurement is the
+authority. "Hear final" plays the real render.
+
+### 5.5 Results: the only state
+
+- A result is the rendered `.m4a`, plus its sanitised name, held under the
+  scratch tmpfs. It lives only long enough to be previewed and downloaded.
+- A sweeper thread deletes results after `RESULT_TTL_SECONDS` (default 600),
+  and startup clears the whole scratch path.
+- There is no database, no data directory and no volume. A restart forgets
+  everything.
+- Logs record the method, the path without its query string, the status and the
+  timing. They never record tone names or audio details.
+
+### 5.6 Tone names (the download filename)
+
+iOS shows the download's filename as the ringtone's name (Phase 0), so the name
+the user types becomes the filename. Decision 9 keeps it readable:
+
+- The name arrives in `X-Tone-Name` as percent-encoded UTF-8. There must be
+  exactly one such header, at most 512 bytes long, that decodes to valid UTF-8.
+  Otherwise the render is refused. A missing header means the name `ringtone`.
+- NFC-normalise the name. Then keep only:
+  - letters, combining marks and digits in any script (Unicode categories L, M
+    and N)
+  - spaces (any `Zs` becomes one space)
+  - the punctuation `- _ ( ) ' . , & !`
+  - emoji (`So`), plus ZWJ (U+200D) and VS16 (U+FE0F) only where they sit next
+    to an emoji
+- Everything else is dropped. That includes control and format characters
+  (bidi overrides among them), path separators, `" * : < > ? |`, and every other
+  quote mark.
+- Collapse runs of spaces, and trim spaces and dots from both ends.
+- Cap the name at 40 code points, then strip any dangling ZWJ, VS16 or
+  combining mark left at the cut. If nothing is left, use `ringtone`.
+- The header is `Content-Disposition: attachment; filename="<ASCII fallback>.m4a";
+  filename*=UTF-8''<percent-encoded name>.m4a` (RFC 6266 and 8187). For the ASCII
+  fallback, fold accents (NFKD, then drop marks) and replace anything else with
+  `_`.
+- The name is never used as a filesystem path. Results are stored under random
+  IDs.
+- Adding a tone that iOS already has fails with "Duplicate Ringtone: This file
+  already exists in the ringtone library". Phase 0 didn't establish whether iOS
+  matches on the name or on the content. The UI tells the user to delete the old
+  tone (swipe left in Settings → Sounds & Haptics → Ringtone) or to pick a new
+  name.
+
+### 5.7 Draft deployment contract (becomes the README section)
+
+| Item | Value |
+| --- | --- |
+| Image | `ghcr.io/<owner>/strange_ringtone:<semver>`, consumed by digest, linux/amd64 |
+| User | UID 10001, GID 10001 (fixed, non-root) |
+| Port | 8080/tcp, plain HTTP. TLS is the proxy's job. |
+| Runs with | `read_only: true`, `cap_drop: [ALL]`, `no-new-privileges`. No egress needed (internal network). |
+| Writable | `/tmp` (tmpfs, size ≥ 64 MB) and nothing else. No volumes, and nothing survives a restart. |
+| Health | `GET /healthz` returns 200 with an empty body |
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `PUBLIC_ORIGIN` | *(required)* | For example `https://ringtones.example.internal`. The server refuses to start without it. |
+| `TRUSTED_PROXIES` | empty | CIDRs whose `X-Forwarded-For` is honoured. The rightmost untrusted hop is the client. |
+| `MAX_CLIP_SECONDS` | 30 | 1 to 40 |
+| `DEFAULT_TARGET_LUFS` | −14 | −24 to −9 |
+| `RENDER_TIMEOUT_SECONDS` | 20 | Wall clock, per ffmpeg run |
+| `RENDER_CONCURRENCY` | 2 | |
+| `RATE_LIMIT_RENDERS_PER_MINUTE` | 10 | Per client IP |
+| `RESULT_TTL_SECONDS` | 600 | |
+| `FETCH_ENABLED` | false | Only shows the YouTube box in the UI. The core never calls the fetcher. |
+| `SOURCE_URL` | baked at build | The AGPL source link. Forks override it. |
+
+The core has no secrets in v0.1.0, so `.env.example` holds only
+`PUBLIC_ORIGIN=` and commented optional settings. Any later secret arrives as
+`*_FILE`, with no usable default.
+
+## 6. Fetcher image (opt-in)
+
+- **Input:** JSON `{video_id}` only. The ID must match `^[A-Za-z0-9_-]{11}$`, and
+  the server builds `https://www.youtube.com/watch?v=<id>` itself. No URL a user
+  typed ever reaches yt-dlp, which removes the SSRF path (yt-dlp's generic
+  extractor would otherwise fetch anything).
+- **Invocation:** `python -I -m yt_dlp`, run as a subprocess with an argument
+  list:
+  - `--ignore-config --no-playlist --use-extractors youtube` (verify flag names
+    against the pinned version)
+  - `-f "bestaudio[ext=m4a]"` (AAC, which Safari decodes, so the fetcher needs
+    no ffmpeg)
+  - `--match-filter "duration <= FETCH_MAX_SECONDS & !is_live"`
+  - `--max-filesize`
+  - `--write-info-json`, with `-o`/`-P` pointing into a fresh `/tmp` job directory
+
+  It runs under `prlimit` and a wall-clock timeout, one job at a time
+  (`FETCH_CONCURRENCY=1`), with its own per-IP rate limit.
+- **Output:** `GET /fetch/api/jobs/<id>` returns status plus whitelisted
+  metadata only:
+  - `title` (sanitised, at most 200 characters)
+  - `duration`
+  - `heatmap`, validated as at most 200 points with times within the duration
+    and values from 0 to 1
+
+  `GET …/audio` streams the file once, then deletes it. A TTL sweep catches any
+  file that was never collected.
+- **Runtime:** Deno is copied from the official image, pinned by digest so
+  Dependabot tracks it. yt-dlp and yt-dlp-ejs come from a hashed pip-tools lock
+  (`--require-hashes --no-deps --only-binary :all:`).
+- **Contract:** the same UID, read-only and capability rules as the core. It
+  needs **internet egress** to YouTube's hosts and no access to any private
+  network. Restricting egress (an allowlisting proxy, firewall rules for private
+  ranges) is documented as the deployment's job. It honours `HTTPS_PROXY`.
+  Settings: `PUBLIC_ORIGIN` (required), `TRUSTED_PROXIES`, `FETCH_MAX_SECONDS`
+  (900), `FETCH_MAX_BYTES` (40 MB), `FETCH_TIMEOUT_SECONDS` (120),
+  `RATE_LIMIT_FETCHES_PER_MINUTE` (5).
+
+## 7. Web app
+
+### 7.1 Trimmer (phone first)
+
+- A full-width canvas waveform with two large draggable handles (44 px touch
+  targets), ±0.1 s and ±1 s nudge buttons, and a duration readout.
+  - The selection is capped at exactly `MAX_CLIP_SECONDS`. Phase 0 accepted
+    30.0 s, so no safety margin is needed.
+  - Dragging one edge past the cap pulls the other edge along.
+- **Play selection** loops it, which is how a ringtone sounds while ringing.
+- Fade-in and fade-out each have a toggle and a slider, and the fade shapes are
+  drawn over the waveform.
+- The loudness has a toggle (on by default) and a "Softer ↔ Louder" slider with
+  a marker at the baseline and a **Reset** button.
+- The name field is pre-filled from the file name or the video title.
+- Buttons: **Hear final**, **Get on this iPhone**, and **Download .m4r**.
+
+### 7.2 Auto-suggesting the hook
+
+The first rule that applies places the selection:
+
+1. If the shared link has a `t=` timestamp, the selection starts there.
+2. If the audio came from the fetcher and YouTube supplied a "Most Replayed"
+   heatmap, the selection goes on the window with the highest summed value.
+3. Otherwise, it goes on the window with the highest mean short-term loudness,
+   since choruses tend to be the loudest part.
+
+The start then moves to the nearest local energy minimum within ±1 s, to avoid
+cutting a word.
+
+### 7.3 Getting it onto the phone
+
+**Get on this iPhone** calls `navigator.share({files: [<name>.m4a]})` when
+`navigator.canShare` allows it. Otherwise it falls back to a download link.
+Phase 0 confirmed that path: in Safari's downloads list, tap the file, then
+Share offers "Use as Ringtone".
+
+Phase 4 checks whether the Web Share sheet offers it too. If it doesn't, the
+download becomes the main button. The help text covers the Duplicate Ringtone
+error, and explains that tones are removed by swiping left in the Ringtone or
+Text Tone list. Web Share needs a secure
+context, so the origin must use a certificate the phone trusts. With a private
+CA, that means its root installed and enabled under Certificate Trust Settings.
+
+### 7.4 iOS Shortcut "Make Ringtone"
+
+The Shortcut has two actions:
+
+1. *Receive URLs from the Share Sheet.*
+2. *Open URL* `<PUBLIC_ORIGIN>/#yt=<URL-encoded input>`.
+
+The fragment never reaches the server or proxy logs. The page extracts the
+video ID and `t=` on the device, from `watch?v=`, `youtu.be/`, `/shorts/`,
+`/live/` and `music.youtube.com` links. It drops tracking parameters such as
+`si=` and sends only the ID to the fetcher. The README documents how to build
+the Shortcut, with a placeholder origin.
+
+### 7.5 AGPL source link
+
+The footer links **Source** to `SOURCE_URL`, which the release build sets to the
+tag's tree on GitHub, so the link matches the running version. It is a plain
+link (no prefetch), and `Referrer-Policy: same-origin` keeps the app's URL from
+going off-site.
+
+## 8. Security summary
+
+- **Headers on every response:**
+  - `Content-Security-Policy: default-src 'none'; script-src 'self'; style-src
+    'self'; img-src 'self'; media-src 'self'; connect-src 'self'; base-uri
+    'none'; form-action 'self'; frame-ancestors 'none'`. This is stricter than
+    `default-src 'self'` and meets the same intent.
+  - `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
+    `Referrer-Policy: same-origin`.
+  - `Cross-Origin-Opener-Policy` and `-Resource-Policy: same-origin`.
+  - A `Permissions-Policy` that denies camera, microphone, geolocation, payment
+    and USB.
+  - HSTS when `PUBLIC_ORIGIN` is https.
+- **CSRF:** every state change is a POST, and each requires exactly one `Origin`
+  equal to `PUBLIC_ORIGIN` (no `Referer` fallback). Request bodies are
+  `audio/wav` or `application/json` only.
+- **Client IP:** `X-Forwarded-For` is honoured only from `TRUSTED_PROXIES`, which
+  is empty by default.
+- **Escaping:** server-rendered text is escaped, and the client uses
+  `textContent` only.
+- **Decoder isolation:** see 5.2, 5.3 and 6. Downloads always carry
+  `Content-Disposition: attachment` and an explicit `Content-Type`. The filename
+  is the sanitised tone name, sent as `filename*` with an ASCII `filename`
+  fallback (5.6).
+- **Process limits:** `python -I`. A fixed thread pool and global concurrency
+  caps. Body reads have socket timeouts. The proxy handles slow-client defence.
+
+## 9. Supply chain, CI and releases
+
+### 9.1 Pins and dependencies
+
+- Every Action is pinned by full commit SHA with a `# vX.Y.Z` comment. Base
+  images are pinned by digest. There is no `curl | sh`.
+- The core has no Python dependencies. The fetcher's yt-dlp lock and the dev
+  tools (ruff, semgrep) use hashed pip-tools locks.
+- Dependabot covers `pip`, `github-actions` and `docker` for both Dockerfiles,
+  with a 7-day cooldown.
+- `ffmpeg-watch.yml` runs weekly with `contents: read` and **fails** when a newer
+  FFmpeg release exists than the pinned one. GitHub's failure email is the
+  alert, so the job needs no issue-write permission. Bumping it means a PR that
+  changes the version and SHA-256, with release notes reviewed.
+
+### 9.2 CI on every PR (`permissions: contents: read`)
+
+- ruff lint.
+- Unit tests.
+- A core image build and an integration test run inside it with
+  `--network none` (the real ffmpeg, the corpus, and the build-configuration
+  checks).
+- Semgrep `p/default`.
+- A Trivy filesystem scan that fails on any secret or any HIGH or CRITICAL
+  finding.
+- A gitleaks history scan.
+- A **PR-title check** (conventional commits, so release-please works). It is a
+  stdlib script that reads the title from an `env:` variable, never from inline
+  `${{ }}`.
+- A **contract-change check**: if the README's "Deployment contract" section
+  changed, the PR title must carry `!` or the body must carry `BREAKING CHANGE:`,
+  so the CHANGELOG marks it. It starts enforcing once
+  `.release-please-manifest.json` records a released version. Before that, the
+  contract is a draft and the check only reports. An unreadable manifest fails
+  the check.
+
+No workflow uses `pull_request_target` or `workflow_run`.
+
+### 9.3 Releases (release-please)
+
+- `release-please.yml` runs on pushes to `main` and sets top-level
+  `permissions: {}`.
+  - **Job `release-please`** gets `contents: write` and `pull-requests: write`,
+    with `release-type: simple` and `bump-minor-pre-major: true`. The first
+    release is forced with `release-as: 0.1.0`.
+  - **Job `publish`** runs only when a release was created. It gets
+    `packages: write`, `id-token: write`, `attestations: write` and
+    `contents: write`. It builds both images with `VERSION` and `SOURCE_URL`,
+    scans them with Trivy (failing on HIGH or CRITICAL), pushes them, runs
+    `actions/attest-build-provenance`, generates an SBOM and attests it with
+    `actions/attest-sbom`, and appends both digests to the release notes.
+- **Known gotcha:** PRs that `GITHUB_TOKEN` creates don't trigger workflows, so
+  CI would never run on the release PR. Plan: the release-please job dispatches
+  `ci.yml` (`workflow_dispatch`) on the release branch, which reports the
+  required checks on the PR's head commit. Cost: that job also needs
+  `actions: write`. I rejected a GitHub App token because it would add a
+  long-lived private key. This approach is verified in Phase 6.
+- A consumer verifies with
+  `gh attestation verify oci://ghcr.io/<owner>/strange_ringtone@sha256:… --repo <owner>/strange_ringtone`
+  before pinning the digest.
+- The repository also has `LICENSE` (AGPL-3.0), `SECURITY.md` (private
+  vulnerability reporting through GitHub Security Advisories) and `CHANGELOG.md`
+  (maintained by release-please). Branch protection and tag rules are set by
+  hand in the GitHub settings.
+
+## 10. Tests (stdlib `unittest`)
+
+- **Limits:** body size, duration bounds, sample rate, channel count and bit
+  depth, the content-type allowlist, and both rate limits and concurrency caps.
+- **WAV validation corpus**, each file refused cleanly with no files left
+  behind:
+  - truncated RIFF
+  - a size that lies
+  - duplicate `fmt `/`data`
+  - float, 24-bit or ADPCM samples
+  - MP3 or MP4 bytes named `.wav`
+  - empty
+  - 31 s or 41 s long
+  - 8 channels
+  - a 0.1 s clip
+  - an oversized body
+  - a body cut off mid-stream
+- **Decoder invocation:** the argument list is built safely (no shell, no user
+  strings except the escaped title), the timeout kills the process, a failure
+  cleans up the job directory, and the build-configuration allowlist holds.
+  The limiter is always invoked with `level=false`, and a rendered fixture's
+  measured loudness lands within 0.5 LU of the target.
+- **Headers and CSRF:** a missing, duplicated or wrong `Origin` is refused, the
+  CSP is exact, and the XFF trust rules hold.
+- **Tone-name sanitisation (5.6):** bidi overrides, CR/LF and other controls,
+  path separators and reserved characters, accents, non-Latin scripts, emoji
+  ZWJ sequences cut at the 40-character cap, input of only dots or spaces, and
+  empty input. The `filename*` header must round-trip, and the ASCII fallback
+  must stay ASCII. A duplicate, oversized or invalid `X-Tone-Name` header is
+  refused.
+- **Statelessness:** after a full render and download, and again after the TTL
+  sweep, the scratch path is empty. The in-image test runs the container with
+  `read_only: true` and only `/tmp` writable, and fails if the server tries to
+  write anywhere else. Neither the logs nor the query strings ever contain a
+  tone name.
+- **Fetcher:** the ID regex, URL construction, argument building, metadata
+  whitelisting, and heatmap validation. yt-dlp is stubbed, with no network.
+- **Every security check has a test that fails when the check is removed.**
+
+## 11. Repository layout (proposed)
+
+```
+LICENSE  README.md  SECURITY.md  CHANGELOG.md  CLAUDE.md  .env.example
+compose.example.yaml        # hardened example, ports only in a commented dev snippet
+core/
+  Dockerfile  ffmpeg/{build.sh,VERSION,SHA256SUMS}
+  strange_ringtone/{server.py,http_guard.py,wav.py,render.py,names.py,results.py}
+  static/{index.html,app.js,waveform.js,loudness.js,suggest.js,share.js,style.css}
+fetcher/
+  Dockerfile  requirements.in  requirements.txt
+  strange_ringtone_fetch/{server.py,ytdlp.py}
+tests/  tests/corpus/
+.github/{dependabot.yml,workflows/{ci,release-please,ffmpeg-watch}.yml}
+release-please-config.json  .release-please-manifest.json
+docs/PLAN.md
+```
+
+## 12. Milestones (one or more PRs each)
+
+0. **Phone spike: done on 2026-10-24** on one iPhone running iOS 26 or later.
+   Other phones on the same iOS are assumed to behave the same. The spike
+   checked:
+   - which files offer "Use as Ringtone", at several lengths and in `.m4a`,
+     `.m4r` and `.mp3`
+   - from which sources: Files and a Safari download, with the Web Share sheet
+     still to test in Phase 4
+   - which name Settings shows when the filename and the title tag differ
+   - whether custom tones appear in the text-tone picker
+   - how −14, −11 and −9 LUFS compare with a built-in tone
+
+   `python -I tools/spike/phase0.py` regenerates the files into the
+   git-ignored `spike-out/phase0/` folder, along with `CHECKLIST.txt` and a zip.
+
+   | Check | Result |
+   | --- | --- |
+   | A1 29.9 s `.m4a` | Offered and accepted |
+   | A2 30.0 s `.m4a` | Offered and accepted |
+   | A3 30.5 s `.m4a` | Offered, then refused: "File Too Large: Choose a ringtone under 30 seconds" |
+   | A4 39.9 s `.m4a` | Offered, then refused with the same error |
+   | A5 29.9 s `.m4r` | Offered and accepted |
+   | A6 30.5 s `.m4r` | Offered, then refused with the same error |
+   | A7 29.9 s `.mp3` | Offered and accepted |
+   | B1/B2: the name shown | The **filename** (`B1 name FILENAME`) for both `.m4a` and `.mp3`. The title tag is ignored. |
+   | C1–C3 loudness | All accepted. Not yet compared by ear, so −14 LUFS stays the baseline. |
+   | Safari download → downloads list → Share | Offers "Use as Ringtone". Re-adding an installed tone fails with "Duplicate Ringtone: This file already exists in the ringtone library". After deleting the first copy, it worked. |
+   | AirDrop | Not tested, and not needed: the app delivers through Safari |
+   | Text Tone list | Every custom tone appears there too |
+   | Loop seam | Not tested. Fades are tunable per tone. |
+   | Deleting test tones | Swipe left in the Ringtone or Text Tone list → Delete |
+1. **Bootstrap (2026-10-25):** create a public GitHub repo whose only initial
+   commit on `main` is LICENSE. Then open a PR adding:
+   - README, CLAUDE.md, SECURITY.md and CHANGELOG.md
+   - `.gitattributes` (LF) and `.gitignore`
+   - Dependabot
+   - the CI skeleton: ruff, unit tests, Semgrep, the Trivy and gitleaks scans,
+     and the PR-title and contract-change checks with their tests
+
+   Docker and image jobs arrive with the first Dockerfile (Phase 3). Set the
+   branch ruleset (required checks, squash-only), the tag rules and private
+   vulnerability reporting in the repository settings.
+2. **Core server:** `/healthz`, headers, the Origin check, XFF and rate limits,
+   static files and config, with tests.
+3. **Render:** the minimal ffmpeg build, WAV validation, measure and render,
+   results with TTL, the corpus, and the build-configuration tests.
+4. **Web app:** decode, waveform, selection, preview (fades and JS loudness),
+   render and "Hear final", share or download, and energy-based suggestions.
+   Finish the Web Share part of the spike here.
+5. **Fetcher** image and UI integration (paste a link, the `#yt=` fragment,
+   heatmap suggestions), plus the Shortcut docs.
+6. **Release:** release-please, publish with provenance, SBOM and image scans, a
+   complete README contract, then **v0.1.0**. Stop there. Integration into an
+   infrastructure repository happens from that repository.
+
+## 13. Privacy notes
+
+- YouTube sees the server's IP fetch the video, the same as watching it. No
+  account or cookies are used.
+- The Shortcut uses a URL fragment, so proxies never log which video was
+  shared, and `si=` share tracking is stripped on the device.
+- Rendered files carry no metadata except a title. The server keeps nothing:
+  each result is deleted after `RESULT_TTL_SECONDS`, and tone names stay out of
+  URLs and logs.
+- By default, Safari saves downloads to iCloud Drive → Downloads. To keep files
+  off iCloud, change Settings → Apps → Safari → Downloads to *On My iPhone*.
+- No telemetry, no CDN, no web fonts, and no third-party requests from the page.
+- With a private CA, hostnames stay out of public Certificate Transparency logs.
+  Public certificates, including VPN-provided `*.ts.net` HTTPS certificates,
+  publish the machine name.
+
+## 14. Later
+
+- **Maybe: a shared tone library.** It was dropped on 2026-10-25 to keep the core
+  stateless. If it comes back, it needs a breaking contract change, and it must
+  be opt-in through one documented data directory. It also needs a backup entry
+  in the deployment, escaped names everywhere, and a quota.
+- A TUI client on the same API.
+- arm64.
+- SponsorBlock `music_offtopic` trimming in the fetcher.
+- Cookies for the fetcher (as a `*_FILE` secret, with a throwaway account).
+- An ntfy "ready" push for slow fetches.
+- A short alert-tone preset (1 to 5 s). Phase 0 showed that custom tones already
+  appear in the Text Tone list.
+- Beat-snapped edges.
+
+## Sources
+
+- AppleInsider: [Custom ringtones are now slightly easier to add in iOS 26](https://appleinsider.com/articles/25/06/12/custom-ringtones-are-now-slightly-easier-to-add-in-ios-26)
+- [Galaxus: personal ringtones could make a comeback with iOS 26](https://www.galaxus.de/en/page/choose-your-own-audio-files-personal-ringtones-could-make-a-comeback-with-ios-26-38379)
+- [AppleVis: Setting custom ringtones has become easy in iOS 26](https://applevis.com/comment/195342)
+- [iPhone Life: Make a voice memo into a ringtone](https://iphonelife.com/content/make-voice-memo-ringtone)
+- [Apple Developer Forums: Use as ringtone](https://developer.apple.com/forums/thread/798223)
+- [Apple Community: Create and manage ringtones](https://discussions.apple.com/docs/DOC-12051)
+- [TidBITS Talk: custom ringtone stopped working on new iPhone](https://talk.tidbits.com/t/my-wifes-custom-ringtone-stopped-working-on-new-iphone/33164)
+- [iMazing: Add ringtones to iPhone](https://imazing.com/guides/how-to-import-or-export-iphone-ringtones-mac-or-pc)
+- [GIGAZINE: yt-dlp now requires a JavaScript runtime (Deno)](https://gigazine.net/news/20251113-yt-dlp-required-deno-javascript-runtime/)
+- [yt-dlp issue #15012 (EJS / JS runtimes)](https://github.com/yt-dlp/yt-dlp/issues/15012)
+- [yt-dlp PO Token Guide](https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide)
+- [bgutil-ytdlp-pot-provider](https://pypi.org/project/bgutil-ytdlp-pot-provider)
+- [yt-dlp `common.py` (`heatmap` field definition)](https://github.com/yt-dlp/yt-dlp/blob/master/yt_dlp/extractor/common.py)
+- [Tailscale: Enabling HTTPS (Certificate Transparency note)](https://tailscale.com/kb/1153/enabling-https)
+- [Tailscale Serve (identity headers)](https://tailscale.com/kb/1312/serve)
+- [SSD Nodes: Tailscale free plan limits](https://www.ssdnodes.com/learn/tailscale-pricing-explained)

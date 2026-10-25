@@ -1,0 +1,37 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 10
+    cooldown:
+      default-days: 7
+    # "chore(deps): bump ..." passes the PR-title check, and release-please
+    # leaves chores out of the CHANGELOG.
+    commit-message:
+      prefix: chore
+      include: scope
+
+  # Hashed pip-compile lockfiles (requirements.in -> requirements.txt) for the CI tools.
+  - package-ecosystem: pip
+    directories:
+      - /.github/lint
+      - /.github/semgrep
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 10
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: chore
+      include: scope
+
+  # The docker ecosystem (base images by digest) is added with the first
+  # Dockerfile, in the render milestone.

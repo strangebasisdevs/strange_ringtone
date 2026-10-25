@@ -1,0 +1,10 @@
+# LF everywhere, whatever core.autocrlf says: the images and CI run on Linux,
+# and this repository is also edited on Windows.
+* text=auto eol=lf
+
+# Audio and archives (spike output, test corpus) are never text.
+*.wav binary
+*.m4a binary
+*.m4r binary
+*.mp3 binary
+*.zip binary

@@ -1,0 +1,3 @@
+semgrep==1.182.1
+# Floor above the pyjwt 2.13.0 advisories (CVE-2026-102266 to 102273); semgrep 1.175.0 capped it at ~=2.13.
+pyjwt>=2.14.0
