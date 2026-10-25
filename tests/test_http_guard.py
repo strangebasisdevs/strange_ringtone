@@ -209,6 +209,14 @@ class ClientAddressTest(unittest.TestCase):
         self.assertEqual(http_guard.client_address("192.0.2.10", ["203.0.113.5", "198.51.100.1"], self.PROXY),
                          "198.51.100.1")
 
+    def test_earlier_header_is_read_when_the_later_holds_only_trusted_hops(self) -> None:
+        # The client is only in the first header: reading the last header alone
+        # would find nothing but proxies and fall back to the peer.
+        self.assertEqual(
+            http_guard.client_address("192.0.2.10", ["198.51.100.7", "192.0.2.20, 192.0.2.30"], self.PROXY),
+            "198.51.100.7",
+        )
+
     def test_missing_or_empty_header_falls_back_to_the_peer(self) -> None:
         for values in ([], [""], [" "], [","], [", ,"]):
             with self.subTest(values=values):
