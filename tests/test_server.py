@@ -1137,6 +1137,36 @@ class LogTest(ServerTestCase):
         self.assertRegex(line, r"^GET /healthz 200 [0-9]+\.[0-9]{3}$")
         self.assertNotIn("Secret", self.log.getvalue())
 
+    def test_duration_is_measured(self) -> None:
+        # A fake clock in the server module only: each reading is 1.25 s
+        # after the last, so the one request reads it exactly twice.
+        readings = iter(100.0 + 1.25 * n for n in range(1000))
+
+        class Clock:
+            @staticmethod
+            def monotonic() -> float:
+                return next(readings)
+
+        with mock.patch.object(server_module, "time", Clock):
+            self.assertEqual(self.request("GET", "/healthz").status, 200)
+            line = self.wait_for_log("GET /healthz ")[0]
+        self.assertEqual(line, "GET /healthz 200 1.250")
+
+    def test_fragment_is_not_logged(self) -> None:
+        response = self.request("GET", "/healthz#SecretFragment")
+        self.assertEqual(response.status, 200)
+        self.assertEqual(self.wait_for_log("GET /")[0].rsplit(" ", 1)[0], "GET /healthz 200")
+        self.assertNotIn("Secret", self.log.getvalue())
+
+    def test_a_connection_without_a_request_logs_nothing(self) -> None:
+        socket.create_connection(("127.0.0.1", self.port), timeout=DEADLINE).close()
+        self.assertEqual(self.request("GET", "/healthz").status, 200)
+        # Stopping joins every handler thread, so the empty connection's
+        # handler has finished, and logged whatever it was going to.
+        self.server.shutdown()
+        self.server.server_close()
+        self.assertEqual([line.rsplit(" ", 1)[0] for line in self.log.lines()], ["GET /healthz 200"])
+
     def test_render_request_logs_nothing_private(self) -> None:
         headers = self.render_headers(10) + [("X-Tone-Name", "SecretHeader"), ("User-Agent", "SecretAgent")]
         response = self.post_render(headers, b"SecretBody")
