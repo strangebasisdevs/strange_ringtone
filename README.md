@@ -68,6 +68,21 @@ Regenerate the spike tones. This needs a local ffmpeg with the `aac` and
 python -I tools/spike/phase0.py
 ```
 
+**Run locally.** Start the core server on loopback, then open
+<http://127.0.0.1:8080/>:
+
+```bash
+cd core && PUBLIC_ORIGIN=http://127.0.0.1:8080 python -m strange_ringtone --bind 127.0.0.1
+```
+
+The other settings in [.env.example](.env.example) are read from the
+environment the same way, and an invalid value stops the server at startup.
+Without `--bind` the server listens on `0.0.0.0:8080`, which is meant for the
+container; don't expose it on your LAN. The local command has no `-I`, because
+`-I` also leaves the current directory off `sys.path`, so Python would not find
+the package in `core/`. The image installs the package where Python finds it,
+so the container runs `python -I -m strange_ringtone`.
+
 **Pull requests:** branch from `main` as `feat/…` or `fix/…`. PRs are
 squash-merged, so their titles must be conventional-commit subjects (`feat:`,
 `fix:`, `docs:`, `ci:`, `chore:`, with `!` for a breaking change). release-please
