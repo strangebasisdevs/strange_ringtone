@@ -83,7 +83,8 @@ Uploads are written only under `/tmp/strange_ringtone` (on Windows, which is
 for development only, under the user's temporary directory); `TMPDIR` does
 not move it.
 Without `--bind` the server listens on `0.0.0.0:8080`, which is meant for the
-container; don't expose it on your LAN. The command passes the `core`
+container; don't expose it on your LAN. `--bind` takes an IP address, never a
+host name, so starting the server makes no DNS lookup. The command passes the `core`
 directory rather than `-m strange_ringtone`: `-I` leaves the current directory
 off `sys.path`, so `-m` finds the package only where it is installed, while a
 directory that Python runs is always on `sys.path`.

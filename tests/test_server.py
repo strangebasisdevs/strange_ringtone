@@ -23,8 +23,8 @@ from unittest import mock
 
 import helpers  # noqa: F401  (puts core/ on sys.path)
 from strange_ringtone import __main__ as entry
+from strange_ringtone import config, static
 from strange_ringtone import server as server_module
-from strange_ringtone import static
 from strange_ringtone.config import Settings
 from strange_ringtone.http_guard import GuardError
 from strange_ringtone.server import CHUNK_BYTES, Handler, RingtoneServer
@@ -1180,6 +1180,103 @@ class MainTest(unittest.TestCase):
         self.assertIn("MAX_CLIP_SECONDS", result.stderr)
 
 
+class EntryPointTest(unittest.TestCase):
+    """main() up to the point where it would serve, with RingtoneServer replaced."""
+
+    def setUp(self) -> None:
+        previous = signal.getsignal(signal.SIGTERM)
+        self.addCleanup(signal.signal, signal.SIGTERM, previous)
+        self.addresses: list[tuple[str, int]] = []
+        self.error: BaseException | None = None
+        test = self
+
+        class FakeServer:
+            def __init__(self, address: tuple[str, int], settings: Settings) -> None:
+                test.addresses.append(address)
+                if test.error is not None:
+                    raise test.error
+
+            def serve_forever(self) -> None:
+                pass
+
+            def server_close(self) -> None:
+                pass
+
+        env = {name: value for name, value in os.environ.items() if name not in MainTest.CONTRACT}
+        env["PUBLIC_ORIGIN"] = ORIGIN
+        for patcher in (mock.patch.dict(os.environ, env, clear=True),
+                        mock.patch.object(entry, "RingtoneServer", FakeServer)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def run_main(self, argv: list[str]) -> tuple[int, str]:
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            try:
+                code = entry.main(argv)
+            except SystemExit as exit_:
+                code = exit_.code if isinstance(exit_.code, int) else 1
+        return code, stderr.getvalue()
+
+    def test_contract_port(self) -> None:
+        # Part of the deployment contract: changing it is a breaking change.
+        self.assertEqual(entry.PORT, 8080)
+
+    def test_default_bind_is_all_addresses_on_8080(self) -> None:
+        # The container passes no --bind. Only the address tuple is checked;
+        # nothing is bound.
+        code, _ = self.run_main([])
+        self.assertEqual(code, 0)
+        self.assertEqual(self.addresses, [("0.0.0.0", 8080)])
+
+    def test_bind_takes_ip_literals(self) -> None:
+        for value, expected in (("127.0.0.1", "127.0.0.1"), ("::1", "::1"), ("0:0::1", "::1")):
+            with self.subTest(value=value):
+                self.addresses.clear()
+                code, _ = self.run_main(["--bind", value])
+                self.assertEqual(code, 0)
+                self.assertEqual(self.addresses, [(expected, 8080)])
+
+    def test_bind_refuses_host_names_before_any_lookup(self) -> None:
+        # A host name would reach getaddrinfo, a DNS query the core never makes.
+        with mock.patch("socket.getaddrinfo", side_effect=AssertionError("getaddrinfo called")):
+            for value in ("localhost", "nonexistent.example.invalid", "127.0.0.1 ", "fe80::1%eth0", "", "1"):
+                with self.subTest(value=value):
+                    code, stderr = self.run_main(["--bind", value])
+                    self.assertEqual(code, 2)
+                    self.assertIn("--bind", stderr)
+                    self.assertNotIn("Traceback", stderr)
+        self.assertEqual(self.addresses, [])
+
+    def test_startup_failures_refuse_cleanly(self) -> None:
+        # The scratch checks raise RuntimeError, a busy port OSError and a
+        # broken page template ValueError: each is one line and exit code 1.
+        for error in (RuntimeError("scratch directory is owned by another user"),
+                      OSError("address in use"), ValueError("bad template")):
+            with self.subTest(error=type(error).__name__):
+                self.error = error
+                code, stderr = self.run_main(["--bind", "127.0.0.1"])
+                self.assertEqual(code, 1)
+                self.assertIn("strange_ringtone: cannot start: ", stderr)
+                self.assertNotIn("Traceback", stderr)
+
+    def test_unusable_scratch_directory_refuses_cleanly(self) -> None:
+        # The real server this time, with the default scratch path moved under
+        # a directory that doesn't exist, as in a container without the tmpfs.
+        with tempfile.TemporaryDirectory() as temp:
+            missing = Path(temp) / "no-tmpfs" / "strange_ringtone"
+            with (
+                mock.patch.object(entry, "RingtoneServer", RingtoneServer),
+                mock.patch.object(config, "_WINDOWS", False),
+                mock.patch.object(config, "SCRATCH_DIR", missing),
+            ):
+                code, stderr = self.run_main(["--bind", "127.0.0.1"])
+            self.assertFalse(missing.parent.exists())
+        self.assertEqual(code, 1)
+        self.assertIn("cannot create the scratch directory", stderr)
+        self.assertNotIn("Traceback", stderr)
+
+
 class SigtermTest(unittest.TestCase):
     """As PID 1 in a container, a process with no SIGTERM handler ignores the signal."""
 
@@ -1244,6 +1341,24 @@ class SigtermTest(unittest.TestCase):
 
 
 class ServerBindTest(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "win32", "SO_REUSEADDR is only unsafe on Windows")
+    def test_no_address_reuse_on_windows(self) -> None:
+        # There SO_REUSEADDR lets a second process bind the same port and take
+        # over its connections.
+        self.assertIs(RingtoneServer.allow_reuse_address, False)
+        with tempfile.TemporaryDirectory() as temp:
+            settings = Settings(public_origin=ORIGIN, scratch_dir=Path(temp) / "scratch")
+            server = RingtoneServer(("127.0.0.1", 0), settings)
+            try:
+                self.assertEqual(server.socket.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR), 0)
+            finally:
+                server.server_close()
+
+    @unittest.skipIf(sys.platform == "win32", "SO_REUSEADDR is only unsafe on Windows")
+    def test_address_reuse_elsewhere(self) -> None:
+        # On Linux it only lets a restarted container bind again at once.
+        self.assertIs(RingtoneServer.allow_reuse_address, True)
+
     def test_no_reverse_dns_lookup_at_startup(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             settings = Settings(public_origin=ORIGIN, scratch_dir=Path(temp) / "scratch")

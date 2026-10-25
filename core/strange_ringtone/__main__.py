@@ -10,6 +10,7 @@ line, so a local run can stay on loopback while the image passes nothing.
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import os
 import signal
 import sys
@@ -28,6 +29,20 @@ def _stop(signum: int, frame: FrameType | None) -> None:
     raise SystemExit(0)
 
 
+def _bind_address(value: str) -> str:
+    # An IP literal only: socket.bind resolves anything else with getaddrinfo,
+    # which can be a DNS query, and the core makes no network queries at all.
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be an IP address such as 127.0.0.1 or ::1, not a host name") from None
+    # A zone index ("fe80::1%eth0") is not something inet_pton can parse, so
+    # it would go through getaddrinfo too.
+    if isinstance(address, ipaddress.IPv6Address) and address.scope_id is not None:
+        raise argparse.ArgumentTypeError("must be an IP address without a zone index")
+    return str(address)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="strange_ringtone", description="Serve strange_ringtone's core on port 8080."
@@ -35,8 +50,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--bind",
         default="0.0.0.0",
+        type=_bind_address,
         metavar="HOST",
-        help="address to listen on (default 0.0.0.0, for the container; use 127.0.0.1 locally)",
+        help="IP address to listen on (default 0.0.0.0, for the container; use 127.0.0.1 locally)",
     )
     args = parser.parse_args(argv)
     try:
