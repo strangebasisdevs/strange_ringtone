@@ -221,6 +221,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.request_version = "HTTP/1.0"
             self.send_json_error(400, "http_400")
             return False
+        # Every other method, whatever its spelling (HEAD, OPTIONS, TRACE,
+        # CONNECT, a lower-case "get", any token), is refused here with a JSON
+        # 405 and an Allow header, or a 404 on an unknown path: never the
+        # stdlib's 501 without Allow, and never a CORS approval.
+        if self.command not in ("GET", "POST"):
+            self._refuse_method()
+            return False
         return True
 
     # --- routing -------------------------------------------------------------
@@ -301,23 +308,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._render()
         except GuardError as error:
             self.send_json_error(error.status, error.code, error.retry_after)
-
-    # Every other verb the stdlib would dispatch is refused explicitly, so the
-    # answer is a JSON 405 (or 404) with an Allow header, never a CORS approval.
-    def do_HEAD(self) -> None:
-        self._refuse_method()
-
-    def do_OPTIONS(self) -> None:
-        self._refuse_method()
-
-    def do_PUT(self) -> None:
-        self._refuse_method()
-
-    def do_DELETE(self) -> None:
-        self._refuse_method()
-
-    def do_PATCH(self) -> None:
-        self._refuse_method()
 
     # --- the render endpoint -------------------------------------------------
 

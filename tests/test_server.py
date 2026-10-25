@@ -225,7 +225,7 @@ class HeadersTest(ServerTestCase):
             ("501 render", build_request("POST", "/api/render", self.render_headers(0)), False),
             ("400 bad request line", b"GET / HTTP/1.0 extra\r\n", True),
             ("400 HTTP/0.9", b"GET /\r\n", True),
-            ("501 unknown verb", b"BREW / HTTP/1.0\r\n\r\n", False),
+            ("405 unknown verb", b"BREW / HTTP/1.0\r\n\r\n", False),
             # Exactly 65537 bytes: the stdlib reads that much, finds no line end,
             # and answers 414 with nothing left unread on the socket.
             ("414", b"GET /" + b"a" * (65537 - 5), False),
@@ -246,7 +246,6 @@ class HeadersTest(ServerTestCase):
         cases = [
             ("bad request line", b"GET / HTTP/1.0 extra\r\n", 400),
             ("HTTP/0.9", b"GET /\r\n", 400),
-            ("unknown verb", b"BREW / HTTP/1.0\r\n\r\n", 501),
             ("request line too long", b"GET /" + b"a" * (65537 - 5), 414),
         ]
         for label, data, status in cases:
@@ -479,6 +478,14 @@ class MethodTest(ServerTestCase):
             ("PATCH", "/api/render", "POST"),
             ("OPTIONS", "/api/render", "POST"),
             ("OPTIONS", "/", "GET"),
+            # Methods with no handler of their own, which the stdlib answers 501.
+            ("TRACE", "/api/render", "POST"),
+            ("CONNECT", "/api/render", "POST"),
+            ("BREW", "/api/render", "POST"),
+            ("get", "/api/render", "POST"),
+            ("post", "/api/render", "POST"),
+            ("BREW", "/", "GET"),
+            ("TRACE", "/static/dev/app.js", "GET"),
         ]
         for method, path, allow in cases:
             with self.subTest(f"{method} {path}"):
@@ -507,7 +514,7 @@ class MethodTest(ServerTestCase):
         self.assertEqual(rest, b"")
 
     def test_unknown_paths(self) -> None:
-        for method in ("GET", "POST", "PUT", "OPTIONS"):
+        for method in ("GET", "POST", "PUT", "OPTIONS", "TRACE", "BREW"):
             with self.subTest(method):
                 self.assertJsonError(self.request(method, "/api/nope", [("Content-Length", "0")]), 404, "not_found")
         self.assertScratchEmpty()
@@ -948,9 +955,15 @@ class LogTest(ServerTestCase):
         self.assertNotIn("SecretDetail", self.log.getvalue())
 
     def test_stdlib_errors_log_one_line_without_the_request_line(self) -> None:
+        exchange(self.port, b"GET /?SecretQuery HTTP/1.0 extra\r\n", half_close=True)
+        line = self.wait_for_log("- ")[0]
+        self.assertRegex(line, r"^- - 400 [0-9]+\.[0-9]{3}$")
+        self.assertNotIn("Secret", self.log.getvalue())
+
+    def test_refused_methods_log_one_line_without_the_query(self) -> None:
         exchange(self.port, b"BREW /?SecretQuery HTTP/1.0\r\n\r\n")
         line = self.wait_for_log("BREW ")[0]
-        self.assertRegex(line, r"^BREW / 501 [0-9]+\.[0-9]{3}$")
+        self.assertRegex(line, r"^BREW / 405 [0-9]+\.[0-9]{3}$")
         self.assertNotIn("Secret", self.log.getvalue())
 
 
