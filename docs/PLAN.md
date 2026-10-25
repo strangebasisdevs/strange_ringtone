@@ -1,8 +1,9 @@
 # strange_ringtone: research and v0.1.0 plan
 
-Status: design agreed on 2026-10-24 (decisions in section 3). No code has been
-written. This file is the design record; the README's "Deployment contract"
-becomes the source of truth for operators once v0.1.0 ships.
+Status: design agreed on 2026-10-24 (decisions in section 3). Milestones 0
+and 1 are done, and the core server of milestone 2 is implemented (section 12).
+This file is the design record; the README's "Deployment contract" becomes the
+source of truth for operators once v0.1.0 ships.
 
 ## 1. Short answer
 

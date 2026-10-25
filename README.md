@@ -38,6 +38,8 @@ shows.
 | Path | What |
 | --- | --- |
 | `docs/PLAN.md` | Research, decisions and the v0.1.0 plan |
+| `core/` | The core server: the `strange_ringtone` package and its static files |
+| `.env.example` | The core's settings, with placeholders and defaults |
 | `tools/spike/phase0.py` | Generates the test tones that established the share sheet's rules |
 | `scripts/` | Stdlib checks that CI runs on pull requests |
 | `tests/` | Stdlib `unittest` tests |
