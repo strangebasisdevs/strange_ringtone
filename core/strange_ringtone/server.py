@@ -93,6 +93,10 @@ def _prepare_scratch(directory: Path) -> None:
         raise RuntimeError(f"scratch path is not a plain directory: {directory}")
     if hasattr(os, "getuid") and info.st_uid != os.getuid():
         raise RuntimeError(f"scratch directory is owned by another user: {directory}")
+    # Owner-only is the strictest mode a directory can usefully have; Semgrep's
+    # insecure-file-permissions rule flags any execute bit, which a directory
+    # needs to be entered at all.
+    # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
     os.chmod(directory, 0o700)
     # Startup clears whatever an earlier process left behind (docs/PLAN.md
     # 5.5): the core keeps no state across restarts.
