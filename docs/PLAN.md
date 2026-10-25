@@ -323,6 +323,7 @@ the user types becomes the filename. Decision 9 keeps it readable:
 | `MAX_RESULTS` | 50 | Results held at once; 503 when full (5.5) |
 | `FETCH_ENABLED` | false | Only shows the YouTube box in the UI. The core never calls the fetcher. |
 | `SOURCE_URL` | baked at build | The AGPL source link. Forks override it. |
+| `VERSION` | baked at build, `dev` outside a release | The `/static/<version>/` path segment (5.1): 1 to 64 letters, digits, `.`, `_` or `-`, starting with a letter or digit |
 
 The core has no secrets in v0.1.0, so `.env.example` holds only
 `PUBLIC_ORIGIN=` and commented optional settings. Any later secret arrives as

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import ipaddress
+import re
 import tempfile
 import unittest
 from pathlib import Path
 
-import helpers  # noqa: F401  (puts core/ on sys.path)
+import helpers  # puts core/ on sys.path
 from strange_ringtone import config
 from strange_ringtone.config import ConfigError, Settings
 
@@ -263,6 +264,51 @@ class VersionTest(unittest.TestCase):
                       "dev ", " dev", "dev\n", "a b", "a?b", "a#b"):
             with self.subTest(value=value), self.assertRaisesRegex(ConfigError, "VERSION"):
                 from_env(VERSION=value)
+
+
+class ReadRecorder(dict[str, str]):
+    """An environment that remembers every variable the settings look up."""
+
+    def __init__(self, values: dict[str, str]) -> None:
+        super().__init__(values)
+        self.looked_up: set[str] = set()
+
+    def get(self, key: str, default: object = None) -> object:
+        self.looked_up.add(key)
+        return super().get(key, default)
+
+    def __getitem__(self, key: str) -> str:
+        self.looked_up.add(key)
+        return super().__getitem__(key)
+
+    def __contains__(self, key: object) -> bool:
+        if isinstance(key, str):
+            self.looked_up.add(key)
+        return super().__contains__(key)
+
+
+class ContractDocsTest(unittest.TestCase):
+    """The variables the server reads, the PLAN 5.7 table and .env.example agree."""
+
+    def read_variables(self) -> set[str]:
+        environ = ReadRecorder({"PUBLIC_ORIGIN": ORIGIN})
+        Settings.from_env(environ)
+        return environ.looked_up
+
+    def plan_variables(self) -> set[str]:
+        text = (helpers.ROOT / "docs" / "PLAN.md").read_text(encoding="utf-8")
+        section = text.split("### 5.7 ", 1)[1].split("\n## ", 1)[0]
+        return set(re.findall(r"^\| `([A-Z][A-Z0-9_]*)` \|", section, re.MULTILINE))
+
+    def env_example_variables(self) -> set[str]:
+        text = (helpers.ROOT / ".env.example").read_text(encoding="utf-8")
+        return set(re.findall(r"^(?:# )?([A-Z][A-Z0-9_]*)=", text, re.MULTILINE))
+
+    def test_plan_table_lists_every_variable_read(self) -> None:
+        self.assertEqual(self.plan_variables(), self.read_variables())
+
+    def test_env_example_lists_every_variable_read(self) -> None:
+        self.assertEqual(self.env_example_variables(), self.read_variables())
 
 
 if __name__ == "__main__":
