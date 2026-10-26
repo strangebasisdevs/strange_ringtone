@@ -20,14 +20,35 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from unittest import mock
+from urllib.parse import quote
 
 import helpers  # noqa: F401  (puts core/ on sys.path)
+from corpus.build import (
+    CORPUS_MAX_CLIP_SECONDS,
+    corpus_cases,
+    cut_off_body,
+    oversized_body,
+    silent_bytes,
+    valid_wav,
+)
 from strange_ringtone import __main__ as entry
 from strange_ringtone import config, static
+from strange_ringtone import render as render_module
 from strange_ringtone import server as server_module
 from strange_ringtone.config import Settings
 from strange_ringtone.http_guard import GuardError
+from strange_ringtone.names import content_disposition
+from strange_ringtone.render import Renderer
+from strange_ringtone.results import ResultStore
 from strange_ringtone.server import CHUNK_BYTES, Handler, RingtoneServer
+
+# A stand-in for ffmpeg (tests/stubs/ffmpeg_stub.py), so no server in these
+# tests ever runs, or needs, the real one.
+STUB = helpers.ROOT / "tests" / "stubs" / "ffmpeg_stub.py"
+STUB_COMMAND = (sys.executable, "-I", str(STUB))
+STUB_MODE_VAR = "STRANGE_RINGTONE_FFMPEG_STUB"
+STUB_LOG_VAR = "STRANGE_RINGTONE_FFMPEG_STUB_LOG"
+STUB_MAGIC = b"STUB-IPOD\n"
 
 ORIGIN = "https://example.internal"
 DEADLINE = 5.0
@@ -141,7 +162,13 @@ class ServerTestCase(unittest.TestCase):
 
     # --- fixtures ---------------------------------------------------------------
 
-    def start(self, render_hook: Callable[[Path, Handler], None] | None = None, **overrides: Any) -> None:
+    def start(
+        self,
+        render_hook: Callable[[Path, Handler], None] | None = None,
+        renderer: Renderer | None = None,
+        clock: Callable[[], float] | None = None,
+        **overrides: Any,
+    ) -> None:
         values: dict[str, Any] = {
             "public_origin": ORIGIN,
             # One second keeps MAX_BODY_BYTES (196096) small enough to send whole.
@@ -152,7 +179,13 @@ class ServerTestCase(unittest.TestCase):
         }
         values.update(overrides)
         self.settings = Settings(**values)
-        self.server = self.server_class(("127.0.0.1", 0), self.settings, render_hook)
+        if renderer is None:
+            renderer = Renderer(STUB_COMMAND, self.settings.render_timeout_seconds)
+        results = None
+        if clock is not None:
+            results = ResultStore(self.scratch / "results", self.settings.result_ttl_seconds,
+                                  self.settings.max_results, clock=clock)
+        self.server = self.server_class(("127.0.0.1", 0), self.settings, render_hook, renderer, results)
         thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
         thread.start()
         self.addCleanup(self._stop, self.server, thread)
@@ -188,16 +221,22 @@ class ServerTestCase(unittest.TestCase):
 
     # --- assertions ---------------------------------------------------------------
 
+    def scratch_contents(self) -> list[str]:
+        """Every path under scratch, relative and with '/', except the results directory itself."""
+        names = [str(p.relative_to(self.scratch)).replace(os.sep, "/") for p in self.scratch.rglob("*")]
+        return sorted(name for name in names if name != "results")
+
     def assertScratchEmpty(self) -> None:
+        # The results directory may exist, but empty: the store keeps it.
         # Cleanup runs after the response is written, so give it a moment.
         def empty() -> bool:
-            return not any(self.scratch.iterdir())
+            return not self.scratch_contents()
 
         try:
             wait_for(empty, "an empty scratch directory")
         except AssertionError:
             pass
-        self.assertEqual(sorted(p.name for p in self.scratch.iterdir()), [])
+        self.assertEqual(self.scratch_contents(), [])
 
     def assertSecurityHeaders(self, response: Response, hsts: bool = True) -> None:
         for name, value in SECURITY_HEADERS:
@@ -210,6 +249,13 @@ class ServerTestCase(unittest.TestCase):
         self.assertEqual(response.headers.get_all("Connection"), ["close"])
         self.assertEqual(response.headers.get_all("Content-Length"), [str(len(response.body))])
         self.assertFalse([name for name in response.headers if name.lower().startswith("access-control-")])
+
+    def assertBadWav(self, response: Response, detail: str, status: int = 400, code: str = "bad_wav") -> None:
+        self.assertEqual(response.status, status, response.body)
+        self.assertEqual(response.headers.get("Content-Type"), "application/json")
+        self.assertEqual(response.headers.get("Cache-Control"), "no-store")
+        self.assertEqual(response.json(), {"error": code, "detail": detail})
+        self.assertSecurityHeaders(response, hsts=self.settings.public_origin.startswith("https://"))
 
     def assertJsonError(self, response: Response, status: int, code: str) -> None:
         self.assertEqual(response.status, status, response.body)
@@ -228,7 +274,7 @@ class HeadersTest(ServerTestCase):
             ("404", build_request("GET", "/nope"), False),
             ("405", build_request("POST", "/"), False),
             ("403", build_request("POST", "/api/render", [("Content-Length", "0")]), False),
-            ("501 render", build_request("POST", "/api/render", self.render_headers(0)), False),
+            ("400 render", build_request("POST", "/api/render", self.render_headers(0)), False),
             ("400 bad request line", b"GET / HTTP/1.0 extra\r\n", True),
             ("400 HTTP/0.9", b"GET /\r\n", True),
             ("405 unknown verb", b"BREW / HTTP/1.0\r\n\r\n", False),
@@ -573,8 +619,9 @@ class OriginTest(ServerTestCase):
         self.assertEqual(hook.calls, [])
 
     def test_exact_origin_passes(self) -> None:
+        # Past every check to the WAV validation, which refuses four bytes.
         response = self.post_render(self.render_headers(4), b"RIFF")
-        self.assertJsonError(response, 501, "render_unavailable")
+        self.assertBadWav(response, "truncated")
         self.assertScratchEmpty()
 
 
@@ -670,7 +717,7 @@ class CheckOrderTest(ServerTestCase):
 
     def test_length_checks_before_rate_limit(self) -> None:
         self.start(rate_limit_renders_per_minute=1)
-        self.assertJsonError(self.post_render(self.render_headers(4), b"RIFF"), 501, "render_unavailable")
+        self.assertBadWav(self.post_render(self.render_headers(4), b"RIFF"), "truncated")
         refusals = [
             ([("Content-Type", "audio/wav"), ("Content-Length", "4")], 403),
             ([("Origin", ORIGIN), ("Content-Type", "text/plain"), ("Content-Length", "4")], 415),
@@ -688,7 +735,7 @@ class CheckOrderTest(ServerTestCase):
         self.start(rate_limit_renders_per_minute=1)
         for _ in range(3):
             self.assertEqual(self.post_render([("Content-Length", "4")]).status, 403)
-        self.assertJsonError(self.post_render(self.render_headers(4), b"RIFF"), 501, "render_unavailable")
+        self.assertBadWav(self.post_render(self.render_headers(4), b"RIFF"), "truncated")
         self.assertScratchEmpty()
 
 
@@ -696,7 +743,7 @@ class RateLimitTest(ServerTestCase):
     def test_limit_per_client(self) -> None:
         self.start(rate_limit_renders_per_minute=2)
         for _ in range(2):
-            self.assertJsonError(self.post_render(self.render_headers(4), b"RIFF"), 501, "render_unavailable")
+            self.assertBadWav(self.post_render(self.render_headers(4), b"RIFF"), "truncated")
         response = self.post_render(self.render_headers(4))
         self.assertJsonError(response, 429, "rate_limited")
         retry_after = response.headers.get("Retry-After")
@@ -709,7 +756,7 @@ class RateLimitTest(ServerTestCase):
         self.start(rate_limit_renders_per_minute=1)
         first = self.render_headers(4) + [("X-Forwarded-For", "192.0.2.1")]
         second = self.render_headers(4) + [("X-Forwarded-For", "192.0.2.2")]
-        self.assertEqual(self.post_render(first, b"RIFF").status, 501)
+        self.assertEqual(self.post_render(first, b"RIFF").status, 400)
         # Same socket peer, so the same client whatever the header claims.
         self.assertJsonError(self.post_render(second), 429, "rate_limited")
         self.assertScratchEmpty()
@@ -718,14 +765,14 @@ class RateLimitTest(ServerTestCase):
         self.start(rate_limit_renders_per_minute=1, trusted_proxies=(ipaddress.ip_network("127.0.0.0/8"),))
         first = self.render_headers(4) + [("X-Forwarded-For", "192.0.2.1")]
         second = self.render_headers(4) + [("X-Forwarded-For", "198.51.100.7, 192.0.2.2")]
-        self.assertEqual(self.post_render(first, b"RIFF").status, 501)
-        self.assertEqual(self.post_render(second, b"RIFF").status, 501)
+        self.assertEqual(self.post_render(first, b"RIFF").status, 400)
+        self.assertEqual(self.post_render(second, b"RIFF").status, 400)
         # 192.0.2.1 again, now behind a client-written hop on the left.
         again = self.render_headers(4) + [("X-Forwarded-For", "203.0.113.9, 192.0.2.1")]
         self.assertJsonError(self.post_render(again), 429, "rate_limited")
         # Garbage falls back to the peer, which has its own budget.
         garbage = self.render_headers(4) + [("X-Forwarded-For", "not-an-address")]
-        self.assertEqual(self.post_render(garbage, b"RIFF").status, 501)
+        self.assertEqual(self.post_render(garbage, b"RIFF").status, 400)
         self.assertEqual(self.post_render(garbage).status, 429)
         self.assertScratchEmpty()
 
@@ -857,11 +904,11 @@ class GateTest(ServerTestCase):
 
 
 class BodyTest(ServerTestCase):
-    def test_default_hook_answers_501(self) -> None:
+    def test_default_hook_validates_the_wav(self) -> None:
         response = self.post_render(self.render_headers(4), b"RIFF")
-        self.assertJsonError(response, 501, "render_unavailable")
-        self.assertEqual(response.body, b'{"error": "render_unavailable"}')
-        self.wait_for_log("POST /api/render 501")
+        self.assertBadWav(response, "truncated")
+        self.assertEqual(response.body, b'{"error": "bad_wav", "detail": "truncated"}')
+        self.wait_for_log("POST /api/render 400")
         self.assertScratchEmpty()
 
     def test_hook_gets_in_wav_with_the_exact_bytes(self) -> None:
@@ -1332,12 +1379,12 @@ class LogTest(ServerTestCase):
     def test_render_request_logs_nothing_private(self) -> None:
         headers = self.render_headers(10) + [("X-Tone-Name", "SecretHeader"), ("User-Agent", "SecretAgent")]
         response = self.post_render(headers, b"SecretBody")
-        self.assertEqual(response.status, 501)
+        self.assertEqual(response.status, 400)
         self.request("POST", "/api/render?name=SecretQuery&fade_in=1", [("Content-Length", "0")])
         lines = self.wait_for_log("POST /api/render ", count=2)
         # Each line is written after its response, so their order can vary.
         self.assertEqual(sorted(line.rsplit(" ", 1)[0] for line in lines),
-                         ["POST /api/render 403", "POST /api/render 501"])
+                         ["POST /api/render 400", "POST /api/render 403"])
         for line in lines:
             self.assertRegex(line, r"^POST /api/render [0-9]{3} [0-9]+\.[0-9]{3}$")
         log = self.log.getvalue()
@@ -1377,6 +1424,481 @@ class LogTest(ServerTestCase):
         line = self.wait_for_log("BREW ")[0]
         self.assertRegex(line, r"^BREW / 405 [0-9]+\.[0-9]{3}$")
         self.assertNotIn("Secret", self.log.getvalue())
+
+
+class FakeClock:
+    """The results store's clock, moved only by the test."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+        self._lock = threading.Lock()
+
+    def __call__(self) -> float:
+        with self._lock:
+            return self.now
+
+    def advance(self, seconds: float) -> None:
+        with self._lock:
+            self.now += seconds
+
+
+class RenderFlowTestCase(ServerTestCase):
+    """The default hook end to end, with the stub ffmpeg and a fake results clock."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.runs_log = self.temp / "runs.jsonl"
+        self.stub_mode("ok")
+        self.clock = FakeClock()
+        self.start(clock=self.clock)
+
+    def stub_mode(self, mode: str) -> None:
+        patcher = mock.patch.dict(os.environ, {STUB_MODE_VAR: mode, STUB_LOG_VAR: str(self.runs_log)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def runs(self) -> list[list[str]]:
+        if not self.runs_log.exists():
+            return []
+        return [json.loads(line)["argv"] for line in self.runs_log.read_text(encoding="utf-8").splitlines()]
+
+    def wav(self, seconds: float = 1.0) -> bytes:
+        return valid_wav(self.temp / "upload.wav", seconds).read_bytes()
+
+    def render(self, query: str = "", name: str | None = None, body: bytes | None = None,
+               extra: list[tuple[str, str]] | None = None) -> Response:
+        data = self.wav() if body is None else body
+        headers = self.render_headers(len(data))
+        if name is not None:
+            headers.append(("X-Tone-Name", name))
+        headers += extra or []
+        return self.post_render(headers, data, path="/api/render" + query)
+
+    def rendered(self, response: Response) -> str:
+        self.assertEqual(response.status, 200, response.body)
+        payload = response.json()
+        self.assertEqual(sorted(payload), ["applied_gain_db", "duration", "measured_lufs", "result_id"])
+        self.assertRegex(payload["result_id"], r"^[0-9a-f]{32}$")
+        return str(payload["result_id"])
+
+    def chain(self, run: list[str]) -> str:
+        return run[run.index("-af") + 1]
+
+
+class RenderFlowTest(RenderFlowTestCase):
+    def test_render_and_download(self) -> None:
+        name = "My Tone \U0001F3B5"
+        response = self.render("?fade_in=0.5&fade_out=0.25&normalize=true&target_lufs=-11", quote(name, safe=""))
+        result_id = self.rendered(response)
+        self.assertEqual(response.headers.get("Content-Type"), "application/json")
+        self.assertEqual(response.headers.get("Cache-Control"), "no-store")
+        self.assertSecurityHeaders(response)
+        # The stub's upload measures -23 LUFS, so the gain is 12 dB.
+        self.assertEqual(response.json(), {
+            "result_id": result_id, "duration": 1.0, "measured_lufs": -11.0, "applied_gain_db": 12.0,
+        })
+        measure, render_run = self.runs()
+        self.assertNotIn("-y", measure)
+        self.assertEqual(
+            self.chain(render_run),
+            "volume=12.00dB,alimiter=limit=0.8414:level=false:latency=true,afade=t=in:st=0:d=0.500:curve=qsin,"
+            "afade=t=out:st=0.750:d=0.250:curve=qsin,ebur128=peak=true",
+        )
+        self.assertEqual(render_run[render_run.index("-metadata") + 1], f"title={name}")
+
+        tone = self.request("GET", f"/api/result/{result_id}.m4a")
+        self.assertEqual(tone.status, 200)
+        self.assertTrue(tone.body.startswith(STUB_MAGIC))
+        self.assertEqual(json.loads(tone.body[len(STUB_MAGIC):])["title"], name)
+        self.assertEqual(tone.headers.get_all("Content-Type"), ["audio/mp4"])
+        self.assertEqual(tone.headers.get_all("Cache-Control"), ["no-store"])
+        self.assertEqual(tone.headers.get_all("Content-Disposition"), [content_disposition(name, "m4a")])
+        self.assertSecurityHeaders(tone)
+        ringtone = self.request("GET", f"/api/result/{result_id}.m4r")
+        self.assertEqual(ringtone.status, 200)
+        self.assertEqual(ringtone.body, tone.body)
+        self.assertEqual(ringtone.headers.get_all("Content-Type"), ["audio/x-m4r"])
+        self.assertEqual(ringtone.headers.get_all("Content-Disposition"), [content_disposition(name, "m4r")])
+        # A download never deletes: the result lives its whole TTL.
+        self.assertEqual(self.request("GET", f"/api/result/{result_id}.m4a").body, tone.body)
+
+        # Only the result remains, under its ID; the name is in no path.
+        self.wait_for_log("GET /api/result/", count=3)
+        self.assertEqual(self.scratch_contents(), [f"results/{result_id}", f"results/{result_id}/tone.m4a"])
+        log = self.log.getvalue()
+        for secret in (result_id, "Tone", "%F0", "fade", "target", "-11"):
+            with self.subTest(secret=secret):
+                self.assertNotIn(secret, log)
+        self.assertIn("GET /api/result/<id>.m4a 200 ", log)
+        self.assertIn("GET /api/result/<id>.m4r 200 ", log)
+        self.assertIn("POST /api/render 200 ", log)
+
+    def test_defaults(self) -> None:
+        self.start(clock=self.clock, max_clip_seconds=2, default_target_lufs=-16.0)
+        response = self.render(body=self.wav(2.0))
+        result_id = self.rendered(response)
+        self.assertEqual(response.json()["applied_gain_db"], 7.0)
+        self.assertEqual(
+            self.chain(self.runs()[1]),
+            "volume=7.00dB,alimiter=limit=0.8414:level=false:latency=true,afade=t=in:st=0:d=0.200:curve=qsin,"
+            "afade=t=out:st=0.500:d=1.500:curve=qsin,ebur128=peak=true",
+        )
+        tone = self.request("GET", f"/api/result/{result_id}.m4a")
+        self.assertEqual(tone.headers.get("Content-Disposition"), content_disposition("ringtone", "m4a"))
+
+    def test_json_rounding(self) -> None:
+        # 44123 frames is 1.000521 s; a -14.333 target gives a gain of 8.667 dB.
+        self.start(clock=self.clock, max_clip_seconds=2)
+        response = self.render("?target_lufs=-14.333", body=silent_bytes(44123))
+        self.rendered(response)
+        payload = response.json()
+        self.assertEqual(payload["duration"], 1.001)
+        self.assertEqual(payload["applied_gain_db"], 8.67)
+        # The stub prints one decimal, as ffmpeg does.
+        self.assertEqual(payload["measured_lufs"], -14.3)
+        self.assertIn(b'"applied_gain_db": 8.67}', response.body)
+
+    def test_normalize_false_skips_the_measure_pass(self) -> None:
+        response = self.render("?normalize=false")
+        self.rendered(response)
+        self.assertEqual(response.json()["applied_gain_db"], 0.0)
+        self.assertEqual(response.json()["measured_lufs"], -23.0)
+        self.assertEqual(len(self.runs()), 1)
+        self.assertTrue(self.chain(self.runs()[0]).startswith("volume=0.00dB,"))
+
+    def test_a_missed_target_gets_one_corrective_pass(self) -> None:
+        self.stub_mode("offset")
+        response = self.render()
+        self.rendered(response)
+        self.assertEqual(response.json()["applied_gain_db"], 10.0)
+        self.assertEqual(response.json()["measured_lufs"], -14.0)
+        self.assertEqual(len(self.runs()), 3)
+
+    def test_the_name_never_becomes_a_path(self) -> None:
+        result_id = self.rendered(self.render(name=quote("../../outside", safe="")))
+        self.assertEqual(self.scratch_contents(), [f"results/{result_id}", f"results/{result_id}/tone.m4a"])
+        self.assertEqual(sorted(p.name for p in self.temp.iterdir()), ["runs.jsonl", "scratch", "upload.wav"])
+        tone = self.request("GET", f"/api/result/{result_id}.m4a")
+        self.assertEqual(tone.headers.get("Content-Disposition"), content_disposition("outside", "m4a"))
+
+    def test_statelessness(self) -> None:
+        result_id = self.rendered(self.render(name="Secret"))
+        self.assertEqual(self.request("GET", f"/api/result/{result_id}.m4r").status, 200)
+        # After render and download only the result remains.
+        self.assertEqual(self.scratch_contents(), [f"results/{result_id}", f"results/{result_id}/tone.m4a"])
+        self.clock.advance(self.settings.result_ttl_seconds)
+        # Refused the moment the TTL is up, before any sweep.
+        self.assertJsonError(self.request("GET", f"/api/result/{result_id}.m4a"), 404, "not_found")
+        self.server.results.sweep()
+        # After the TTL sweep scratch holds nothing.
+        self.assertScratchEmpty()
+
+    def test_a_restart_forgets_every_result(self) -> None:
+        result_id = self.rendered(self.render())
+        self.start(clock=self.clock)
+        self.assertScratchEmpty()
+        self.assertJsonError(self.request("GET", f"/api/result/{result_id}.m4a"), 404, "not_found")
+
+
+class RenderParamsTest(RenderFlowTestCase):
+    BAD_QUERIES = [
+        "?fade_in=5.01", "?fade_in=-0.1", "?fade_out=6", "?fade_out=-1",
+        "?target_lufs=-8.9", "?target_lufs=-25", "?target_lufs=0",
+        "?fade_in=1e0", "?fade_in=.5", "?fade_in=0.5.", "?fade_in=1.", "?fade_in=+1", "?fade_in=0x1",
+        "?target_lufs=nan", "?target_lufs=-inf", "?target_lufs=%2D14", "?fade%5Fin=1", "?fade_in=1+",
+        "?fade_in=" + "0" * 20 + "1",
+        "?fade_in=", "?fade_in", "?fade_in=1&fade_in=1", "?fade_in=1&", "?&fade_in=1", "?fade_in=1&&fade_out=1",
+        "?fade_in=1;fade_out=1", "?fade_in=1=2",
+        "?normalize=TRUE", "?normalize=1", "?normalize=yes", "?normalize=",
+        "?volume=3", "?name=x", "?FADE_IN=1",
+        "?a=1&b=2&c=3&d=4&e=5&f=6&g=7&h=8&i=9",
+    ]
+
+    def test_bad_params_are_refused_before_the_rate_limit(self) -> None:
+        self.start(clock=self.clock, rate_limit_renders_per_minute=1)
+        for query in self.BAD_QUERIES:
+            with self.subTest(query=query):
+                self.assertJsonError(self.render(query), 400, "bad_params")
+                self.assertScratchEmpty()
+        self.assertEqual(self.runs(), [])
+        # None of them used the client's one render.
+        self.rendered(self.render())
+
+    def test_boundaries_are_accepted(self) -> None:
+        for query in ("?fade_in=0&fade_out=0", "?fade_in=5&fade_out=5.0", "?target_lufs=-24", "?target_lufs=-9",
+                      "?target_lufs=-9.0", "?normalize=true", "?fade_in=0001.250", ""):
+            with self.subTest(query=query):
+                self.rendered(self.render(query))
+
+    def test_params_after_the_length_checks(self) -> None:
+        # Origin, type and length come first (docs/PLAN.md 5.2).
+        response = self.post_render([("Content-Type", "audio/wav"), ("Content-Length", "4")],
+                                    path="/api/render?fade_in=99")
+        self.assertJsonError(response, 403, "bad_origin")
+        headers = [("Origin", ORIGIN), ("Content-Type", "audio/wav"), ("Content-Length", "99999999")]
+        self.assertJsonError(self.post_render(headers, path="/api/render?fade_in=99"), 413, "too_large")
+
+    def test_bad_names_are_refused_before_the_rate_limit(self) -> None:
+        self.start(clock=self.clock, rate_limit_renders_per_minute=1)
+        cases = [
+            [("X-Tone-Name", "a"), ("X-Tone-Name", "b")],
+            [("X-Tone-Name", "%FF")],
+            [("X-Tone-Name", "%E2%82")],
+            [("X-Tone-Name", "a b")],
+            [("X-Tone-Name", "caf\xe9")],
+            [("X-Tone-Name", "x" * 513)],
+        ]
+        for extra in cases:
+            with self.subTest(extra=extra):
+                self.assertJsonError(self.render(extra=extra), 400, "bad_name")
+                self.assertScratchEmpty()
+        self.assertEqual(self.runs(), [])
+        self.rendered(self.render(name="x" * 512))
+
+
+class RenderInputTest(RenderFlowTestCase):
+    def test_every_corpus_case_is_refused_and_leaves_nothing(self) -> None:
+        self.start(clock=self.clock, max_clip_seconds=CORPUS_MAX_CLIP_SECONDS)
+        corpus = self.temp / "corpus"
+        corpus.mkdir()
+        for case, (path, code) in corpus_cases(corpus).items():
+            with self.subTest(case=case):
+                response = self.render(name="SecretName", body=path.read_bytes())
+                if code == "too_long":
+                    self.assertBadWav(response, "too_long", status=413, code="too_large")
+                else:
+                    self.assertBadWav(response, code)
+                self.assertScratchEmpty()
+        # Nothing ever reached ffmpeg.
+        self.assertEqual(self.runs(), [])
+        self.assertEqual(len(self.server.results), 0)
+        self.assertNotIn("SecretName", self.log.getvalue())
+
+    def test_an_oversized_body_is_refused_on_its_length(self) -> None:
+        length = len(oversized_body(self.settings.max_body_bytes))
+        headers = [("Origin", ORIGIN), ("Content-Type", "audio/wav"), ("Content-Length", str(length))]
+        self.assertJsonError(self.post_render(headers), 413, "too_large")
+        self.assertScratchEmpty()
+
+    def test_a_body_cut_off_mid_stream(self) -> None:
+        sent, declared = cut_off_body()
+        data = build_request("POST", "/api/render", self.render_headers(declared), sent)
+        response = exchange(self.port, data, half_close=True)
+        assert response is not None
+        self.assertJsonError(response, 400, "incomplete_body")
+        self.assertEqual(self.runs(), [])
+        self.assertScratchEmpty()
+
+
+class RenderFailureTest(RenderFlowTestCase):
+    def assertFailed(self, response: Response, status: int, code: str) -> None:
+        self.assertJsonError(response, status, code)
+        self.wait_for_log(f"POST /api/render {status}")
+        self.assertScratchEmpty()
+        self.assertEqual(len(self.server.results), 0)
+        self.assertNotIn("SecretName", self.log.getvalue())
+        self.assertNotIn("Traceback", self.log.getvalue())
+
+    def test_ffmpeg_failure(self) -> None:
+        self.stub_mode("fail")
+        for query in ("", "?normalize=false"):
+            with self.subTest(query=query):
+                self.assertFailed(self.render(query, name="SecretName"), 500, "render_failed")
+
+    def test_unparsable_measurement_is_a_render_failure(self) -> None:
+        self.stub_mode("unparsable")
+        for query in ("", "?normalize=false"):
+            with self.subTest(query=query):
+                self.assertFailed(self.render(query, name="SecretName"), 500, "render_failed")
+
+    def test_timeout(self) -> None:
+        self.stub_mode("hang")
+        self.start(clock=self.clock, render_timeout_seconds=1)
+        started = time.monotonic()
+        self.assertFailed(self.render(name="SecretName"), 504, "render_timeout")
+        self.assertLess(time.monotonic() - started, 10)
+
+    def test_missing_ffmpeg(self) -> None:
+        # What a checkout on Windows does with the production renderer.
+        self.start(clock=self.clock, renderer=Renderer((str(self.temp / "no-ffmpeg"),), 20))
+        self.assertFailed(self.render(name="SecretName"), 500, "render_failed")
+
+    def test_the_slot_is_free_after_a_failure(self) -> None:
+        self.stub_mode("fail")
+        self.start(clock=self.clock, render_concurrency=1)
+        for _ in range(3):
+            self.assertEqual(self.render().status, 500)
+        self.stub_mode("ok")
+        self.rendered(self.render())
+
+
+class ResultsFullTest(RenderFlowTestCase):
+    def test_full_store_is_refused_before_the_slot(self) -> None:
+        self.start(clock=self.clock, max_results=1, rate_limit_renders_per_minute=2)
+        self.rendered(self.render())
+        self.assertEqual(len(self.runs()), 2)
+        for _ in range(3):
+            response = self.render()
+            self.assertJsonError(response, 503, "results_full")
+            self.assertEqual(response.headers.get("Retry-After"), "10")
+        # No upload was rendered and no budget was used.
+        self.assertEqual(len(self.runs()), 2)
+        self.clock.advance(self.settings.result_ttl_seconds)
+        self.rendered(self.render())
+        # The rate limit is still asked first.
+        self.assertJsonError(self.render(), 429, "rate_limited")
+
+    def test_store_filled_during_the_render(self) -> None:
+        self.start(clock=self.clock, max_results=1)
+        first = self.rendered(self.render())
+        # Another render took the last place after this one passed the check.
+        with mock.patch.object(self.server.results, "is_full", return_value=False):
+            response = self.render(name="SecretName")
+        self.assertJsonError(response, 503, "results_full")
+        self.assertEqual(response.headers.get("Retry-After"), "10")
+        self.assertEqual(len(self.runs()), 4)
+        self.wait_for_log("POST /api/render 503")
+        # The refused render left nothing: its job directory and output are gone.
+        self.assertEqual(self.scratch_contents(), [f"results/{first}", f"results/{first}/tone.m4a"])
+
+
+class ResultRouteTest(RenderFlowTestCase):
+    def test_unknown_malformed_and_tricky_ids_are_not_found(self) -> None:
+        result_id = self.rendered(self.render())
+        paths = [
+            f"/api/result/{'0' * 32}.m4a",
+            f"/api/result/{result_id.upper()}.m4a",
+            f"/api/result/{result_id[:-1]}.m4a",
+            f"/api/result/{result_id}0.m4a",
+            f"/api/result/{result_id}.mp3",
+            f"/api/result/{result_id}.M4A",
+            f"/api/result/{result_id}.m4a/",
+            f"/api/result/{result_id}.m4a.m4a",
+            f"/api/result/{result_id}",
+            f"/api/result/{result_id}/tone.m4a",
+            f"/api/result/../{result_id}.m4a",
+            f"/api/result/%2e%2e/{result_id}.m4a",
+            f"/api/result/{result_id}%2Em4a",
+            f"/api/result//{result_id}.m4a",
+            f"//api/result/{result_id}.m4a",
+            f"/api/results/{result_id}.m4a",
+            f"/API/result/{result_id}.m4a",
+            "/api/result/",
+            "/api/result",
+        ]
+        for path in paths:
+            with self.subTest(path=path):
+                self.assertJsonError(self.request("GET", path), 404, "not_found")
+        self.assertEqual(self.request("GET", f"/api/result/{result_id}.m4a?download=1").status, 200)
+
+    def test_a_file_swept_between_lookup_and_read_is_not_found(self) -> None:
+        result_id = self.rendered(self.render())
+        result = self.server.results.get(result_id)
+        assert result is not None
+        result.path.unlink()
+        self.assertJsonError(self.request("GET", f"/api/result/{result_id}.m4a"), 404, "not_found")
+        # Any read failure, not only a missing file, is a 404 rather than a
+        # dropped connection.
+        result.path.mkdir()
+        self.assertJsonError(self.request("GET", f"/api/result/{result_id}.m4r"), 404, "not_found")
+        self.assertNotIn("error while handling a request", self.log.getvalue())
+
+    def test_other_methods(self) -> None:
+        result_id = self.rendered(self.render())
+        for method, extension in (("POST", "m4a"), ("PUT", "m4r"), ("DELETE", "m4a"), ("OPTIONS", "m4a")):
+            with self.subTest(method=method):
+                response = self.request(method, f"/api/result/{result_id}.{extension}", [("Content-Length", "0")])
+                self.assertJsonError(response, 405, "method_not_allowed")
+                self.assertEqual(response.headers.get("Allow"), "GET")
+        # The same answer for an ID that never existed.
+        response = self.request("POST", f"/api/result/{'0' * 32}.m4a", [("Content-Length", "0")])
+        self.assertEqual((response.status, response.headers.get("Allow")), (405, "GET"))
+        with socket.create_connection(("127.0.0.1", self.port), timeout=DEADLINE) as sock:
+            sock.sendall(build_request("HEAD", f"/api/result/{result_id}.m4a"))
+            data = b""
+            while chunk := sock.recv(65536):
+                data += chunk
+        head, _, rest = data.partition(b"\r\n\r\n")
+        self.assertTrue(head.startswith(b"HTTP/1.0 405 "))
+        self.assertIn(b"\r\nAllow: GET", head)
+        self.assertEqual(rest, b"")
+        # The result is untouched by any of it.
+        self.assertEqual(self.request("GET", f"/api/result/{result_id}.m4a").status, 200)
+        self.wait_for_log("GET /api/result/", count=1)
+        self.assertNotIn(result_id, self.log.getvalue())
+
+    def test_log_hides_ids_in_any_result_path(self) -> None:
+        secret = "0123456789abcdef0123456789abcdef"
+        self.request("GET", f"/api/result/{secret}.m4a?x=1")
+        self.request("GET", f"/api/result/{secret.upper()}{secret}.mp3")
+        self.wait_for_log("GET /api/result/", count=2)
+        self.assertNotIn(secret, self.log.getvalue().lower())
+        self.assertIn("GET /api/result/<id>.m4a 404 ", self.log.getvalue())
+
+
+class ServerWiringTest(unittest.TestCase):
+    def test_default_renderer_and_store(self) -> None:
+        with tempfile.TemporaryDirectory() as temp, contextlib.redirect_stderr(io.StringIO()):
+            settings = Settings(public_origin=ORIGIN, scratch_dir=Path(temp) / "scratch", render_timeout_seconds=7,
+                                result_ttl_seconds=60, max_results=3)
+            server = RingtoneServer(("127.0.0.1", 0), settings)
+            try:
+                # The image's ffmpeg at its fixed path, behind prlimit on Linux.
+                self.assertEqual(server.renderer.command, (render_module.FFMPEG,))
+                self.assertEqual(server.renderer.prlimit, render_module.default_prlimit())
+                self.assertEqual(server.renderer.timeout_seconds, 7)
+                self.assertEqual(server.results.directory, settings.scratch_dir / "results")
+                self.assertEqual((server.results.ttl_seconds, server.results.max_results), (60, 3))
+                self.assertTrue(server.results.directory.is_dir())
+                self.assertIs(server.render_hook, server_module.render_and_store)
+            finally:
+                server.server_close()
+
+    def test_closing_stops_the_sweeper(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            server = RingtoneServer(("127.0.0.1", 0), Settings(public_origin=ORIGIN, scratch_dir=Path(temp) / "s"))
+            thread = server.results._thread
+            assert thread is not None
+            self.assertTrue(thread.is_alive())
+            self.assertTrue(thread.daemon)
+            server.server_close()
+            self.assertFalse(thread.is_alive())
+
+    def test_query_parsing_is_strict_and_bounded(self) -> None:
+        with mock.patch.object(server_module, "parse_qs", wraps=server_module.parse_qs) as spy:
+            server_module.parse_render_request("/api/render?fade_in=1", http.client.HTTPMessage(),
+                                               Settings(public_origin=ORIGIN))
+        self.assertEqual(spy.call_args.kwargs,
+                         {"keep_blank_values": True, "strict_parsing": True, "max_num_fields": 8})
+
+
+class ParseRenderRequestTest(unittest.TestCase):
+    """The pure parser, which the hook relies on for every option."""
+
+    def parse(self, path: str, names: list[str] | None = None) -> server_module.RenderRequest:
+        headers = http.client.HTTPMessage()
+        for value in names or []:
+            headers["X-Tone-Name"] = value
+        return server_module.parse_render_request(path, headers, Settings(public_origin=ORIGIN))
+
+    def test_defaults(self) -> None:
+        self.assertEqual(self.parse("/api/render"), server_module.RenderRequest(
+            fade_in=0.2, fade_out=1.5, normalize=True, target_lufs=-14.0, name="ringtone"))
+
+    def test_values(self) -> None:
+        self.assertEqual(
+            self.parse("/api/render?target_lufs=-9.5&normalize=false&fade_out=0&fade_in=5", ["Caf%C3%A9"]),
+            server_module.RenderRequest(fade_in=5.0, fade_out=0.0, normalize=False, target_lufs=-9.5, name="Café"),
+        )
+
+    def test_refusals(self) -> None:
+        for query in RenderParamsTest.BAD_QUERIES:
+            with self.subTest(query=query), self.assertRaises(GuardError) as raised:
+                self.parse("/api/render" + query)
+            self.assertEqual((raised.exception.status, raised.exception.code), (400, "bad_params"))
+        with self.assertRaises(GuardError) as raised:
+            self.parse("/api/render", ["a", "b"])
+        self.assertEqual((raised.exception.status, raised.exception.code), (400, "bad_name"))
 
 
 class MainTest(unittest.TestCase):
