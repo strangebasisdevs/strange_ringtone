@@ -68,9 +68,16 @@ test("an empty name sends no header", () => {
   assert.equal(toneNameHeader(42), null);
 });
 
-test("a lone surrogate becomes U+FFFD instead of throwing", () => {
-  assert.equal(toneNameHeader("a\ud800b"), "a%EF%BF%BDb");
-  assert.equal(toneNameHeader("\udc00"), "%EF%BF%BD");
+test("a lone surrogate is dropped instead of throwing", () => {
+  // Not U+FFFD: the server keeps that character (category So), so it would
+  // reach the tone's name.
+  assert.equal(toneNameHeader("a\ud800b"), "ab");
+  assert.equal(toneNameHeader("a\udc00\ud800b"), "ab");
+  // A pair is a real character and stays.
+  assert.equal(toneNameHeader("a\ud83d\ude00b"), "a%F0%9F%98%80b");
+  // Nothing else left: no header, so the server uses its default name.
+  assert.equal(toneNameHeader("\udc00"), null);
+  assert.equal(toneNameHeader("My Tone \ud800"), "My%20Tone");
 });
 
 test("the header is cut at a code point boundary to at most 512 bytes", () => {
@@ -93,6 +100,13 @@ test("the header is cut at a code point boundary to at most 512 bytes", () => {
   assert.equal(toneNameHeader("a".repeat(512)).length, 512);
 });
 
+test("the cut stops at the first code point that does not fit", () => {
+  // 505 + 9 bytes for the euro sign is over 512; the "b" after it would fit,
+  // but a name with a character missing from its middle is not a cut.
+  assert.equal(toneNameHeader("a".repeat(505) + "\u20ac" + "b"), "a".repeat(505));
+  assert.equal(toneNameHeader("a".repeat(501) + "\u{1F600}" + "bc"), "a".repeat(501));
+});
+
 test("displayName strips the extension and keeps the rest", () => {
   assert.equal(displayName("Song.mp3"), "Song");
   assert.equal(displayName("My.Song.flac"), "My.Song");
@@ -101,6 +115,8 @@ test("displayName strips the extension and keeps the rest", () => {
   assert.equal(displayName(" spaced .m4a"), "spaced");
   assert.equal(displayName(".mp3"), "");
   assert.equal(displayName("dir/sub\\Tone.wav"), "Tone");
+  assert.equal(displayName("dir/song.mp3"), "song");
+  assert.equal(displayName("dir\\song.mp3"), "song");
   assert.equal(displayName("Café \u{1F600}.opus"), "Café \u{1F600}");
   assert.equal(displayName(undefined), "");
 });

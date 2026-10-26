@@ -48,11 +48,13 @@ export function renderQuery({ fadeIn, fadeOut, normalize, targetLufs }) {
 
 function wellFormed(text) {
   // encodeURIComponent throws on a lone surrogate (from a pasted, broken
-  // string); replace each with U+FFFD, which the server then drops.
+  // string), so each is dropped. Not replaced with U+FFFD: the server keeps
+  // that character (its category is So, which names.py lets through with the
+  // emoji), so it would end up in the tone's name as a "?" box.
   let out = "";
   for (const point of text) {
     const code = point.codePointAt(0);
-    out += code >= 0xd800 && code <= 0xdfff ? "�" : point;
+    if (code < 0xd800 || code > 0xdfff) out += point;
   }
   return out;
 }
@@ -71,7 +73,9 @@ export function toneNameHeader(name) {
   if (typeof name !== "string") {
     return null;
   }
-  const text = wellFormed(name.trim().normalize("NFC"));
+  // Dropped before the trim, so a name that ends in a broken surrogate
+  // after a space does not keep the space.
+  const text = wellFormed(name).trim().normalize("NFC");
   let header = "";
   for (const point of text) {
     const encoded = encodeURIComponent(point);
