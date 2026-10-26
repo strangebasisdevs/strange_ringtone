@@ -89,6 +89,40 @@ directory rather than `-m strange_ringtone`: `-I` leaves the current directory
 off `sys.path`, so `-m` finds the package only where it is installed, while a
 directory that Python runs is always on `sys.path`.
 
+**Build the image.** From the repository root:
+
+```bash
+docker build -f core/Dockerfile -t strange_ringtone:local .
+```
+
+The first build compiles ffmpeg and takes a few minutes. It downloads the
+release named in `core/ffmpeg/VERSION` and refuses it unless both its SHA-256
+(`core/ffmpeg/SHA256SUMS`) and FFmpeg's release signature (made with the
+committed `core/ffmpeg/ffmpeg-devel.asc`) check out, then configures it with
+exactly `core/ffmpeg/configure.txt`. `--build-arg VERSION=…` and
+`--build-arg SOURCE_URL=…` bake those settings in; they default to `dev` and the
+upstream repository.
+
+**Run the in-image tests** in a throwaway container with the deployment
+contract's restrictions: no network, a read-only root, only `/tmp` writable,
+no capabilities and no published ports. In Git Bash on Windows:
+
+```bash
+MSYS_NO_PATHCONV=1 docker run --rm --name strange_ringtone-image-tests \
+  --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m,mode=1777 \
+  --cap-drop ALL --security-opt no-new-privileges:true \
+  -e PUBLIC_ORIGIN=https://example.internal -e STRANGE_RINGTONE_IMAGE_TESTS=1 \
+  -v "$(cygpath -w "$PWD/tests"):/tests:ro" \
+  strange_ringtone:local python -I -m unittest discover -s /tests/image -t /tests -v
+```
+
+On Linux or macOS, drop `MSYS_NO_PATHCONV=1` and write `"$PWD/tests"` in place
+of the `cygpath` call. These are the CI job **Image tests**. They check the
+binary against `core/ffmpeg/components.txt`, which names every component and
+why it is there, and the container against the contract. Outside the image
+(`STRANGE_RINGTONE_IMAGE_TESTS` unset), `unittest discover -s tests` skips them.
+`compose.example.yaml` shows the same restrictions as a Compose service.
+
 **Pull requests:** branch from `main` as `feat/…` or `fix/…`. PRs are
 squash-merged, so their titles must be conventional-commit subjects (`feat:`,
 `fix:`, `docs:`, `ci:`, `chore:`, with `!` for a breaking change). release-please

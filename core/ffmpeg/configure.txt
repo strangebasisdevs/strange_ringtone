@@ -1,0 +1,50 @@
+# The exact ./configure flags for the core image's ffmpeg, one per line, in
+# order. core/Dockerfile passes the lines that are not comments to configure,
+# and tests/image/test_build_config.py fails unless `ffmpeg -buildconf` reports
+# exactly these. components.txt says why each component in the binary exists.
+#
+# Start from nothing: no component is built unless a line below enables it.
+--disable-everything
+# No network protocols, sockets or TLS: the core never makes a connection.
+--disable-network
+# Never link a library that configure happens to find on the build machine;
+# the binary holds only what this file names.
+--disable-autodetect
+# configure probes for the C library's iconv even under --disable-autodetect
+# and lists it as an external library. It only converts subtitle character
+# sets, which this build cannot decode, and glibc's iconv loads gconv modules
+# from the filesystem at run time.
+--disable-iconv
+# Experimental code (in 9.0.2, new swscale paths) is enabled by default; a
+# security-minded build takes only what FFmpeg calls stable.
+--disable-unstable
+--disable-doc
+# Only the ffmpeg tool itself; the image needs no player and no prober.
+--disable-ffplay
+--disable-ffprobe
+# The builder has no nasm. Encoding a 30 s clip does not need hand-written
+# SIMD, and less assembly is less to review.
+--disable-x86asm
+--enable-static
+--disable-shared
+# Input: the PCM WAV the browser made, checked by content before ffmpeg runs.
+--enable-demuxer=wav
+--enable-decoder=pcm_s16le
+# Output: AAC in an ipod (MP4) container, which iOS accepts as a ringtone.
+--enable-encoder=aac
+--enable-muxer=ipod
+# The measure pass writes to the null muxer, which still encodes what it
+# discards, with its default encoder pcm_s16le.
+--enable-encoder=pcm_s16le
+--enable-muxer=null
+# Local files in the per-job directory, and nothing else.
+--enable-protocol=file
+# Loudness measurement, gain, limiter and fades (docs/PLAN.md 5.3), plus the
+# format negotiation the chain needs.
+--enable-filter=ebur128
+--enable-filter=volume
+--enable-filter=alimiter
+--enable-filter=afade
+--enable-filter=aformat
+--enable-filter=aresample
+--enable-filter=anull

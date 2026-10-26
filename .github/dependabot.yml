@@ -33,5 +33,25 @@ updates:
       prefix: chore
       include: scope
 
-  # The docker ecosystem (base images by digest) is added with the first
-  # Dockerfile, in the render milestone.
+  # core/Dockerfile's base images, pinned by digest. The FFmpeg source tarball
+  # is not something Dependabot can see; ffmpeg-watch.yml covers it.
+  - package-ecosystem: docker
+    directory: /core
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 10
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: chore
+      include: scope
+    ignore:
+      # The core targets Python 3.12 (CLAUDE.md), so only the digest of the
+      # 3.12 tag moves; a newer Python is a decision, not a bump.
+      - dependency-name: python
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor

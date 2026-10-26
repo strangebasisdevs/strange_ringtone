@@ -1,0 +1,35 @@
+name: FFmpeg watch
+
+# The core image builds a pinned FFmpeg release from source (core/ffmpeg/VERSION),
+# which Dependabot cannot track. This fails when FFmpeg has released a newer
+# version; GitHub's failure email is the alert, so the job needs no permission
+# to open issues (docs/PLAN.md 9.1). Bumping means a PR that changes VERSION and
+# SHA256SUMS after reading the release notes.
+on:
+  schedule:
+    # Mondays, off the hour to avoid the scheduler's busiest minute.
+    - cron: "23 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Newer FFmpeg release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: List FFmpeg's release tags
+        # The read-only token only raises the API rate limit; the mirror is public.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api --paginate --slurp 'repos/FFmpeg/FFmpeg/git/matching-refs/tags/n?per_page=100' > "$RUNNER_TEMP/tags.json"
+
+      - name: Compare with core/ffmpeg/VERSION
+        run: python -I scripts/check_ffmpeg_release.py core/ffmpeg/VERSION "$RUNNER_TEMP/tags.json"
