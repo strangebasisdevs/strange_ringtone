@@ -27,6 +27,16 @@ test("the fade-out is a quarter sine from 1 to 0", () => {
   near(fadeGainAt(10, 10, 0, 2), 0, "end");
 });
 
+test("between the fades the gain is exactly 1", () => {
+  // Just past the fade-in and just before the fade-out, and everywhere in
+  // between: a fade that reached further would dip the plateau.
+  for (const t of [2 + 1e-9, 2.001, 2.5, 3, 5, 7.5, 8.5 - 0.001, 8.5 - 1e-9]) {
+    assert.equal(fadeGainAt(t, 10, 2, 1.5), 1, `t=${t}`);
+  }
+  assert.ok(fadeGainAt(2 - 1e-3, 10, 2, 1.5) < 1, "still fading in");
+  assert.ok(fadeGainAt(8.5 + 1e-3, 10, 2, 1.5) < 1, "already fading out");
+});
+
 test("the shape is not linear", () => {
   // A linear ramp would give 0.5 halfway; qsin gives 0.707.
   assert.ok(fadeGainAt(1, 10, 2, 1.5) > 0.7);

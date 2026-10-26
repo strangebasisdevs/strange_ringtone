@@ -159,6 +159,16 @@ test("the wav.py details users can act on get their own words", () => {
   assert.notEqual(errorMessage(413, "too_large", "too_long"), errorMessage(413, "too_large"));
 });
 
+test("those words belong to bad_wav and too_large only", () => {
+  // A detail is the wav.py reason only under those two codes; under any
+  // other code it must not turn "the server is busy" into "make it longer".
+  for (const code of ["busy", "bad_params", "rate_limited", "teapot_mode", null]) {
+    for (const detail of ["too_short", "too_long"]) {
+      assert.equal(errorMessage(400, code, detail), errorMessage(400, code), `${code} ${detail}`);
+    }
+  }
+});
+
 test("other bad_wav details are named after the plain words", () => {
   for (const detail of ["not_riff", "truncated", "bad_size", "unexpected_chunk", "duplicate_chunk", "missing_chunk",
     "unsupported_format", "bad_bits", "bad_channels", "bad_rate", "bad_block_align", "bad_byte_rate",

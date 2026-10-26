@@ -37,6 +37,15 @@ test("the 48 kHz K-weighting coefficients are the standard's published values", 
   }
 });
 
+test("a sample rate at or below twice the shelf frequency is refused", () => {
+  // tan() of the shelf's pre-warped frequency passes pi/2 there, and the
+  // coefficients it gives are nonsense rather than an error.
+  for (const rate of [2000, 3363, 0, -44100, NaN, Infinity]) {
+    assert.throws(() => kWeightingCoefficients(rate), RangeError, String(rate));
+  }
+  assert.doesNotThrow(() => kWeightingCoefficients(8000));
+});
+
 test("the 44.1 kHz coefficients differ from the 48 kHz set (derived, not copied)", () => {
   const a = kWeightingCoefficients(44100);
   const b = kWeightingCoefficients(48000);
@@ -88,6 +97,20 @@ test("the relative gate drops blocks more than 10 LU below the gated mean", () =
   const nearby = sine(5, 44100, 1000, 0.05);
   mixed.set(nearby, loud.length);
   assert.ok(integratedLufs([mixed], 44100) < integratedLufs([loud], 44100) - 1);
+});
+
+test("blocks are 400 ms long and start every 100 ms", () => {
+  // 1 s of silence, a 0.4 s tone, 1 s of silence. Counted by hand, the blocks
+  // that touch the tone hold 1/4, 2/4, 3/4, 4/4, 3/4, 2/4 and 1/4 of a full
+  // block's energy; silent blocks fall to the absolute gate and none falls to
+  // the relative one. So the result is the steady tone's loudness plus
+  // 10*log10(4/7). Steps of 200 ms would give 10*log10(2/3) (0.67 dB higher),
+  // 400 ms 10*log10(1/2), 50 ms 10*log10(8/15).
+  const rate = 44100;
+  const burst = new Float32Array(Math.round(2.4 * rate));
+  burst.set(sine(0.4, rate, 1000, 0.1), rate);
+  const steady = integratedLufs([sine(10, rate, 1000, 0.1)], rate);
+  near(integratedLufs([burst], rate), steady + 10 * Math.log10(4 / 7), 0.02, "gated burst");
 });
 
 test("K-weighting makes low frequencies count for less", () => {
