@@ -1835,6 +1835,30 @@ class ResultRouteTest(RenderFlowTestCase):
         self.wait_for_log("GET /api/result/", count=1)
         self.assertNotIn(result_id, self.log.getvalue())
 
+    def test_only_the_exact_route_shape_is_a_result_route(self) -> None:
+        # A route-level check, not only the store's: a path that is not 32
+        # lowercase hex digits and .m4a or .m4r is no result route at all, so a
+        # wrong method gets 404, never the 405 Allow: GET of a real route.
+        hex_id = "0123456789abcdef" * 2
+        for path in (f"/api/result/{hex_id[:-1]}.m4a", f"/api/result/{hex_id}0.m4a",
+                     f"/api/result/{hex_id}.wav", f"/api/result/{hex_id}.mp4"):
+            with self.subTest(path=path):
+                response = self.request("POST", path, [("Content-Length", "0")])
+                self.assertJsonError(response, 404, "not_found")
+                self.assertIsNone(response.headers.get("Allow"))
+                with socket.create_connection(("127.0.0.1", self.port), timeout=DEADLINE) as sock:
+                    sock.sendall(build_request("HEAD", path))
+                    data = b""
+                    while chunk := sock.recv(65536):
+                        data += chunk
+                head = data.partition(b"\r\n\r\n")[0]
+                self.assertTrue(head.startswith(b"HTTP/1.0 404 "), head)
+                self.assertNotIn(b"\r\nAllow:", head)
+        for extension in ("m4a", "m4r"):
+            with self.subTest(extension=extension):
+                response = self.request("POST", f"/api/result/{hex_id}.{extension}", [("Content-Length", "0")])
+                self.assertEqual((response.status, response.headers.get("Allow")), (405, "GET"))
+
     def test_log_hides_ids_in_any_result_path(self) -> None:
         probe_id = "0123456789abcdef0123456789abcdef"
         self.request("GET", f"/api/result/{probe_id}.m4a?x=1")
