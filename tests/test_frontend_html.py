@@ -210,39 +210,73 @@ class TemplateAuditTest(unittest.TestCase):
         self.assertEqual(audit_template(GOOD_TEMPLATE), [])
 
     def test_each_violation_is_caught(self) -> None:
+        # Each case names the problem it must produce, not just "some problem":
+        # several rules overlap (a javascript: href is also not the Source
+        # link), so a rule that stopped working would otherwise hide behind
+        # another one.
         script = '<script type="module" src="{{static_prefix}}/app.js"></script>'
+        body = GOOD_TEMPLATE.replace
+
+        def add(markup: str) -> str:
+            return body("</body>", markup + "</body>")
+
         cases = {
-            "inline script": GOOD_TEMPLATE.replace(script, script.replace("></", ">alert(1)</")),
-            "classic script": GOOD_TEMPLATE.replace(' type="module"', ""),
-            "script elsewhere": GOOD_TEMPLATE.replace("{{static_prefix}}/app.js", "/app.js"),
-            "style element": GOOD_TEMPLATE.replace("</head>", "<style>p{}</style></head>"),
-            "empty style element": GOOD_TEMPLATE.replace("</head>", "<style></style></head>"),
-            "style attribute": GOOD_TEMPLATE.replace("<section", '<section style="color:red"'),
-            "handler": GOOD_TEMPLATE.replace("<a ", '<a onclick="x()" '),
-            "upper-case handler": GOOD_TEMPLATE.replace("<a ", '<a ONCLICK="x()" '),
-            "javascript link": GOOD_TEMPLATE.replace("{{source_url}}", "javascript:x()"),
-            "split javascript link": GOOD_TEMPLATE.replace("{{source_url}}", "java\tscript:x()"),
-            "data link": GOOD_TEMPLATE.replace("{{source_url}}", "data:text/html,x"),
-            "external link": GOOD_TEMPLATE.replace("</body>", '<a href="https://example.internal/">x</a></body>'),
-            "external text": GOOD_TEMPLATE.replace("</body>", "<p>see http://example.internal</p></body>"),
-            "protocol-relative": GOOD_TEMPLATE.replace("</body>", '<img src="//example.internal/x.png"></body>'),
-            "unlisted asset": GOOD_TEMPLATE.replace("style.css", "other.css"),
-            "template as asset": GOOD_TEMPLATE.replace("style.css", "index.html"),
-            "traversal asset": GOOD_TEMPLATE.replace("style.css", "audio/../style.css"),
-            "relative link": GOOD_TEMPLATE.replace("</body>", '<a href="/api/result/x.m4a">x</a></body>'),
-            "source placeholder in a script": GOOD_TEMPLATE.replace("{{static_prefix}}/app.js", "{{source_url}}"),
-            "base": GOOD_TEMPLATE.replace("<head>", '<head><base href="{{static_prefix}}/style.css">'),
-            "iframe": GOOD_TEMPLATE.replace("</body>", "<iframe></iframe></body>"),
-            "form": GOOD_TEMPLATE.replace("</body>", "<form></form></body>"),
-            "meta refresh": GOOD_TEMPLATE.replace("<head>", '<head><meta http-equiv="refresh" content="0">'),
-            "youtube shown": GOOD_TEMPLATE.replace(" hidden>", ">"),
-            "youtube missing": GOOD_TEMPLATE.replace(' id="youtube"', ""),
-            "youtube not a section": GOOD_TEMPLATE.replace('<section id="youtube" hidden></section>',
-                                                            '<div id="youtube" hidden></div>'),
+            "inline script": (body(script, script.replace("></", ">alert(1)</")), "inline script"),
+            "classic script": (body(' type="module"', ""), "script without type=module"),
+            "script elsewhere": (body("{{static_prefix}}/app.js", "/app.js"), "script src outside"),
+            "source placeholder in a script": (body("{{static_prefix}}/app.js", "{{source_url}}"),
+                                               "script src outside"),
+            "style element": (body("</head>", "<style>p{}</style></head>"), "<style> element"),
+            "empty style element": (body("</head>", "<style></style></head>"), "<style> element"),
+            "style attribute": (body("<section", '<section style="color:red"'), "style attribute"),
+            "handler": (body("<a ", '<a onclick="x()" '), "event-handler attribute onclick"),
+            "upper-case handler": (body("<a ", '<a ONCLICK="x()" '), "event-handler attribute onclick"),
+            "javascript link": (body("{{source_url}}", "javascript:x()"), "href= with a script or data scheme"),
+            "split javascript link": (body("{{source_url}}", "java\tscript:x()"),
+                                      "href= with a script or data scheme"),
+            "upper-case javascript link": (body("{{source_url}}", "JavaScript:x()"),
+                                           "href= with a script or data scheme"),
+            "vbscript link": (body("{{source_url}}", "vbscript:x"), "href= with a script or data scheme"),
+            "data link": (body("{{source_url}}", "data:text/html,x"), "href= with a script or data scheme"),
+            "blob link": (body("{{source_url}}", "blob:x"), "href= with a script or data scheme"),
+            "filesystem link": (body("{{source_url}}", "filesystem:x"), "href= with a script or data scheme"),
+            # Not a URL attribute, so only the scheme rule sees it.
+            "scheme in a data attribute": (body("<section ", '<section data-x="javascript:x" '),
+                                           "data-x= with a script or data scheme"),
+            "external link": (add('<a href="https://example.internal/">x</a>'), "an http(s) URL in the template"),
+            "external text": (add("<p>see http://example.internal</p>"), "an http(s) URL in the template"),
+            "protocol-relative": (add('<img src="//example.internal/x.png">'),
+                                  "is neither a static asset nor the Source link"),
+            "unlisted asset": (body("style.css", "other.css"), "names 'other.css', which is not served"),
+            "template as asset": (body("style.css", "index.html"), "names 'index.html', which is not served"),
+            "traversal asset": (body("style.css", "audio/../style.css"),
+                                "names 'audio/../style.css', which is not served"),
+            "relative link": (add('<a href="/api/result/x.m4a">x</a>'),
+                              "is neither a static asset nor the Source link"),
+            # The Source link exemption is for <a href> only.
+            "source placeholder in an img": (add('<img src="{{source_url}}">'),
+                                             "src='{{source_url}}' is neither a static asset nor the Source link"),
+            "source placeholder in a link element": (
+                body("</head>", '<link rel="icon" href="{{source_url}}"></head>'),
+                "href='{{source_url}}' is neither a static asset nor the Source link"),
+            "source placeholder in an a ping": (
+                body('<a href="{{source_url}}">', '<a href="{{source_url}}" ping="{{source_url}}">'),
+                "ping='{{source_url}}' is neither a static asset nor the Source link"),
+            "meta refresh": (body("<head>", '<head><meta http-equiv="refresh" content="0">'), "<meta http-equiv>"),
+            "youtube shown": (body(" hidden>", ">"), "the YouTube section is not hidden"),
+            "youtube missing": (body(' id="youtube"', ""), "no YouTube section"),
+            "youtube not a section": (
+                body('<section id="youtube" hidden></section>', '<div id="youtube" hidden></div>'),
+                "the YouTube section is not hidden"),
+            "base": (body("<head>", "<head><base>"), "<base> element"),
         }
-        for label, text in cases.items():
+        for tag in sorted(FORBIDDEN_ELEMENTS - {"base"}):
+            cases[tag] = (add(f"<{tag}></{tag}>"), f"<{tag}> element")
+        self.assertTrue({"embed", "applet", "portal", "object", "iframe", "form"} <= set(cases))
+        for label, (sample, expected) in cases.items():
             with self.subTest(label):
-                self.assertNotEqual(audit_template(text), [], label)
+                problems = audit_template(sample)
+                self.assertTrue(any(expected in problem for problem in problems), (expected, problems))
 
 
 class TemplateTest(unittest.TestCase):
@@ -360,35 +394,42 @@ class JsAuditTest(unittest.TestCase):
         self.assertEqual(audit_js(sample), [])
 
     def test_each_construct_is_caught(self) -> None:
+        # Each sample names the problem it must produce, so a rule that stopped
+        # working can't hide behind another one that also matches the sample.
         cases = [
-            "element.innerHTML = name;",
-            "element.outerHTML = name;",
-            'element.insertAdjacentHTML("beforeend", name);',
-            "range.createContextualFragment(name);",
-            "document.write(name);",
-            "document . writeln(name);",
-            "eval(code);",
-            'const f = new Function("return 1");',
-            'const f = Function("return 1");',
-            'setTimeout("run()", 10);',
-            "setInterval(`run()`, 10);",
-            "frame.srcdoc = name;",
-            'element.setAttribute("src", url);',
-            "element.setAttribute('onclick', code);",
-            'element.setAttribute("style", css);',
-            "audio.src = URL.createObjectURL(blob);",
-            "audio.src = url;",
-            'audio.src = "https://example.internal/x.m4a";',
-            'audio.src = "//example.internal/x.m4a";',
-            'audio.src = "javascript:x()";',
-            'link.href = "javascript:x()";',
-            'fetch("https://example.internal/api");',
-            'const u = "data:text/html,x";',
-            'const m = await import("./audio/wav.js");',
+            ("element.innerHTML = name;", "innerHTML"),
+            ("element.outerHTML = name;", "outerHTML"),
+            ('element.insertAdjacentHTML("beforeend", name);', "insertAdjacentHTML"),
+            ("range.createContextualFragment(name);", "createContextualFragment"),
+            ("document.write(name);", "document.write"),
+            ("document . writeln(name);", "document.write"),
+            ("eval(code);", "eval"),
+            ('const f = new Function("return 1");', "new Function"),
+            ('const f = Function("return 1");', "Function()"),
+            ('setTimeout("run()", 10);', "a timer with a string body"),
+            ("setInterval(`run()`, 10);", "a timer with a string body"),
+            ("frame.srcdoc = name;", "srcdoc"),
+            ('element.setAttribute("src", url);', "setAttribute of src, href, style or a handler"),
+            ("element.setAttribute('onclick', code);", "setAttribute of src, href, style or a handler"),
+            ('element.setAttribute("style", css);', "setAttribute of src, href, style or a handler"),
+            ("audio.src = URL.createObjectURL(blob);", "createObjectURL"),
+            # Without a .src assignment, only the createObjectURL rule sees it.
+            ("const url = URL.createObjectURL(b);", "createObjectURL"),
+            ("audio.src = url;", ".src = 'url'"),
+            ('audio.src = "https://example.internal/x.m4a";', "an absolute URL"),
+            ('audio.src = "//example.internal/x.m4a";', ".src = '\"//example.internal/x.m4a\"'"),
+            ('audio.src = "javascript:x()";', "a script, data or blob URL"),
+            ('link.href = "javascript:x()";', "a script, data or blob URL"),
+            ('link.href = "VBScript:x";', "a script, data or blob URL"),
+            ('fetch("https://example.internal/api");', "an absolute URL"),
+            ('const u = "data:text/html,x";', "a script, data or blob URL"),
+            ('const u = "blob:x";', "a script, data or blob URL"),
+            ('const m = await import("./audio/wav.js");', "dynamic import"),
         ]
-        for sample in cases:
+        for sample, expected in cases:
             with self.subTest(sample):
-                self.assertNotEqual(audit_js(sample), [], sample)
+                problems = audit_js(sample)
+                self.assertTrue(any(expected in problem for problem in problems), (expected, problems))
 
     def test_imports_are_read(self) -> None:
         sample = 'import { a } from "./a.js";\nimport "./b.js";\nexport { c } from "../c.js";\n'
