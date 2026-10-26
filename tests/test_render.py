@@ -592,6 +592,44 @@ class TimeoutTest(StubTestCase):
             time.sleep(0.05)
         self.assertFalse(alive(grandchild), "the grandchild survived the timeout")
 
+    def test_an_interrupted_wait_kills_the_group_and_propagates(self) -> None:
+        # Anything but a timeout escaping communicate() (a KeyboardInterrupt at
+        # shutdown, an OSError from a pipe) must still take the run and what it
+        # started down with it, then re-raise rather than become a result.
+        self.set_mode("grandchild")
+        pid_file = self.job / "grandchild.pid"
+        for error in (KeyboardInterrupt, OSError):
+            with self.subTest(error=error.__name__):
+                self.procs.clear()
+                pid_file.unlink(missing_ok=True)
+
+                def interrupted(proc: subprocess.Popen[bytes], input: Any = None, timeout: float | None = None,
+                                error: type[BaseException] = error) -> Any:
+                    # Only once the grandchild exists, so there is a group to kill.
+                    deadline = time.monotonic() + 10
+                    while not pid_file.exists() and time.monotonic() < deadline:
+                        time.sleep(0.05)
+                    raise error()
+
+                started = time.monotonic()
+                with mock.patch.object(self.popen, "communicate", interrupted):
+                    with self.assertRaises(error):
+                        Renderer(STUB_COMMAND, 20).render(self.job, params(duration=1.0))
+                self.assertTrue(pid_file.exists(), "the stub never started its grandchild")
+                grandchild = int(pid_file.read_text(encoding="ascii"))
+                self.addCleanup(kill_quietly, grandchild)
+                # Killed, not waited out: the stub would sleep for 60 s.
+                self.assertLess(time.monotonic() - started, 10 + 5)
+                self.assertReaped()
+                if not hasattr(os, "killpg"):
+                    # Windows: only the direct child can be ended (see above).
+                    continue
+                self.assertEqual(self.procs[0].returncode, -signal.SIGKILL)
+                deadline = time.monotonic() + 5
+                while alive(grandchild) and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                self.assertFalse(alive(grandchild), "the grandchild survived the interrupted run")
+
     def test_a_survivor_holding_the_pipes_cannot_hang_the_request(self) -> None:
         # As if the kill had missed: the run still holds stdout and stderr
         # open. The bounded drain gives up instead of waiting for it.
