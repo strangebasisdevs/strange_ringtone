@@ -2,7 +2,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { suggestSelection } from "../../core/static/audio/suggest.js";
+import { bestWindow, snapToQuiet, suggestSelection } from "../../core/static/audio/suggest.js";
 
 const RATE = 44100;
 
@@ -105,4 +105,89 @@ test("bad arguments are refused", () => {
   assert.throws(() => suggestSelection([signal], RATE, 0), RangeError);
   assert.throws(() => suggestSelection([signal], RATE, NaN), RangeError);
   assert.throws(() => suggestSelection([], RATE, 30), RangeError);
+});
+
+test("a file quieter than the -70 LUFS gate everywhere is treated as silence", () => {
+  // About -83 LUFS throughout, with a 0.3 s digital gap near the start that
+  // the snap would otherwise jump to.
+  const faint = sections([0.3, 0.0001], [0.3, 0], [59.4, 0.0001]);
+  assert.deepEqual(suggestSelection([faint], RATE, 30), { start: 0, end: 30 });
+});
+
+test("input just over the cap keeps the cap's length inside the input", () => {
+  const signal = sections([30.05, 0.5]);
+  const { start, end } = suggestSelection([signal], RATE, 30);
+  near(end - start, 30, 1e-9, "length");
+  assert.ok(start >= 0 && end <= 30.05 + 1e-9, `${start} to ${end}`);
+});
+
+// Hand-built inputs for the two steps, because equal scores and equal quiet
+// spots need exact ties, which the K-weighting filter's ringing never leaves
+// in real audio.
+
+test("of equally loud windows the earliest wins", () => {
+  assert.equal(bestWindow([-20, -20, -20, -20, -20], 2, 4), 0);
+  assert.equal(bestWindow([-30, -20, -20, -20, -30], 2, 4), 1);
+  assert.equal(bestWindow([-30, -20, -30, -20, -20], 2, 4), 3);
+});
+
+test("silence and anything below -70 count as -70 in a window's score", () => {
+  // Without the floor every window after a -Infinity would score NaN or
+  // -Infinity, and the loud stretch at 2 could never win.
+  assert.equal(bestWindow([-Infinity, -Infinity, -10, -10, -80], 2, 4), 2);
+  // Floored, windows 0 and 1 tie at -80 and the earliest wins; counted as
+  // they are, window 3 (-85) would beat both.
+  assert.equal(bestWindow([-200, -10, -100, -35, -50], 2, 4), 0);
+});
+
+test("only the given candidates are scored", () => {
+  assert.equal(bestWindow([-30, -30, -30, -10], 1, 3), 0);
+  assert.equal(bestWindow([-30, -30, -30, -10], 1, 4), 3);
+});
+
+// Granule energies -> the prefix sum snapToQuiet reads.
+function prefixOf(energies) {
+  const prefix = new Float64Array(energies.length + 1);
+  energies.forEach((energy, i) => { prefix[i + 1] = prefix[i] + energy; });
+  return prefix;
+}
+
+// count granules of energy 1 with digital silence at the given 5-granule spans.
+function energies(count, ...silentFrom) {
+  const out = new Array(count).fill(1);
+  for (const from of silentFrom) out.fill(0, from, from + 5);
+  return out;
+}
+
+test("the snap takes the nearest of equally quiet spots, the earlier side first", () => {
+  // Quiet 50 ms centred 8 granules either side of 200, and another farther out.
+  const e = energies(400, 190, 206, 150);
+  assert.equal(snapToQuiet(prefixOf(e), e.length, 200), 192);
+  // Only the later one: it is taken.
+  const later = energies(400, 206);
+  assert.equal(snapToQuiet(prefixOf(later), later.length, 200), 208);
+});
+
+test("the snap reaches 1 s and no further, and needs something strictly quieter", () => {
+  const near1s = energies(400, 98);
+  assert.equal(snapToQuiet(prefixOf(near1s), near1s.length, 200), 100);
+  // Silence at granules 92 to 96 touches no 50 ms around a point within reach
+  // (the nearest, 100, spans 98 to 102).
+  const beyond = energies(400, 92);
+  assert.equal(snapToQuiet(prefixOf(beyond), beyond.length, 200), 200);
+  const flat = energies(400);
+  assert.equal(snapToQuiet(prefixOf(flat), flat.length, 200), 200);
+});
+
+test("the snap measures 50 ms inside the input at either end", () => {
+  // A start at the very beginning still compares its own 50 ms (the first
+  // five granules) with the quiet spot 20 granules on.
+  const start = energies(400, 20);
+  start.fill(10, 0, 5);
+  assert.equal(snapToQuiet(prefixOf(start), start.length, 0), 22);
+  // Quiet at the very end: the nearest point whose 50 ms is all quiet.
+  const end = energies(400, 395);
+  assert.equal(snapToQuiet(prefixOf(end), end.length, 390), 397);
+  // Shorter than 50 ms: nothing to compare, the start stays.
+  assert.equal(snapToQuiet(prefixOf([1, 1, 0]), 3, 1), 1);
 });

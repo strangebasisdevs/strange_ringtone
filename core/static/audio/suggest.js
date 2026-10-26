@@ -55,15 +55,38 @@ export function suggestSelection(channels, sampleRate, maxSeconds, options = { h
     return { start: 0, end: Math.min(maxSeconds, duration) };
   }
 
-  // Rule 3's score: the mean of the hop values inside the window, with
-  // -Infinity counted as -70. Equal windows have the same number of values,
-  // so comparing sums is comparing means.
+  const perWindow = Math.floor((maxGranules - windowGranules) / HOP_GRANULES) + 1;
+  const candidates = Math.max(0, Math.floor((count - maxGranules) / HOP_GRANULES)) + 1;
+  const chosen = bestWindow(curve, perWindow, candidates) * HOP_GRANULES;
+  const snapped = snapToQuiet(prefix, count, chosen);
+
+  let start = (snapped * granule) / sampleRate;
+  let end = start + maxSeconds;
+  if (end > duration) {
+    // Moving the start later must not shorten the selection: slide back.
+    end = duration;
+    start = duration - maxSeconds;
+  }
+  return { start, end };
+}
+
+/**
+ * Rule 3's choice: the candidate window with the highest mean of the hop
+ * loudness values inside it, -Infinity and anything below -70 counted as -70.
+ * Window k holds curve[k] to curve[k + perWindow - 1]. Exported for the tests,
+ * which need exact ties that real audio never gives.
+ * @param {Float32Array | number[]} curve hop loudness values in LUFS
+ * @param {number} perWindow hop values inside one window (>= 1)
+ * @param {number} candidates windows to consider, starting at hop 0
+ * @returns {number} the index of the best window; of equal ones the earliest
+ */
+export function bestWindow(curve, perWindow, candidates) {
+  // Equal windows have the same number of values, so comparing sums is
+  // comparing means, and a prefix sum makes each window O(1).
   const sums = new Float64Array(curve.length + 1);
   for (let i = 0; i < curve.length; i += 1) {
     sums[i + 1] = sums[i] + Math.max(curve[i], FLOOR_LUFS);
   }
-  const perWindow = Math.floor((maxGranules - windowGranules) / HOP_GRANULES) + 1;
-  const candidates = Math.max(0, Math.floor((count - maxGranules) / HOP_GRANULES)) + 1;
   let best = 0;
   let bestScore = -Infinity;
   for (let k = 0; k < candidates && k + perWindow <= curve.length; k += 1) {
@@ -74,18 +97,33 @@ export function suggestSelection(channels, sampleRate, maxSeconds, options = { h
       best = k;
     }
   }
+  return best;
+}
 
-  const chosen = best * HOP_GRANULES;
+/**
+ * The cut point near a chosen start: the granule within 1 s whose 50 ms
+ * around it holds the least energy, so the selection does not open mid-word.
+ * Exported for the tests, as bestWindow is.
+ * @param {Float64Array} prefix energy prefix sum per granule (energyPrefix)
+ * @param {number} count granules in the input
+ * @param {number} chosen the start granule bestWindow picked
+ * @returns {number} the start granule; of equally quiet spots the nearest,
+ *   then the earlier one; chosen itself unless somewhere is strictly quieter
+ */
+export function snapToQuiet(prefix, count, chosen) {
+  if (count < RMS_GRANULES) {
+    return chosen;
+  }
   const rms = (at) => {
     // The 50 ms around a candidate cut point, kept inside the input.
     const from = Math.min(Math.max(at - Math.floor(RMS_GRANULES / 2), 0), count - RMS_GRANULES);
     return prefix[from + RMS_GRANULES] - prefix[from];
   };
   let snapped = chosen;
-  let quietest = count >= RMS_GRANULES ? rms(chosen) : 0;
+  let quietest = rms(chosen);
   // Outward from the chosen start, earlier side first, strictly lower only:
   // of equally quiet spots the nearest wins (then the earlier one).
-  for (let distance = 1; distance <= SNAP_GRANULES && count >= RMS_GRANULES; distance += 1) {
+  for (let distance = 1; distance <= SNAP_GRANULES; distance += 1) {
     for (const at of [chosen - distance, chosen + distance]) {
       if (at < 0 || at > count) {
         continue;
@@ -97,13 +135,5 @@ export function suggestSelection(channels, sampleRate, maxSeconds, options = { h
       }
     }
   }
-
-  let start = (snapped * granule) / sampleRate;
-  let end = start + maxSeconds;
-  if (end > duration) {
-    // Moving the start later must not shorten the selection: slide back.
-    end = duration;
-    start = duration - maxSeconds;
-  }
-  return { start, end };
+  return snapped;
 }
