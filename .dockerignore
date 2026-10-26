@@ -1,0 +1,6 @@
+# An allowlist: the build context holds only core/, so nothing else in the
+# checkout (a local .env, spike output, tests, .git) can reach an image layer.
+*
+!core
+**/__pycache__
+**/*.pyc
