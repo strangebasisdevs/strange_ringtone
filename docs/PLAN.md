@@ -323,7 +323,7 @@ the user types becomes the filename. Decision 9 keeps it readable:
 | User | UID 10001, GID 10001 (fixed, non-root) |
 | Port | 8080/tcp, plain HTTP. TLS is the proxy's job. |
 | Runs with | `read_only: true`, `cap_drop: [ALL]`, `no-new-privileges`, `ipc: none`, `ulimits: msgqueue: 0`. No egress needed (internal network). |
-| Writable | `/tmp` (tmpfs) and nothing else. Docker would also give the container a writable `/dev/shm` tmpfs and POSIX message queues in `/dev/mqueue`; `ipc: none` and a zero `msgqueue` limit remove both. No volumes, and nothing survives a restart. Size it at `MAX_RESULTS × 1 MB + RENDER_CONCURRENCY × (MAX_BODY_BYTES + 1 MB)`, which is 64 MB with the defaults. |
+| Writable | `/tmp` (tmpfs) and nothing else. Docker would also give the container a writable `/dev/shm` tmpfs and POSIX message queues in `/dev/mqueue`; `ipc: none` and a zero `msgqueue` limit remove both. No volumes, and nothing survives a restart. Size it at `(MAX_RESULTS + RENDER_CONCURRENCY) × MAX_CLIP_SECONDS × 33 kB + RENDER_CONCURRENCY × MAX_BODY_BYTES`: a result is 256 kbit/s AAC, at most 33 kB per second of clip with the MP4 overhead, and each running render also holds its upload. That is 63 MB with the defaults (use 64 MB) and 84 MB with `MAX_CLIP_SECONDS=40`. |
 | Health | `GET /healthz` returns 200 with an empty body |
 
 | Variable | Default | Notes |

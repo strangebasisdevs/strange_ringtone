@@ -10,11 +10,13 @@ import contextlib
 import http.client
 import io
 import json
+import random
 import shutil
 import struct
 import tempfile
 import threading
 import unittest
+import wave
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -22,13 +24,18 @@ from urllib.parse import quote
 from corpus.build import CORPUS_MAX_CLIP_SECONDS, corpus_cases, valid_wav
 from strange_ringtone.config import Settings
 from strange_ringtone.names import content_disposition
-from strange_ringtone.render import FFMPEG, PRLIMIT
+from strange_ringtone.render import FFMPEG, PRLIMIT, Renderer, RenderParams
 from strange_ringtone.server import RingtoneServer
 
 ORIGIN = "https://example.internal"
 FIXTURE_SECONDS = 10.0
 LOUDNESS_TOLERANCE_LU = 0.5
 DURATION_TOLERANCE_SECONDS = 0.010
+# The contract sizes the /tmp tmpfs with this many bytes per second of clip
+# for every result (docs/PLAN.md 5.7); a larger result could fill it.
+RESULT_BYTES_PER_SECOND = 33_000
+# The ceiling config.py allows for MAX_CLIP_SECONDS.
+LONGEST_CLIP_SECONDS = 40
 # Boxes whose payload is a list of child boxes, as far as the checks below
 # need to descend.
 CONTAINERS = {b"moov", b"trak", b"mdia", b"minf", b"stbl", b"udta", b"edts"}
@@ -202,6 +209,25 @@ class RealRenderTest(unittest.TestCase):
             # Each case is removed as it goes: the tmpfs is small on purpose.
             path.unlink()
         self.assertEqual(len(self.server.results), 0)
+
+    def test_the_longest_result_fits_the_contract_sizing(self) -> None:
+        # Noise uses every bit the encoder may spend, so this is the largest
+        # result a MAX_CLIP_SECONDS=40 deployment can hold.
+        job = self.temp / "job"
+        job.mkdir()
+        noise = random.Random(40).randbytes(LONGEST_CLIP_SECONDS * 48000 * 2 * 2)
+        with wave.open(str(job / "in.wav"), "wb") as writer:
+            writer.setnchannels(2)
+            writer.setsampwidth(2)
+            writer.setframerate(48000)
+            writer.writeframes(noise)
+        params = RenderParams(
+            fade_in=0.0, fade_out=0.0, normalize=False, target_lufs=-14.0, title="Noise",
+            duration=float(LONGEST_CLIP_SECONDS),
+        )
+        result = Renderer((FFMPEG,), 120, (PRLIMIT,)).render(job, params)
+        size = result.output.stat().st_size
+        self.assertLessEqual(size, LONGEST_CLIP_SECONDS * RESULT_BYTES_PER_SECOND)
 
     def test_only_the_result_remains_and_the_sweep_takes_it(self) -> None:
         status, payload = self.render(self.fixture.read_bytes(), name="Swept")

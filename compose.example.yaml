@@ -40,7 +40,8 @@ services:
     tmpfs:
       # The only writable path: uploads and results, gone on restart. noexec
       # and nosuid keep anything written there from running. The size follows
-      # the contract's formula, 64 MB with the default settings.
+      # the contract's formula (docs/PLAN.md 5.7): 64 MB fits the default
+      # settings; MAX_CLIP_SECONDS=40 needs 84 MB.
       - /tmp:rw,noexec,nosuid,size=64m,mode=1777
     networks:
       - core
