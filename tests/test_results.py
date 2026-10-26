@@ -198,7 +198,7 @@ class SweepTest(StoreTestCase):
             # is_full() sweeps too, and the retry fails the same way.
             self.assertTrue(store.is_full())
             self.assertIsNone(store.get(old.result_id))
-            self.assertEqual(self.on_disk(), [old.result_id])
+            self.assertEqual(self.on_disk(), [old.result_id, f"{old.result_id}/tone.m4a"])
         # Once the deletion goes through, the entry and the slot go with it.
         self.assertEqual(store.sweep(), 1)
         self.assertEqual(len(store), 0)
