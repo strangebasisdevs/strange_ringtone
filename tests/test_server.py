@@ -405,6 +405,28 @@ class IndexTest(ServerTestCase):
         self.assertIn("<footer>", page)
         self.assertIn("Version dev", page)
 
+    def test_page_references_only_allowlisted_assets(self) -> None:
+        page = self.page()
+        references = re.findall(r'\s(?:src|href)="([^"]*)"', page)
+        self.assertTrue(references)
+        for reference in references:
+            with self.subTest(reference):
+                if reference == self.settings.source_url:
+                    continue
+                self.assertTrue(reference.startswith("/static/dev/"), reference)
+                name = reference[len("/static/dev/"):]
+                self.assertIn(name, static.ALLOWED)
+                self.assertNotEqual(name, "index.html")
+                self.assertEqual(self.request("GET", reference).status, 200)
+
+    def test_youtube_section_stays_hidden_in_the_markup(self) -> None:
+        # app.js reveals it when data-fetch-enabled is "true"; the markup keeps
+        # it hidden either way, so without the script nothing half-works.
+        for enabled in (False, True):
+            with self.subTest(fetch_enabled=enabled):
+                self.start(fetch_enabled=enabled)
+                self.assertIn('<section id="youtube" class="panel" hidden', self.page())
+
     def test_template_is_never_served_raw(self) -> None:
         for path in ("/index.html", "/static/dev/index.html"):
             with self.subTest(path):
@@ -425,11 +447,33 @@ class IndexTest(ServerTestCase):
         with self.assertRaises(FileNotFoundError):
             static.StaticFiles(copy)
 
+    def test_missing_nested_file_fails_startup(self) -> None:
+        copy = self.temp / "static"
+        shutil.copytree(static.STATIC_DIR, copy)
+        (copy / "audio" / "wav.js").unlink()
+        with self.assertRaises(FileNotFoundError):
+            static.StaticFiles(copy)
+
 
 class StaticTest(ServerTestCase):
     def test_assets(self) -> None:
-        for name, content_type in (("app.js", "text/javascript; charset=utf-8"),
-                                   ("style.css", "text/css; charset=utf-8")):
+        expected = {
+            "style.css": "text/css; charset=utf-8",
+            "app.js": "text/javascript; charset=utf-8",
+            "waveform.js": "text/javascript; charset=utf-8",
+            "player.js": "text/javascript; charset=utf-8",
+            "share.js": "text/javascript; charset=utf-8",
+            "audio/decode.js": "text/javascript; charset=utf-8",
+            "audio/wav.js": "text/javascript; charset=utf-8",
+            "audio/loudness.js": "text/javascript; charset=utf-8",
+            "audio/suggest.js": "text/javascript; charset=utf-8",
+            "audio/fades.js": "text/javascript; charset=utf-8",
+            "audio/request.js": "text/javascript; charset=utf-8",
+        }
+        # Written out, so a file dropped from the allowlist or given another
+        # type fails here; the template is the one listed name never served.
+        self.assertEqual({**expected, "index.html": "text/html; charset=utf-8"}, static.ALLOWED)
+        for name, content_type in expected.items():
             with self.subTest(name):
                 response = self.request("GET", f"/static/dev/{name}")
                 self.assertEqual(response.status, 200)
@@ -465,6 +509,25 @@ class StaticTest(ServerTestCase):
             "/static/app.js",
             "/static/0.0.1/app.js",
             "/static/dev/app.js;x",
+            # Subpaths: only the exact key "audio/wav.js" is a file.
+            "/static/dev/audio/../app.js",
+            "/static/dev/audio/./wav.js",
+            "/static/dev/./audio/wav.js",
+            "/static/dev/audio/%2e%2e/app.js",
+            "/static/dev/audio%2Fwav.js",
+            "/static/dev/audio%2fwav.js",
+            "/static/dev/audio//wav.js",
+            "/static/dev/audio\\wav.js",
+            "/static/dev/audio/wav.js/",
+            "/static/dev/AUDIO/wav.js",
+            "/static/dev/audio/",
+            "/static/dev/audio",
+            "/static/dev/wav.js",
+            "/static/dev/audio/app.js",
+            "/static/dev/../dev/audio/wav.js",
+            # The ES-module marker for the Node tests is never served.
+            "/static/dev/package.json",
+            "/static/dev/audio/package.json",
             "/core/static/app.js",
             "/strange_ringtone/server.py",
             "http://example.internal/static/dev/app.js",
@@ -495,8 +558,10 @@ class StaticTest(ServerTestCase):
         with mock.patch.object(static, "STATIC_DIR", copy):
             self.start()
         shutil.rmtree(copy)
-        self.assertEqual(self.request("GET", "/static/dev/app.js").body, originals["app.js"])
-        self.assertEqual(self.request("GET", "/static/dev/style.css").body, originals["style.css"])
+        for name in static.ALLOWED:
+            if name != "index.html":
+                with self.subTest(name):
+                    self.assertEqual(self.request("GET", f"/static/dev/{name}").body, originals[name])
         self.assertEqual(self.request("GET", "/").status, 200)
 
     def test_get_never_returns_the_template_or_unlisted_names(self) -> None:
@@ -504,7 +569,27 @@ class StaticTest(ServerTestCase):
         self.assertIsNone(files.get("index.html"))
         self.assertIsNone(files.get("nope.js"))
         self.assertIsNone(files.get("../static/app.js"))
+        self.assertIsNone(files.get("audio/../app.js"))
+        self.assertIsNone(files.get("audio"))
+        self.assertIsNone(files.get("package.json"))
         self.assertIsNotNone(files.get("app.js"))
+        self.assertIsNotNone(files.get("audio/wav.js"))
+
+    def test_allowlist_names_are_plain_relative_paths(self) -> None:
+        static.check_names(static.ALLOWED)
+        for name in ("../server.py", "audio/../app.js", "./app.js", "audio/./wav.js", "/app.js", "audio/",
+                     "audio//wav.js", "audio\\wav.js", "C:/app.js", "app.js%00", "app js", "", "..", "."):
+            with self.subTest(name):
+                with self.assertRaises(ValueError):
+                    static.check_names([name])
+
+    def test_a_bad_allowlist_name_fails_startup(self) -> None:
+        # StaticFiles is where a name becomes a path, so it checks too: a ".."
+        # entry would otherwise read, and serve, a file outside static/.
+        bad = {"../strange_ringtone/server.py": "text/plain; charset=utf-8"}
+        with mock.patch.dict(static.ALLOWED, bad):
+            with self.assertRaisesRegex(ValueError, "bad static file name"):
+                static.StaticFiles()
 
     def test_routing_never_trusts_a_rewritten_or_double_slash_target(self) -> None:
         # Called directly, so the "//" refusal is pinned even on a stdlib that
