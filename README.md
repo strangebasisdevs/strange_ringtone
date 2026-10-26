@@ -43,7 +43,7 @@ shows.
 | `compose.example.yaml` | A hardened Compose example, with no published ports |
 | `.dockerignore` | An allowlist: only `core/` reaches the image build context |
 | `tools/spike/phase0.py` | Generates the test tones that established the share sheet's rules |
-| `scripts/` | Stdlib checks that CI runs on pull requests |
+| `scripts/` | Stdlib checks that CI runs: the PR title and contract checks on pull requests, and the weekly FFmpeg release watch |
 | `tests/` | Stdlib `unittest` tests |
 | `.github/` | CI workflows, Dependabot, and hashed lockfiles for the CI tools |
 

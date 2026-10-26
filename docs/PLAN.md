@@ -683,7 +683,9 @@ fetcher/
   Dockerfile  requirements.in  requirements.txt
   strange_ringtone_fetch/{server.py,ytdlp.py}
 tests/  tests/corpus/  tests/image/  tests/stubs/
-.github/{dependabot.yml,workflows/{ci,release-please,ffmpeg-watch}.yml}
+scripts/{check_pr_title.py,check_contract_change.py,check_ffmpeg_release.py}   # stdlib checks CI runs
+tools/spike/phase0.py       # regenerates the iOS test tones into spike-out/
+.github/{dependabot.yml,workflows/{ci,pr-checks,security_gate,release-please,ffmpeg-watch}.yml}
 release-please-config.json  .release-please-manifest.json
 docs/PLAN.md
 ```
