@@ -1840,8 +1840,10 @@ class ResultRouteTest(RenderFlowTestCase):
         # lowercase hex digits and .m4a or .m4r is no result route at all, so a
         # wrong method gets 404, never the 405 Allow: GET of a real route.
         hex_id = "0123456789abcdef" * 2
+        mixed_case = hex_id[:16] + hex_id[16:].upper()
         for path in (f"/api/result/{hex_id[:-1]}.m4a", f"/api/result/{hex_id}0.m4a",
-                     f"/api/result/{hex_id}.wav", f"/api/result/{hex_id}.mp4"):
+                     f"/api/result/{hex_id}.wav", f"/api/result/{hex_id}.mp4",
+                     f"/api/result/{hex_id.upper()}.m4a", f"/api/result/{mixed_case}.m4r"):
             with self.subTest(path=path):
                 response = self.request("POST", path, [("Content-Length", "0")])
                 self.assertJsonError(response, 404, "not_found")
