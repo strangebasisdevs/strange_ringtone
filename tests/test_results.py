@@ -166,6 +166,18 @@ class CapacityTest(StoreTestCase):
         self.assertEqual(self.on_disk(), [])
         self.store.put(self.source(), "x")
 
+    def test_put_sweeps_before_it_checks_for_room(self) -> None:
+        # The server asks is_full() before the render, but the last result can
+        # expire during it: put() itself must not count an expired result.
+        store = self.make_store(max_results=1)
+        old = store.put(self.source(b"old"), "x")
+        self.clock.advance(TTL)
+        new = store.put(self.source(b"new"), "y")
+        self.assertIsNone(store.get(old.result_id))
+        self.assertEqual(store.get(new.result_id), new)
+        self.assertEqual(len(store), 1)
+        self.assertEqual(self.on_disk(), [new.result_id, f"{new.result_id}/tone.m4a"])
+
     def test_bad_construction(self) -> None:
         for ttl, cap in ((0, 1), (1, 0)):
             with self.subTest(ttl=ttl, cap=cap), self.assertRaises(ValueError):
