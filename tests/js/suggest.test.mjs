@@ -67,6 +67,31 @@ test("a snap that would run past the end slides the window back", () => {
   near(start, 1, 1e-9, "start");
 });
 
+// Digital silence around the loud part in the next two tests: the K-weighting
+// filter is causal, so the silence before it measures exactly zero, and the
+// snap only moves the start when the chosen one is not already silent.
+
+test("the last candidate window, ending exactly at the clip's end, is scored", () => {
+  // Loud from 10.3 s to the end of a 40 s clip: the best 30 s window is the
+  // very last one, 10 s to 40 s, and its start is already silent.
+  const signal = sections([10.3, 0], [29.7, 0.5]);
+  const { start, end } = suggestSelection([signal], RATE, 30);
+  near(start, 10, 1e-9, "start");
+  near(end, 40, 1e-9, "end");
+});
+
+test("candidate windows start every 100 ms", () => {
+  // A 15 s loud part from 20.28 s: of the windows 100 ms apart, the one at
+  // 20.3 s holds the most of it (2.98 s in its last short-term block, against
+  // 2.92 s for 20.2 s and 2.88 s for 20.4 s). Its start is 20 ms into the loud
+  // part, so the snap moves it back to the nearest silent 50 ms, 20.25 s.
+  // Candidates 200 ms apart would pick 20.2 s, already silent, and stay there.
+  const signal = sections([20.28, 0], [15, 0.5], [24.72, 0]);
+  const { start, end } = suggestSelection([signal], RATE, 15);
+  near(start, 20.25, 1e-9, "start");
+  near(end, 35.25, 1e-9, "end");
+});
+
 test("a clip no longer than the cap is selected whole", () => {
   const signal = sections([10, 0.5]);
   assert.deepEqual(suggestSelection([signal], RATE, 30), { start: 0, end: 10 });
