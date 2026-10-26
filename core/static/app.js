@@ -30,6 +30,17 @@ function byId(id) {
 
 const app = byId("app");
 
+// The server accepts a DEFAULT_TARGET_LUFS with any number of decimals, but the
+// slider moves in 0.1 LU steps (step="0.1") and renderQuery sends one decimal.
+// Left as it is, an off-step baseline such as -14.25 would be snapped by the
+// browser to -14.2, so the slider could never sit on it: no "(baseline)"
+// label, a Reset that never disables, and a marker away from the thumb.
+// Rounding it once here, half up as the range input snaps, makes the baseline
+// a value the slider can hold and the query can send.
+function roundToStep(value) {
+  return Math.round(value * 10) / 10;
+}
+
 function readConfig() {
   // MAX_CLIP_SECONDS is an integer string and DEFAULT_TARGET_LUFS a float
   // string such as "-14.0"; the server validated both at startup.
@@ -38,7 +49,7 @@ function readConfig() {
   return {
     maxClipSeconds: Number.isInteger(maxClipSeconds) && maxClipSeconds > 0 ? maxClipSeconds : 30,
     defaultTarget: Number.isFinite(defaultTarget)
-      ? Math.min(Math.max(defaultTarget, TARGET_MIN_LUFS), TARGET_MAX_LUFS)
+      ? roundToStep(Math.min(Math.max(defaultTarget, TARGET_MIN_LUFS), TARGET_MAX_LUFS))
       : -14,
     fetchEnabled: app.dataset.fetchEnabled === "true",
   };
@@ -303,6 +314,10 @@ async function renderFinal() {
     state.busy = false;
     updateButtons();
     if (generation !== state.generation && state.result === null) {
+      // invalidate() only clears a finished result, and this render never
+      // became one, so its numbers would otherwise stay up describing a
+      // selection or setting that has since changed.
+      el.resultInfo.hidden = true;
       setStatus(el.renderStatus, "Changed while rendering. Tap Hear final to render it again.");
     }
   }

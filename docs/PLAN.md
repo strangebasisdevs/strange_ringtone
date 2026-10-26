@@ -98,7 +98,8 @@ install through Finder or iMazing.
   of 0 to 5 s. Ringtones loop while ringing, so a fade-out plus a short fade-in
   makes the loop seamless and avoids clicks.
 - Loudness normalisation is on by default. The baseline (`DEFAULT_TARGET_LUFS`)
-  is −14 LUFS, with a slider from −24 (softer) to −9 (louder) and a true-peak
+  is −14 LUFS, with a slider from −24 (softer) to −9 (louder) in 0.1 LU steps
+  (the page rounds a baseline with more decimals to one) and a true-peak
   ceiling of −1 dBTP. Phase 0 didn't compare it by ear with a built-in tone, so
   the baseline is adjusted later through the slider or the env var.
 - The frontend has no dependencies: plain ES modules, with a canvas waveform
