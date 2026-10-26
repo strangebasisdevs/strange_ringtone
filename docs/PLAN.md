@@ -237,12 +237,20 @@ nasm, and audio encoding doesn't need the hand-written SIMD.
 - decoder `pcm_s16le`
 - encoders `aac` and `pcm_s16le` (the `null` muxer needs an encoder, 5.3 step 1)
 - muxers `ipod` and `null`, plus what configure pulls in for `ipod`: the `mov`
-  muxer, the bitstream filters and the parser its `_select` lines name. The
-  committed allowlist names each of them, with the reason, so the test
-  documents the whole binary.
+  muxer, and through its `_select` line the bitstream filters `aac_adtstoasc`
+  and `vp9_superframe` and the parser `ac3`. The committed allowlist names
+  each of them, with the reason, so the test documents the whole binary.
 - protocol `file`
 - filters `ebur128`, `volume`, `alimiter`, `afade`, `aformat`, `aresample`,
   `anull`
+- what `ffmpeg_select` pulls in for the ffmpeg tool's automatic audio and
+  video graphs: the filter `atrim` and the video filters `crop`, `format`,
+  `hflip`, `null`, `rotate`, `transpose`, `trim` and `vflip`, which WAV input
+  can't reach
+- libavfilter's always-built graph ends: `abuffer` and `abuffersink`, and the
+  video `buffer` and `buffersink`, which are equally unreachable
+
+`core/ffmpeg/components.txt` gives the reason for every one of these.
 
 The licence stays LGPL-2.1+. A CI test compares `ffmpeg -buildconf` with the
 committed configure line, then runs `-protocols`, `-demuxers`, `-decoders`,
