@@ -315,10 +315,17 @@ class Renderer:
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
+            finally:
+                # A drain that gave up leaves both pipes open; close them here
+                # rather than whenever the Popen object is collected.
+                _close_pipes(proc)
             raise RenderError("render_timeout") from None
         except BaseException:
-            _kill_group(proc)
-            proc.wait()
+            try:
+                _kill_group(proc)
+                proc.wait()
+            finally:
+                _close_pipes(proc)
             raise
         if proc.returncode != 0:
             raise RenderError(failure)
@@ -347,6 +354,25 @@ def _kill_group(proc: subprocess.Popen[bytes]) -> None:
         proc.kill()
     except OSError:
         pass
+
+
+def _close_pipes(proc: subprocess.Popen[bytes]) -> None:
+    for name in ("stdout", "stderr"):
+        pipe = getattr(proc, name)
+        if pipe is None or pipe.closed:
+            continue
+        # On Windows communicate() reads through helper threads that hold the
+        # pipe's lock while blocked in a read. Closing under a live one would
+        # wait for whatever survivor still holds the pipe open, which is the
+        # hang the bounded drain exists to avoid; such a thread closes its
+        # pipe itself once the pipe reaches EOF, so it is left to the thread.
+        reader = getattr(proc, f"{name}_thread", None)
+        if reader is not None and reader.is_alive():
+            continue
+        try:
+            pipe.close()
+        except OSError:
+            pass
 
 
 def _remove(path: Path) -> None:

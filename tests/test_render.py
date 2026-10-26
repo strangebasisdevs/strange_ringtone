@@ -499,6 +499,35 @@ class TimeoutTest(StubTestCase):
         patcher = mock.patch.object(render, "DRAIN_SECONDS", 0.5)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # Every run the renderer starts, so a test can check it was reaped.
+        self.procs: list[subprocess.Popen[bytes]] = []
+        # The class itself, kept before the patch below replaces the name.
+        self.popen = subprocess.Popen
+
+        def recording(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
+            proc = self.popen(*args, **kwargs)
+            self.procs.append(proc)
+            return proc
+
+        patcher = mock.patch.object(render.subprocess, "Popen", recording)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def assertReaped(self, pipes_closed: bool = True) -> None:
+        self.assertEqual(len(self.procs), 1)
+        proc = self.procs[0]
+        # Killed and waited for, not left a zombie for the GC to find.
+        self.assertIsNotNone(proc.returncode, "the timed-out run was never reaped")
+        if pipes_closed:
+            assert proc.stdout is not None and proc.stderr is not None
+            # On POSIX the renderer closes them before it raises. On Windows a
+            # reader thread closes its pipe once the killed run's end of it is
+            # gone, which can trail the raise by a moment.
+            deadline = time.monotonic() + 5
+            while not (proc.stdout.closed and proc.stderr.closed) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(proc.stdout.closed, "stdout left open")
+            self.assertTrue(proc.stderr.closed, "stderr left open")
 
     def test_a_hung_run_times_out(self) -> None:
         self.set_mode("hang")
@@ -508,6 +537,23 @@ class TimeoutTest(StubTestCase):
         self.assertEqual(raised.exception.code, "render_timeout")
         self.assertLess(time.monotonic() - started, 1 + 0.5 + 5)
         self.assertEqual(self.job_names(), ["in.wav"])
+        self.assertReaped()
+
+    def test_the_kill_is_followed_by_a_bounded_drain(self) -> None:
+        # The killed run is read to EOF and reaped, with the drain's own bound.
+        self.set_mode("hang")
+        timeouts: list[float | None] = []
+        real = self.popen.communicate
+
+        def recording(proc: subprocess.Popen[bytes], input: Any = None, timeout: float | None = None) -> Any:
+            timeouts.append(timeout)
+            return real(proc, input, timeout)
+
+        with mock.patch.object(self.popen, "communicate", recording):
+            with self.assertRaises(RenderError):
+                Renderer(STUB_COMMAND, 1).render(self.job, params(duration=1.0))
+        self.assertEqual(timeouts, [1, 0.5])
+        self.assertReaped()
 
     def test_the_whole_process_group_dies(self) -> None:
         self.set_mode("grandchild")
@@ -523,8 +569,11 @@ class TimeoutTest(StubTestCase):
         self.addCleanup(kill_quietly, grandchild)
         if not hasattr(os, "killpg"):
             # Windows has no process groups to kill; there the renderer can
-            # only end the direct child.
+            # only end the direct child, and the surviving grandchild still
+            # holds the pipes its reader threads are blocked on.
+            self.assertReaped(pipes_closed=False)
             return
+        self.assertReaped()
         deadline = time.monotonic() + 5
         while alive(grandchild) and time.monotonic() < deadline:
             time.sleep(0.05)
@@ -540,6 +589,9 @@ class TimeoutTest(StubTestCase):
                 Renderer(STUB_COMMAND, 1).render(self.job, params(duration=1.0))
         self.assertEqual(raised.exception.code, "render_timeout")
         self.assertLess(time.monotonic() - started, 1 + 0.5 + 5)
+        # The fallback kill ends the run, and its pipes are closed explicitly
+        # rather than left for the garbage collector.
+        self.assertReaped()
 
     @unittest.skipUnless(hasattr(os, "killpg"), "process groups are POSIX")
     def test_the_kill_targets_the_group_not_just_the_child(self) -> None:
