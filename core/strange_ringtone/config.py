@@ -146,6 +146,8 @@ def _parse_public_origin(value: str) -> str:
         raise ConfigError(f"{name} has an invalid host")
     if parts.netloc.endswith(":"):
         raise ConfigError(f"{name} has an empty port")
+    if parts.netloc.startswith("["):
+        _require_canonical_ipv6(name, parts.netloc[1 : parts.netloc.index("]")])
     if port is not None:
         # Browsers omit the default port and leading zeros, so either would
         # never match the Origin they send.
@@ -154,6 +156,20 @@ def _parse_public_origin(value: str) -> str:
         if port == _DEFAULT_PORTS[parts.scheme]:
             raise ConfigError(f"{name} must omit the default port, as browsers do")
     return value
+
+
+def _require_canonical_ipv6(name: str, host: str) -> None:
+    # Browsers serialize an IPv6 host in its shortest lowercase form, such as
+    # [::1], and the Origin check compares bytes. Any other spelling of the
+    # same address would start fine and then fail every POST with 403. A dotted
+    # tail is refused outright: browsers never send one, and Python only
+    # started printing it in 3.13.
+    try:
+        canonical = ipaddress.IPv6Address(host).compressed
+    except ValueError as exc:
+        raise ConfigError(f"{name} has an invalid IPv6 host") from exc
+    if "." in host or host != canonical:
+        raise ConfigError(f"{name} must write the IPv6 host as browsers do, for example [{canonical}]")
 
 
 def _parse_trusted_proxies(value: str | None) -> tuple[Network, ...]:

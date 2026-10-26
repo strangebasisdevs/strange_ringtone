@@ -459,6 +459,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         return GuardError(400, "incomplete_body")
                     out.write(chunk)
                     remaining -= len(chunk)
+        except OSError:
+            # A full tmpfs fails the write, or the flush when the with-block
+            # closes the file. Without this the error would escape and the
+            # client would see a dropped connection instead of a JSON answer.
+            return GuardError(500, "internal_error")
         finally:
             # The answer is written with the usual per-write timeout.
             self.connection.settimeout(self.timeout)
@@ -490,10 +495,18 @@ class RingtoneServer(http.server.ThreadingHTTPServer):
         self.limiter = RateLimiter(settings.rate_limit_renders_per_minute)
         self.gate = ConcurrencyGate(settings.render_concurrency)
         self._workers = threading.BoundedSemaphore(self.MAX_WORKERS)
-        _prepare_scratch(settings.scratch_dir)
         if ":" in address[0]:
             self.address_family = socket.AF_INET6
+        # Binding comes first: when another instance already owns the port,
+        # this one fails here, before it can empty the scratch directory that
+        # the running instance is still using.
         super().__init__(address, Handler)
+        try:
+            _prepare_scratch(settings.scratch_dir)
+        except BaseException:
+            # Nobody will call server_close() on a half-built server.
+            self.server_close()
+            raise
 
     def server_bind(self) -> None:
         # HTTPServer.server_bind calls socket.getfqdn(), a reverse DNS lookup.

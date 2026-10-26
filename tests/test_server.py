@@ -883,6 +883,39 @@ class BodyTest(ServerTestCase):
         self.assertScratchEmpty()
         self.assertEqual(sorted(p.name for p in self.temp.iterdir()), ["scratch"])
 
+    def test_a_full_disk_answers_500_not_a_dropped_connection(self) -> None:
+        real_open = open
+
+        class FullDisk:
+            def __init__(self, fail_on: str) -> None:
+                self.fail_on = fail_on
+
+            def __enter__(self) -> FullDisk:
+                return self
+
+            def __exit__(self, *exc: object) -> None:
+                # The buffered flush on close is where a full tmpfs can show up.
+                if self.fail_on == "close":
+                    raise OSError(28, "No space left on device")
+
+            def write(self, chunk: bytes) -> int:
+                if self.fail_on == "write":
+                    raise OSError(28, "No space left on device")
+                return len(chunk)
+
+        for fail_on in ("write", "close"):
+            with self.subTest(fail_on=fail_on):
+                def fake_open(file: Any, mode: str = "r", *args: Any, fail_on: str = fail_on, **kwargs: Any) -> Any:
+                    if Path(file).name == "in.wav":
+                        return FullDisk(fail_on)
+                    return real_open(file, mode, *args, **kwargs)
+
+                with mock.patch.object(server_module, "open", fake_open, create=True):
+                    response = self.post_render(self.render_headers(4), b"RIFF")
+                self.assertJsonError(response, 500, "internal_error")
+                self.wait_for_log("POST /api/render 500")
+                self.assertScratchEmpty()
+
     def test_job_directory_is_removed_when_the_hook_raises(self) -> None:
         def fail(job_dir: Path, handler: Handler) -> None:
             raise RuntimeError("SecretToneName")
@@ -1151,6 +1184,28 @@ class ScratchTest(ServerTestCase):
         self.assertEqual(self.post_render(self.render_headers(4), b"RIFF").status, 200)
         self.wait_for_log("POST /api/render 200")
         self.assertScratchEmpty()
+
+    def test_a_failed_bind_leaves_the_running_servers_scratch_alone(self) -> None:
+        # Starting the documented command twice must not delete the active
+        # jobs of the instance that owns the port.
+        (self.scratch / "job-active").mkdir()
+        (self.scratch / "job-active" / "in.wav").write_bytes(b"active")
+        with self.assertRaises(OSError):
+            RingtoneServer(("127.0.0.1", self.port), self.settings)
+        self.assertEqual((self.scratch / "job-active" / "in.wav").read_bytes(), b"active")
+
+    def test_the_socket_is_closed_when_scratch_preparation_fails(self) -> None:
+        closed: list[bool] = []
+
+        class Spy(RingtoneServer):
+            def server_close(self) -> None:
+                closed.append(True)
+                super().server_close()
+
+        with mock.patch.object(server_module, "_prepare_scratch", side_effect=RuntimeError("no scratch")):
+            with self.assertRaisesRegex(RuntimeError, "no scratch"):
+                Spy(("127.0.0.1", 0), self.settings)
+        self.assertEqual(closed, [True])
 
     def test_missing_parent_is_refused_not_created(self) -> None:
         # Without the /tmp tmpfs the core must not create /tmp on the root

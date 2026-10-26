@@ -143,6 +143,28 @@ class PublicOriginTest(unittest.TestCase):
             with self.subTest(origin=origin), self.assertRaisesRegex(ConfigError, "PUBLIC_ORIGIN"):
                 Settings.from_env({"PUBLIC_ORIGIN": origin})
 
+    def test_refuses_ipv6_hosts_a_browser_would_write_differently(self) -> None:
+        # Browsers send [::1], never a longer spelling of the same address, so
+        # the byte-for-byte Origin check would fail every POST.
+        for origin in (
+            "http://[0:0:0:0:0:0:0:1]:8080",
+            "http://[0::1]:8080",
+            "http://[::0001]:8080",
+            "http://[2001:db8:0:0:0:0:0:1]",
+            "http://[1:0:0:0:0:0:0:0]",
+            "http://[::ffff:127.0.0.1]:8080",
+            "http://[::1.2.3.4]:8080",
+            "http://[:::1]:8080",
+            "http://[1:2:3:4:5:6:7:8:9]:8080",
+        ):
+            with self.subTest(origin=origin), self.assertRaisesRegex(ConfigError, "PUBLIC_ORIGIN"):
+                Settings.from_env({"PUBLIC_ORIGIN": origin})
+
+    def test_accepts_canonical_ipv6_hosts(self) -> None:
+        for origin in ("http://[::1]:8080", "https://[2001:db8::1]", "https://[2001:db8:0:1:1:1:1:1]:8443"):
+            with self.subTest(origin=origin):
+                self.assertEqual(Settings.from_env({"PUBLIC_ORIGIN": origin}).public_origin, origin)
+
     def test_refuses_uppercase_with_a_hint(self) -> None:
         # Browsers send lowercase origins; an uppercase setting would make every
         # POST fail with 403, so say why instead.
