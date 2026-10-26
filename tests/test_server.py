@@ -1831,9 +1831,17 @@ class ResultRouteTest(RenderFlowTestCase):
         probe_id = "0123456789abcdef0123456789abcdef"
         self.request("GET", f"/api/result/{probe_id}.m4a?x=1")
         self.request("GET", f"/api/result/{probe_id.upper()}{probe_id}.mp3")
+        # A live ID sent to any other path is still a download token, so it is
+        # masked whatever route the request missed.
+        for other in (f"/API/result/{probe_id}.m4a", f"/api/results/{probe_id}.m4a",
+                      f"/static/{probe_id}.m4a", f"/{probe_id}"):
+            self.request("GET", other)
         self.wait_for_log("GET /api/result/", count=2)
+        self.wait_for_log("GET /", count=6)
         self.assertNotIn(probe_id, self.log.getvalue().lower())
         self.assertIn("GET /api/result/<id>.m4a 404 ", self.log.getvalue())
+        self.assertIn("GET /API/result/<id>.m4a 404 ", self.log.getvalue())
+        self.assertIn("GET /<id> 404 ", self.log.getvalue())
 
 
 class ServerWiringTest(unittest.TestCase):

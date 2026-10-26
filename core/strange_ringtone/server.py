@@ -224,9 +224,10 @@ def _log_path(raw: str) -> str:
     # anything there; logs keep the path only (docs/PLAN.md 5.5).
     path = raw.split("?", 1)[0].split("#", 1)[0]
     # A result ID is the only thing needed to download a tone, so a log line
-    # must not hand one to whoever reads the logs.
-    if path.startswith("/api/result/"):
-        path = _LOG_ID_RE.sub("<id>", path)
+    # must not hand one to whoever reads the logs. The mask applies to every
+    # path, not only the result route: a live ID sent to a mistyped or
+    # case-varied route is just as much a token.
+    path = _LOG_ID_RE.sub("<id>", path)
     return _printable(path, _LOG_PATH_MAX)
 
 
