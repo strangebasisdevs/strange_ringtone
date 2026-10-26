@@ -1,7 +1,7 @@
 # strange_ringtone: research and v0.1.0 plan
 
 Status: design agreed on 2026-10-24 (decisions in section 3). Milestones 0
-and 1 are done, and the core server of milestone 2 is implemented (section 12).
+to 2 are done, and milestone 3 (render) is implemented (section 12).
 This file is the design record; the README's "Deployment contract" becomes the
 source of truth for operators once v0.1.0 ships.
 
@@ -178,8 +178,9 @@ it as unsafe in a threaded process, and this server is threaded. The child
 starts in its own session (`start_new_session=True`), `communicate()` enforces
 `RENDER_TIMEOUT_SECONDS`, and on timeout the whole process group is killed with
 `os.killpg` and reaped. `subprocess.run(timeout=…)` alone would kill only the
-direct child. Each run uses `-nostdin -hide_banner -threads 1
--protocol_whitelist file -f wav -i <job>/in.wav`.
+direct child. Each run uses `-nostdin -hide_banner -nostats -threads 1
+-protocol_whitelist file -f wav -i <job>/in.wav`, and each render run adds `-y`,
+because the corrective render overwrites `out.m4a`.
 
 1. **Measure:** `-af ebur128=peak=true -f null -`. A strict regex reads the
    integrated loudness and true peak from the summary. If parsing fails, the
@@ -224,25 +225,39 @@ Measured in the Phase 0 spike (ffmpeg 8.1.1, synthetic loop, 2026-10-24):
 
 **Minimal ffmpeg build:** a pinned release tarball, checked against a committed
 SHA-256 and the FFmpeg release signature. Configure flags:
-`--disable-everything --disable-network --disable-autodetect --disable-doc
---disable-ffplay --disable-ffprobe --enable-static --disable-shared`, then
-enable only these:
+`--disable-everything --disable-network --disable-autodetect --disable-iconv
+--disable-unstable --disable-doc --disable-ffplay --disable-ffprobe
+--disable-x86asm --enable-static --disable-shared`, then enable only these.
+`--disable-iconv` is needed because configure probes for the C library's
+iconv even under `--disable-autodetect`; `--disable-unstable` leaves out
+FFmpeg's experimental code; `--disable-x86asm` means the builder needs no
+nasm, and audio encoding doesn't need the hand-written SIMD.
 
 - demuxer `wav`
 - decoder `pcm_s16le`
 - encoders `aac` and `pcm_s16le` (the `null` muxer needs an encoder, 5.3 step 1)
 - muxers `ipod` and `null`, plus what configure pulls in for `ipod`: the `mov`
-  muxer, the bitstream filters and the parser its `_select` lines name. The
-  committed allowlist names each of them, with the reason, so the test
-  documents the whole binary.
+  muxer, and through its `_select` line the bitstream filters `aac_adtstoasc`
+  and `vp9_superframe` and the parser `ac3`. The committed allowlist names
+  each of them, with the reason, so the test documents the whole binary.
 - protocol `file`
 - filters `ebur128`, `volume`, `alimiter`, `afade`, `aformat`, `aresample`,
   `anull`
+- what `ffmpeg_select` pulls in for the ffmpeg tool's automatic audio and
+  video graphs: the filter `atrim` and the video filters `crop`, `format`,
+  `hflip`, `null`, `rotate`, `transpose`, `trim` and `vflip`, which WAV input
+  can't reach
+- libavfilter's always-built graph ends: `abuffer` and `abuffersink`, and the
+  video `buffer` and `buffersink`, which are equally unreachable
+
+`core/ffmpeg/components.txt` gives the reason for every one of these.
 
 The licence stays LGPL-2.1+. A CI test compares `ffmpeg -buildconf` with the
 committed configure line, then runs `-protocols`, `-demuxers`, `-decoders`,
-`-encoders`, `-muxers`, `-bsfs`, `-parsers` and `-filters` in the built image
-and fails on anything outside the committed allowlist.
+`-encoders`, `-muxers`, `-bsfs` and `-filters` in the built image, reads the
+parsers from the build's generated `parser_list.c` (ffmpeg has no `-parsers`
+option), and fails on anything outside the committed allowlist
+(`core/ffmpeg/components.txt`) and on anything listed there that is missing.
 
 ### 5.4 Fades and loudness preview
 
@@ -307,8 +322,8 @@ the user types becomes the filename. Decision 9 keeps it readable:
 | Image | `ghcr.io/<owner>/strange_ringtone:<semver>`, consumed by digest, linux/amd64 |
 | User | UID 10001, GID 10001 (fixed, non-root) |
 | Port | 8080/tcp, plain HTTP. TLS is the proxy's job. |
-| Runs with | `read_only: true`, `cap_drop: [ALL]`, `no-new-privileges`. No egress needed (internal network). |
-| Writable | `/tmp` (tmpfs) and nothing else. No volumes, and nothing survives a restart. Size it at `MAX_RESULTS × 1 MB + RENDER_CONCURRENCY × (MAX_BODY_BYTES + 1 MB)`, which is 64 MB with the defaults. |
+| Runs with | `read_only: true`, `cap_drop: [ALL]`, `no-new-privileges`, `ipc: none`, `ulimits: msgqueue: 0`. No egress needed (internal network). |
+| Writable | `/tmp` (tmpfs) and nothing else. Docker would also give the container a writable `/dev/shm` tmpfs and POSIX message queues in `/dev/mqueue`; `ipc: none` and a zero `msgqueue` limit remove both. No volumes, and nothing survives a restart. Size it at `(MAX_RESULTS + RENDER_CONCURRENCY) × MAX_CLIP_SECONDS × 33 kB + RENDER_CONCURRENCY × MAX_BODY_BYTES`: a result is 256 kbit/s AAC, at most 33 kB per second of clip with the MP4 overhead, and each running render also holds its upload. That is 63 MB with the defaults (use 64 MB) and 84 MB with `MAX_CLIP_SECONDS=40`. |
 | Health | `GET /healthz` returns 200 with an empty body |
 
 | Variable | Default | Notes |
@@ -515,11 +530,14 @@ Local jobs run with `permissions: contents: read`:
 
 - ruff lint.
 - Unit tests.
-- A core image build and an integration test run inside it with
-  `--network none` (the real ffmpeg, the corpus, and the build-configuration
-  checks), from the render milestone on. The job is named **Image tests** and
-  joins the required checks in the same milestone, because it is the only
-  test that proves the ffmpeg allowlist, `--network none` and `read_only`.
+- **Image tests** (from the render milestone on): a core image build with
+  buildx and the GitHub Actions cache, then the in-image tests
+  (`tests/image`) in the built image with `--network none`, `--read-only`, a
+  `/tmp` tmpfs, `--cap-drop ALL`, `no-new-privileges`, `--ipc none` and
+  `--ulimit msgqueue=0`: the real ffmpeg, the corpus, the build-configuration
+  checks and the container contract. It is a
+  required check, because it is the only test that proves the ffmpeg
+  allowlist, `--network none` and `read_only`.
 - A **PR-title check** (conventional commits, so release-please works). It is a
   stdlib script that reads the title from an `env:` variable, never from inline
   `${{ }}`.
@@ -557,7 +575,7 @@ required, all reported by GitHub Actions:
 - Semgrep / Semgrep scan
 - Trivy / Trivy filesystem scan
 - Gitleaks / Gitleaks history scan
-- Image tests (added with the first Dockerfile, milestone 3)
+- Image tests (from milestone 3; the owner adds it to the ruleset)
 
 The repository squash-merges with the PR title as the commit subject, which is
 what release-please reads. A **tag ruleset** on `v*` lets only organisation
@@ -649,8 +667,9 @@ security repository, and never patched with a local copy here.
   empty input. The `filename*` header must round-trip, and the ASCII fallback
   must stay ASCII. A duplicate, oversized or invalid `X-Tone-Name` header is
   refused.
-- **Statelessness:** after a full render and download, and again after the TTL
-  sweep, the scratch path is empty. The in-image test runs the container with
+- **Statelessness:** after a full render and download only the result remains
+  under `results/`; after the TTL sweep the scratch path holds nothing. The
+  in-image test runs the container with
   `read_only: true` and only `/tmp` writable, and fails if the server tries to
   write anywhere else. Neither the logs nor the query strings ever contain a
   tone name.
@@ -663,16 +682,19 @@ security repository, and never patched with a local copy here.
 ```
 LICENSE  README.md  SECURITY.md  CHANGELOG.md  CLAUDE.md  .env.example
 compose.example.yaml        # hardened example, ports only in a commented dev snippet
+.dockerignore               # allowlist: only core/ reaches the build context
 core/
-  Dockerfile  ffmpeg/{build.sh,VERSION,SHA256SUMS}
+  Dockerfile  ffmpeg/{VERSION,SHA256SUMS,ffmpeg-devel.asc,configure.txt,components.txt}
   __main__.py               # checkout entry point: python -I core
   strange_ringtone/{__main__.py,config.py,server.py,http_guard.py,static.py,wav.py,render.py,names.py,results.py}
   static/{index.html,app.js,waveform.js,loudness.js,suggest.js,share.js,style.css}
 fetcher/
   Dockerfile  requirements.in  requirements.txt
   strange_ringtone_fetch/{server.py,ytdlp.py}
-tests/  tests/corpus/
-.github/{dependabot.yml,workflows/{ci,release-please,ffmpeg-watch}.yml}
+tests/  tests/corpus/  tests/image/  tests/stubs/
+scripts/{check_pr_title.py,check_contract_change.py,check_ffmpeg_release.py}   # stdlib checks CI runs
+tools/spike/phase0.py       # regenerates the iOS test tones into spike-out/
+.github/{dependabot.yml,workflows/{ci,pr-checks,security_gate,release-please,ffmpeg-watch}.yml}
 release-please-config.json  .release-please-manifest.json
 docs/PLAN.md
 ```
@@ -730,10 +752,19 @@ docs/PLAN.md
    `python -I -m strange_ringtone`: `-I` keeps the current directory off
    `sys.path`, so `-m` finds the package only where it is installed, while a
    directory that Python runs is always on `sys.path`. `POST /api/render` ends
-   in 501 `render_unavailable` until milestone 3. How the image starts the
-   server is settled with the Dockerfile.
+   in 501 `render_unavailable` until milestone 3. The image starts the server
+   as `python -I /app/core` (milestone 3).
 3. **Render:** the minimal ffmpeg build, WAV validation, measure and render,
    results with TTL, the corpus, and the build-configuration tests.
+
+   The image (`core/Dockerfile`) builds FFmpeg 9.0.2 from the release tarball,
+   verified by its committed SHA-256 and by FFmpeg's release signature, with
+   exactly `core/ffmpeg/configure.txt`, and runs as UID 10001 on port 8080
+   under `python:3.12-slim-bookworm`, both base images pinned by digest. The
+   **Image tests** job runs the in-image tests under the contract's
+   restrictions; the owner adds it to the ruleset. `ffmpeg-watch.yml` fails
+   weekly when a newer FFmpeg is released, and Dependabot tracks the base
+   images. `compose.example.yaml` shows the hardened service.
 4. **Web app:** decode, waveform, selection, preview (fades and JS loudness),
    render and "Hear final", share or download, and energy-based suggestions.
    Finish the Web Share part of the spike here.

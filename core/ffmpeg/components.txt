@@ -1,0 +1,56 @@
+# Every component in the core image's ffmpeg, as `<kind> <name> <why>`.
+#
+# tests/image/test_build_config.py lists each kind from the built binary
+# (`ffmpeg -protocols`, `-demuxers`, `-decoders`, `-encoders`, `-muxers`,
+# `-bsfs`, `-filters`; parsers from the build's generated parser_list.c,
+# because ffmpeg has no -parsers option) and fails on any name missing here,
+# and on any name here that the binary lacks. A component that appears after a
+# version bump fails the build until someone writes down why it is there.
+#
+# The enables themselves are in configure.txt. The rest is what configure
+# pulls in through _select lines (FFmpeg 9.0.2's configure script).
+
+# What configure.txt enables.
+protocol file      Reads in.wav and writes out.m4a in the per-job directory; the only protocol (-protocol_whitelist file).
+demuxer  wav       The only input: the PCM WAV the browser made, checked by content first (docs/PLAN.md 5.2).
+decoder  pcm_s16le The only sample format the WAV check accepts.
+encoder  aac       The ringtone's audio codec.
+encoder  pcm_s16le The null muxer's default encoder; the measure pass encodes what it discards (5.3 step 1).
+muxer    ipod      The ringtone's container (.m4a and .m4r are the same bytes).
+muxer    null      The measure pass's output, which writes nothing.
+filter   ebur128   Measures integrated loudness and true peak, before and after the chain.
+filter   volume    Applies the loudness gain.
+filter   alimiter  Keeps peaks under the -1.5 dBFS ceiling, with level=false.
+filter   afade     Fade-in and fade-out.
+filter   aformat   Format negotiation in the filter graph.
+filter   aresample Resamples to 44.1 kHz (-ar 44100); ebur128's true peak also uses libswresample.
+filter   anull     Pass-through, part of ffmpeg's default audio graph.
+
+# Pulled in by ipod_muxer_select="mov_muxer".
+muxer    mov       The ipod muxer is a variant of the mov muxer and shares its code.
+
+# Pulled in by mov_muxer_select. None of them can be reached with WAV input,
+# but configure links them because the mov muxer refers to them.
+bsf      aac_adtstoasc  Rewrites ADTS AAC for MP4; the aac encoder already emits raw AAC.
+bsf      vp9_superframe For VP9 video in MP4; this build has no video input.
+parser   ac3            For AC-3 audio in MP4; this build has no AC-3 input.
+
+# Pulled in by ffmpeg_select, which the ffmpeg tool itself needs for its
+# automatic audio and video graphs. The video ones are unreachable: the only
+# demuxer is wav.
+filter   atrim     Trims audio for -ss/-t/-to; the renderer never passes them.
+filter   crop      Video, from ffmpeg_select.
+filter   format    Video, from ffmpeg_select.
+filter   hflip     Video, from ffmpeg_select (autorotation).
+filter   null      Video pass-through, from ffmpeg_select.
+filter   rotate    Video, from ffmpeg_select (autorotation).
+filter   transpose Video, from ffmpeg_select (autorotation).
+filter   trim      Video, from ffmpeg_select.
+filter   vflip     Video, from ffmpeg_select (autorotation).
+
+# Always built into libavfilter: every filter graph starts at a buffer source
+# and ends at a buffer sink.
+filter   abuffer     Audio graph input.
+filter   abuffersink Audio graph output.
+filter   buffer      Video graph input; unreachable, as above.
+filter   buffersink  Video graph output; unreachable, as above.

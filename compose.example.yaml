@@ -1,0 +1,71 @@
+# A hardened example of running the core (docs/PLAN.md 5.7). Copy it into your
+# own infrastructure repository and adapt it there; this repository stays
+# generic, so it names no host, domain or proxy.
+#
+#   cp .env.example .env    # then set PUBLIC_ORIGIN
+#   docker compose -f compose.example.yaml up -d
+#
+# The service publishes no ports. A reverse proxy that terminates TLS joins
+# the `core` network and forwards to core:8080.
+
+name: strange_ringtone
+
+services:
+  core:
+    # Deployments pin a released image by digest, for example
+    #   image: ghcr.io/strangebasisdevs/strange_ringtone@sha256:<digest>
+    # There is no release before v0.1.0, so this example builds the checkout.
+    build:
+      context: .
+      dockerfile: core/Dockerfile
+    image: strange_ringtone:local
+    # PUBLIC_ORIGIN (required) and any optional settings, from .env.
+    env_file: .env
+    # The contract's fixed, non-root UID and GID; the image sets the same.
+    user: "10001:10001"
+    # Nothing in the image is writable but the tmpfs below, so a compromised
+    # server can't change its own code or ffmpeg.
+    read_only: true
+    # The server needs no capability, and setuid binaries can't grant one.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # Docker otherwise mounts a writable /dev/shm tmpfs and lets the server
+    # create POSIX message queues under /dev/mqueue, both outside read_only.
+    # The server uses neither, so /tmp stays the only writable path.
+    ipc: none
+    ulimits:
+      msgqueue: 0
+    tmpfs:
+      # The only writable path: uploads and results, gone on restart. noexec
+      # and nosuid keep anything written there from running. The size follows
+      # the contract's formula (docs/PLAN.md 5.7): 64 MB fits the default
+      # settings; MAX_CLIP_SECONDS=40 needs 84 MB.
+      - /tmp:rw,noexec,nosuid,size=64m,mode=1777
+    networks:
+      - core
+    restart: unless-stopped
+    healthcheck:
+      # http.client to loopback: inside the container, with no proxy lookup.
+      test:
+        - CMD
+        - python
+        - -I
+        - -c
+        - "import http.client as h; c = h.HTTPConnection('127.0.0.1', 8080, timeout=3); c.request('GET', '/healthz'); raise SystemExit(c.getresponse().status != 200)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    # For local development only, never on a LAN-facing host: publish the
+    # port on loopback and set PUBLIC_ORIGIN=http://127.0.0.1:8080 in .env.
+    # An internal network has no port publishing, so also switch `core`
+    # below to a normal network while you do.
+    # ports:
+    #   - "127.0.0.1:8080:8080"
+
+networks:
+  core:
+    # internal: no route out of this network. The core never makes an
+    # outbound connection, so it needs none.
+    internal: true

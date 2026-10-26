@@ -1,0 +1,8 @@
+# Reviewed false positives of the organisation's Gitleaks history scan, one
+# fingerprint per line (commit:file:rule:line). CLAUDE.md: Gitleaks findings
+# never get inline suppressions; a real secret means rotate first.
+#
+# A 32-hex test probe ID, "0123456789abcdef0123456789abcdef", used to prove
+# that result IDs are masked in the log. Not a credential. The variable was
+# renamed in f8c146d, but the history scan still sees this commit.
+88814415c20d259b7fc51f966ab78880a46c36e9:tests/test_server.py:generic-api-key:1831

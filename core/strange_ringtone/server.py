@@ -11,6 +11,7 @@ import http.server
 import io
 import json
 import os
+import re
 import shutil
 import socket
 import socketserver
@@ -20,9 +21,11 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
+from email.message import Message
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from strange_ringtone.config import Settings
 from strange_ringtone.http_guard import (
@@ -35,11 +38,45 @@ from strange_ringtone.http_guard import (
     require_origin,
     security_headers,
 )
+from strange_ringtone.names import content_disposition, parse_tone_name
+from strange_ringtone.render import FFMPEG, Renderer, RenderError, RenderParams, default_prlimit
+from strange_ringtone.results import ResultStore, StoreFull
 from strange_ringtone.static import ALLOWED, StaticFiles
+from strange_ringtone.wav import WavError, inspect_wav
 
 SERVER_NAME = "strange_ringtone"
 RENDER_PATH = "/api/render"
 WAV_TYPE = "audio/wav"
+# /api/result/<32 hex>.m4a or .m4r. The ID's exact shape is part of the route,
+# so a path trick ("..", "%2f", a longer ID) is simply not a result route.
+RESULT_PATH_RE = re.compile(r"/api/result/([0-9a-f]{32})\.(m4a|m4r)")
+# The same bytes under both names; only the type differs (docs/PLAN.md 5.3).
+RESULT_TYPES = {"m4a": "audio/mp4", "m4r": "audio/x-m4r"}
+# How often the sweeper looks for expired results. Small against the TTL, so
+# a result outlives its TTL by at most this much on disk; get() refuses it the
+# moment the TTL is up.
+SWEEP_INTERVAL_SECONDS = 5.0
+# A full results store frees a slot only when the oldest result expires, so a
+# retry in one second (as for busy) would mostly meet the same answer.
+RESULTS_FULL_RETRY_SECONDS = 10
+
+# Render options in the query string (docs/PLAN.md 5.1). Defaults and bounds
+# are the plan's; the target's default comes from DEFAULT_TARGET_LUFS.
+FADE_IN_DEFAULT = 0.2
+FADE_OUT_DEFAULT = 1.5
+FADE_MAX_SECONDS = 5.0
+TARGET_LUFS_MIN = -24.0
+TARGET_LUFS_MAX = -9.0
+_QUERY_KEYS = frozenset({"fade_in", "fade_out", "normalize", "target_lufs"})
+# What the web app's URLSearchParams produces for these keys and values. No
+# '%' or '+': parse_qs would decode them, and a decoded key or number is
+# something the client could spell in many ways.
+_QUERY_RE = re.compile(r"[A-Za-z0-9_.=&-]*")
+# A plain decimal, as config.py accepts: no exponent, inf, nan, sign other
+# than '-', or whitespace, all of which float() would take.
+_DECIMAL_RE = re.compile(r"-?[0-9]+(\.[0-9]+)?")
+_DECIMAL_MAX_CHARS = 16
+_QUERY_MAX_FIELDS = 8
 # The body is copied to disk in pieces, so a 5.8 MB upload never sits in memory
 # whole and a read never asks for more than the declared length.
 CHUNK_BYTES = 65536
@@ -58,9 +95,118 @@ _LOG_METHOD_MAX = 16
 RenderHook = Callable[[Path, "Handler"], None]
 
 
-def unavailable_render_hook(job_dir: Path, handler: Handler) -> None:
-    """Milestone 2 has no renderer: a request that passed every check ends here."""
-    raise GuardError(501, "render_unavailable")
+@dataclass(frozen=True)
+class RenderRequest:
+    """The render options and tone name, checked before the request costs anything."""
+
+    fade_in: float
+    fade_out: float
+    normalize: bool
+    target_lufs: float
+    name: str
+
+
+def _decimal(values: list[str], low: float, high: float) -> float:
+    value = values[0]
+    if len(value) > _DECIMAL_MAX_CHARS or not _DECIMAL_RE.fullmatch(value):
+        raise GuardError(400, "bad_params")
+    number = float(value)
+    if not low <= number <= high:
+        raise GuardError(400, "bad_params")
+    return number
+
+
+def parse_render_request(path: str, headers: Message, settings: Settings) -> RenderRequest:
+    """The query's render options and the X-Tone-Name header, or GuardError 400.
+
+    Pure, so every refusal is tested on its own. Anything not positively
+    recognised is refused: unknown or repeated keys, numbers in any spelling
+    but a plain decimal, and values out of range.
+    """
+    name = parse_tone_name(headers.get_all("X-Tone-Name") or [])
+    try:
+        query = urlsplit(path).query
+    except ValueError:
+        raise GuardError(400, "bad_params") from None
+    fields: dict[str, list[str]] = {}
+    if query:
+        if not _QUERY_RE.fullmatch(query):
+            raise GuardError(400, "bad_params")
+        try:
+            # strict_parsing refuses empty fields and fields without '=';
+            # max_num_fields bounds the work a long query can cause.
+            fields = parse_qs(query, keep_blank_values=True, strict_parsing=True, max_num_fields=_QUERY_MAX_FIELDS)
+        except ValueError:
+            raise GuardError(400, "bad_params") from None
+    # A repeated key could be read differently by a proxy, a client library
+    # and this server, so it is refused rather than resolved.
+    if set(fields) - _QUERY_KEYS or any(len(values) != 1 for values in fields.values()):
+        raise GuardError(400, "bad_params")
+    normalize = True
+    if "normalize" in fields:
+        value = fields["normalize"][0]
+        if value not in ("true", "false"):
+            raise GuardError(400, "bad_params")
+        normalize = value == "true"
+    return RenderRequest(
+        fade_in=_decimal(fields["fade_in"], 0.0, FADE_MAX_SECONDS) if "fade_in" in fields else FADE_IN_DEFAULT,
+        fade_out=_decimal(fields["fade_out"], 0.0, FADE_MAX_SECONDS) if "fade_out" in fields else FADE_OUT_DEFAULT,
+        normalize=normalize,
+        target_lufs=(
+            _decimal(fields["target_lufs"], TARGET_LUFS_MIN, TARGET_LUFS_MAX)
+            if "target_lufs" in fields
+            else settings.default_target_lufs
+        ),
+        name=name,
+    )
+
+
+def render_and_store(job_dir: Path, handler: Handler) -> None:
+    """The render hook: validate in.wav, render it, keep the result, answer JSON.
+
+    Runs inside the render slot with job_dir/in.wav complete. The handler
+    deletes job_dir before it sends the answer, so out.m4a is moved into the
+    results store before this returns.
+    """
+    server = handler.server
+    request = handler.render_request
+    try:
+        info = inspect_wav(job_dir / "in.wav", server.settings.max_clip_seconds)
+    except WavError as error:
+        # These two carry a detail, which GuardError can't, so they are
+        # answered here. The detail is one of the fixed codes in wav.py.
+        if error.code == "too_long":
+            handler.send_json(413, {"error": "too_large", "detail": "too_long"})
+        else:
+            handler.send_json(400, {"error": "bad_wav", "detail": error.code})
+        return
+    params = RenderParams(
+        fade_in=request.fade_in,
+        fade_out=request.fade_out,
+        normalize=request.normalize,
+        target_lufs=request.target_lufs,
+        title=request.name,
+        duration=info.seconds,
+    )
+    try:
+        rendered = server.renderer.render(job_dir, params)
+    except RenderError as error:
+        # measure_failed is a render failure to the client; what ffmpeg said
+        # stays inside the renderer.
+        if error.code == "render_timeout":
+            raise GuardError(504, "render_timeout") from None
+        raise GuardError(500, "render_failed") from None
+    try:
+        result = server.results.put(rendered.output, request.name)
+    except StoreFull:
+        # Another render filled the store while this one ran.
+        raise GuardError(503, "results_full", retry_after=RESULTS_FULL_RETRY_SECONDS) from None
+    handler.send_json(200, {
+        "result_id": result.result_id,
+        "duration": round(rendered.duration, 3),
+        "measured_lufs": round(rendered.measured_lufs, 2),
+        "applied_gain_db": round(rendered.applied_gain_db, 2),
+    })
 
 
 def _printable(text: str, limit: int) -> str:
@@ -70,10 +216,19 @@ def _printable(text: str, limit: int) -> str:
     return cleaned or "-"
 
 
+_LOG_ID_RE = re.compile(r"[0-9A-Fa-f]{32,}")
+
+
 def _log_path(raw: str) -> str:
     # The query string holds the render options, and a client could put
     # anything there; logs keep the path only (docs/PLAN.md 5.5).
-    return _printable(raw.split("?", 1)[0].split("#", 1)[0], _LOG_PATH_MAX)
+    path = raw.split("?", 1)[0].split("#", 1)[0]
+    # A result ID is the only thing needed to download a tone, so a log line
+    # must not hand one to whoever reads the logs. The mask applies to every
+    # path, not only the result route: a live ID sent to a mistyped or
+    # case-varied route is just as much a token.
+    path = _LOG_ID_RE.sub("<id>", path)
+    return _printable(path, _LOG_PATH_MAX)
 
 
 def _prepare_scratch(directory: Path) -> None:
@@ -111,6 +266,8 @@ def _prepare_scratch(directory: Path) -> None:
 
 class Handler(http.server.BaseHTTPRequestHandler):
     server: RingtoneServer
+    # Set by _render once the query and the name have passed, for the hook.
+    render_request: RenderRequest
 
     # One request per connection, always closed afterwards: no keep-alive state
     # to reason about, and no worker parked on an idle socket. It also means
@@ -285,6 +442,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return None
         if path in ("/", "/healthz") or self._static_name(path) is not None:
             return "GET"
+        # Any well-formed result path, live or not: HEAD or POST to it is a
+        # 405 whether or not the ID exists, so the answer reveals nothing.
+        if RESULT_PATH_RE.fullmatch(path):
+            return "GET"
         if path == RENDER_PATH:
             return "POST"
         return None
@@ -313,7 +474,36 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # every asset URL.
             self.send_body(200, body, content_type, IMMUTABLE)
             return
+        match = RESULT_PATH_RE.fullmatch(path) if path is not None else None
+        if match is not None:
+            self._send_result(match[1], match[2])
+            return
         self._refuse_method()
+
+    def _send_result(self, result_id: str, extension: str) -> None:
+        # Unknown, expired and swept IDs all get the same 404, so a client
+        # learns nothing about which IDs ever existed.
+        result = self.server.results.get(result_id)
+        body: bytes | None = None
+        if result is not None:
+            try:
+                # Read whole and closed at once: the sweeper may delete the file
+                # between get() and here, and Windows can't delete an open file.
+                with open(result.path, "rb") as handle:
+                    body = handle.read()
+            except OSError:
+                body = None
+        if result is None or body is None:
+            self.send_json_error(404, "not_found")
+            return
+        self.send_body(
+            200,
+            body,
+            RESULT_TYPES[extension],
+            # A tone is private to whoever rendered it; no cache keeps a copy.
+            NO_STORE,
+            [("Content-Disposition", content_disposition(result.name, extension))],
+        )
 
     def do_POST(self) -> None:
         # Method and path come first (docs/PLAN.md 5.2 step 1): an unknown path
@@ -340,6 +530,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             headers.get_all("Transfer-Encoding") or [],
             settings.max_body_bytes,
         )
+        # The query and the name are checked before the rate limit and the
+        # slot, so a refused request never uses up the client's budget.
+        self.render_request = parse_render_request(self.path, headers, settings)
         client = client_address(
             self.client_address[0], headers.get_all("X-Forwarded-For") or [], settings.trusted_proxies
         )
@@ -350,6 +543,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         allowed, retry_after = self.server.limiter.has_room(client)
         if not allowed:
             raise GuardError(429, "rate_limited", retry_after=retry_after)
+        # Nothing is evicted early (docs/PLAN.md 5.5), so with MAX_RESULTS
+        # results waiting a render would have nowhere to go. Refused before the
+        # slot, like busy: no upload, no render, no budget used.
+        if self.server.results.is_full():
+            raise GuardError(503, "results_full", retry_after=RESULTS_FULL_RETRY_SECONDS)
         with self.server.gate.slot():
             # Counted here, atomically: a parallel request from the same client
             # may have taken the last hit since has_room answered.
@@ -485,9 +683,24 @@ class RingtoneServer(http.server.ThreadingHTTPServer):
     # gets a fast 503 instead of a thread, so a flood can't exhaust memory.
     MAX_WORKERS = 16
 
-    def __init__(self, address: tuple[str, int], settings: Settings, render_hook: RenderHook | None = None) -> None:
+    def __init__(
+        self,
+        address: tuple[str, int],
+        settings: Settings,
+        render_hook: RenderHook | None = None,
+        renderer: Renderer | None = None,
+        results: ResultStore | None = None,
+    ) -> None:
         self.settings = settings
-        self.render_hook: RenderHook = render_hook if render_hook is not None else unavailable_render_hook
+        self.render_hook: RenderHook = render_hook if render_hook is not None else render_and_store
+        # The image's ffmpeg at its fixed path. Building the Renderer checks
+        # nothing on disk, so a checkout on Windows starts without ffmpeg and
+        # only a render fails.
+        self.renderer = (
+            renderer
+            if renderer is not None
+            else Renderer((FFMPEG,), settings.render_timeout_seconds, prlimit=default_prlimit())
+        )
         self.static = StaticFiles()
         # Rendered once: a broken template fails startup, and no request does
         # template work.
@@ -503,10 +716,30 @@ class RingtoneServer(http.server.ThreadingHTTPServer):
         super().__init__(address, Handler)
         try:
             _prepare_scratch(settings.scratch_dir)
+            # Only after scratch is checked and emptied: the results directory
+            # lives inside it, and startup forgets every earlier result.
+            if results is None:
+                results = ResultStore(
+                    settings.scratch_dir / "results", settings.result_ttl_seconds, settings.max_results
+                )
+            else:
+                # An injected store (tests) had its directory emptied, or
+                # removed, with the rest of scratch just now.
+                results.clear()
+            self.results = results
+            self.results.start_sweeper(SWEEP_INTERVAL_SECONDS)
         except BaseException:
             # Nobody will call server_close() on a half-built server.
             self.server_close()
             raise
+
+    def server_close(self) -> None:
+        # Also reached from a failed bind inside TCPServer.__init__, before
+        # the results store exists.
+        results = getattr(self, "results", None)
+        if results is not None:
+            results.stop()
+        super().server_close()
 
     def server_bind(self) -> None:
         # HTTPServer.server_bind calls socket.getfqdn(), a reverse DNS lookup.
