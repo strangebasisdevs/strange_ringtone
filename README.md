@@ -38,8 +38,10 @@ shows.
 | Path | What |
 | --- | --- |
 | `docs/PLAN.md` | Research, decisions and the v0.1.0 plan |
-| `core/` | The core server: the `strange_ringtone` package and its static files |
+| `core/` | The core server: the `strange_ringtone` package and its static files, the image's `Dockerfile`, and in `core/ffmpeg/` the pinned, verified ffmpeg build inputs (version, checksum, signing key, configure line, component allowlist) |
 | `.env.example` | The core's settings, with placeholders and defaults |
+| `compose.example.yaml` | A hardened Compose example, with no published ports |
+| `.dockerignore` | An allowlist: only `core/` reaches the image build context |
 | `tools/spike/phase0.py` | Generates the test tones that established the share sheet's rules |
 | `scripts/` | Stdlib checks that CI runs on pull requests |
 | `tests/` | Stdlib `unittest` tests |
