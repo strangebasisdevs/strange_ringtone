@@ -185,6 +185,25 @@ class CapacityTest(StoreTestCase):
 
 
 class SweepTest(StoreTestCase):
+    def test_a_failed_deletion_is_retried_and_keeps_its_slot(self) -> None:
+        # An expired result whose files cannot be removed (an open download on
+        # Windows) must stay indexed: forgetting it would free a capacity slot
+        # while its bytes still sit on the tmpfs, and nothing would retry.
+        store = self.make_store(max_results=1)
+        old = store.put(self.source(b"old"), "x")
+        self.clock.advance(TTL)
+        with mock.patch("strange_ringtone.results.shutil.rmtree", side_effect=PermissionError("busy")):
+            self.assertEqual(store.sweep(), 0)
+            self.assertEqual(len(store), 1)
+            # is_full() sweeps too, and the retry fails the same way.
+            self.assertTrue(store.is_full())
+            self.assertIsNone(store.get(old.result_id))
+            self.assertEqual(self.on_disk(), [old.result_id])
+        # Once the deletion goes through, the entry and the slot go with it.
+        self.assertEqual(store.sweep(), 1)
+        self.assertEqual(len(store), 0)
+        self.assertEqual(self.on_disk(), [])
+
     def test_results_live_exactly_their_ttl(self) -> None:
         first = self.store.put(self.source(), "a")
         self.clock.advance(100)

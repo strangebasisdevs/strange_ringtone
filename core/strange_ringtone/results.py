@@ -114,13 +114,24 @@ class ResultStore:
         now = self._clock()
         with self._lock:
             expired = [r for r in self._results.values() if now - r.created >= self.ttl_seconds]
-            for result in expired:
-                del self._results[result.result_id]
-        # The files go after the index entries: from this point no request can
-        # be handed these paths.
+        removed = 0
         for result in expired:
-            shutil.rmtree(self.directory / result.result_id, ignore_errors=True)
-        return len(expired)
+            # The files go first and the index entry only once they are gone.
+            # A deletion that fails (Windows refuses while a download still
+            # holds the file open) keeps its entry, so the next sweep retries it
+            # and it keeps counting against MAX_RESULTS until the bytes are
+            # really off the tmpfs. No request can be handed the path meanwhile:
+            # get() refuses an expired entry.
+            try:
+                shutil.rmtree(self.directory / result.result_id)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                continue
+            with self._lock:
+                self._results.pop(result.result_id, None)
+            removed += 1
+        return removed
 
     def clear(self) -> None:
         """Forget every result and leave the results directory existing and empty."""
