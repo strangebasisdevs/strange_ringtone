@@ -46,3 +46,48 @@ jobs:
       - name: Run unit tests
         # Stdlib only, so nothing to install. -I keeps the environment and user site out.
         run: python -I -m unittest discover --start-directory tests --verbose
+
+  image:
+    name: Image tests
+    # The only test of what ships: the real ffmpeg against its allowlist, and
+    # the server under the contract's --network none, --read-only, tmpfs /tmp,
+    # cap-drop ALL and no-new-privileges (docs/PLAN.md 9.2).
+    runs-on: ubuntu-24.04
+    # A cold build compiles ffmpeg; the GitHub Actions cache makes later runs
+    # rebuild only the layers after it.
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build the core image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          # A path context, so .dockerignore's allowlist decides what is sent.
+          context: .
+          file: core/Dockerfile
+          platforms: linux/amd64
+          # Into the local Docker engine for the test run; nothing is pushed.
+          load: true
+          push: false
+          tags: strange_ringtone:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run the in-image tests
+        # The same flags as the README's Development section and the contract.
+        # The tests are mounted read-only and nothing is published.
+        run: |
+          docker run --rm --name "image-tests-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --network none --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=64m,mode=1777 \
+            --cap-drop ALL --security-opt no-new-privileges:true \
+            -e PUBLIC_ORIGIN=https://example.internal -e STRANGE_RINGTONE_IMAGE_TESTS=1 \
+            -v "$GITHUB_WORKSPACE/tests:/tests:ro" \
+            strange_ringtone:ci \
+            python -I -m unittest discover -s /tests/image -t /tests -v

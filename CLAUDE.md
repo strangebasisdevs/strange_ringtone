@@ -125,8 +125,9 @@ starts enforcing once `.release-please-manifest.json` records a release.
   - Every suppression is called out in the PR description, so the reviewer
     sees each judgment.
 - **`main` is protected by a ruleset:** changes go through a PR, squash-merge
-  only, and the required checks are Ruff, Unit tests, Conventional PR title,
-  Deployment contract change, and the gate's Semgrep, Trivy and Gitleaks jobs.
+  only, and the required checks are Ruff, Unit tests, Image tests,
+  Conventional PR title, Deployment contract change, and the gate's Semgrep,
+  Trivy and Gitleaks jobs.
   Renaming a job means updating the ruleset in the same change. `v*` tags can
   be created, moved or deleted only by organisation admins.
 - Workflows default to `contents: read`. Never use `pull_request_target` or
