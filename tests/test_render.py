@@ -1,0 +1,569 @@
+"""The renderer against a stub ffmpeg (tests/stubs/ffmpeg_stub.py).
+
+The stub checks the argument list it receives and reports loudness derived
+from it, so these tests pin the exact commands, the measure / render /
+correct sequence, the timeout and process-group kill, and the cleanup, on
+Windows and Linux alike. tests/image/test_render_real.py runs the real ffmpeg.
+"""
+from __future__ import annotations
+
+import contextlib
+import io
+import json
+import os
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from typing import Any
+from unittest import mock
+
+import helpers
+from corpus.build import valid_wav
+from strange_ringtone import render
+from strange_ringtone.render import (
+    FFMPEG,
+    PRLIMIT,
+    Limits,
+    Renderer,
+    RenderError,
+    RenderParams,
+    clamp_gain,
+    default_prlimit,
+    filter_chain,
+    measure_args,
+    parse_summary,
+    render_args,
+)
+
+STUB = helpers.ROOT / "tests" / "stubs" / "ffmpeg_stub.py"
+STUB_COMMAND = (sys.executable, "-I", str(STUB))
+MODE_VAR = "STRANGE_RINGTONE_FFMPEG_STUB"
+LOG_VAR = "STRANGE_RINGTONE_FFMPEG_STUB_LOG"
+STUB_MAGIC = b"STUB-IPOD\n"
+
+CHAIN = (
+    "volume=9.00dB,alimiter=limit=0.8414:level=false:latency=true,"
+    "afade=t=in:st=0:d=0.200:curve=qsin,afade=t=out:st=8.500:d=1.500:curve=qsin,ebur128=peak=true"
+)
+
+# What the image's ffmpeg 9.0.2 printed for a two-second two-tone clip,
+# trimmed to the last frame line.
+REAL_SUMMARY = (
+    "[Parsed_ebur128_0 @ 0x763e78002480] t: 1.999977   TARGET:-23 LUFS    M: -23.5 S:-120.7     I: -23.5 LUFS"
+    "       LRA:   0.0 LU  FTPK: -21.1 -21.1 dBFS  TPK: -21.1 -21.1 dBFS\n"
+    "[Parsed_ebur128_0 @ 0x763e78002480] Summary:\n"
+    "\n"
+    "  Integrated loudness:\n"
+    "    I:         -23.5 LUFS\n"
+    "    Threshold: -33.5 LUFS\n"
+    "\n"
+    "  Loudness range:\n"
+    "    LRA:         0.0 LU\n"
+    "    Threshold:   0.0 LUFS\n"
+    "    LRA low:     0.0 LUFS\n"
+    "    LRA high:    0.0 LUFS\n"
+    "\n"
+    "  True peak:\n"
+    "    Peak:      -21.1 dBFS\n"
+    "[out#0/null @ 0x630d71c89980] video:0KiB audio:345KiB subtitle:0KiB other streams:0KiB\n"
+)
+
+
+def params(**overrides: Any) -> RenderParams:
+    values: dict[str, Any] = {
+        "fade_in": 0.2, "fade_out": 1.5, "normalize": True, "target_lufs": -14.0, "title": "My Tone", "duration": 10.0,
+    }
+    values.update(overrides)
+    return RenderParams(**values)
+
+
+def alive(pid: int) -> bool:
+    """Whether pid still runs. A zombie (killed, not yet reaped) counts as gone."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    try:
+        with open(f"/proc/{pid}/stat", encoding="ascii") as handle:
+            return handle.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except (OSError, IndexError):
+        return True
+
+
+def kill_quietly(pid: int) -> None:
+    # On Windows os.kill with SIGTERM is TerminateProcess.
+    try:
+        os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+    except OSError:
+        pass
+
+
+class ArgumentsTest(unittest.TestCase):
+    def test_measure_args(self) -> None:
+        self.assertEqual(
+            measure_args(Path("job") / "in.wav"),
+            ["-nostdin", "-hide_banner", "-nostats", "-threads", "1", "-protocol_whitelist", "file",
+             "-f", "wav", "-i", str(Path("job") / "in.wav"), "-af", "ebur128=peak=true", "-f", "null", "-"],
+        )
+
+    def test_render_args(self) -> None:
+        source, output = Path("job") / "in.wav", Path("job") / "out.m4a"
+        self.assertEqual(
+            render_args(source, output, params(), 9.0),
+            ["-nostdin", "-hide_banner", "-nostats", "-threads", "1", "-protocol_whitelist", "file", "-y",
+             "-f", "wav", "-i", str(source), "-af", CHAIN, "-ar", "44100", "-map_metadata", "-1",
+             "-fflags", "+bitexact", "-metadata", "title=My Tone", "-c:a", "aac", "-b:a", "256k",
+             "-movflags", "+faststart", "-f", "ipod", str(output)],
+        )
+
+    def test_limiter_is_always_level_false_at_minus_1_5_dbfs(self) -> None:
+        # level=true (alimiter's default) re-normalises and undoes the gain.
+        self.assertEqual(render.LIMITER_CEILING_DB, -1.5)
+        self.assertEqual(render.LIMITER_LIMIT, "0.8414")
+        for case in (params(), params(normalize=False), params(fade_in=0, fade_out=0)):
+            with self.subTest(case=case):
+                stages = filter_chain(case, 0.0).split(",")
+                self.assertEqual(stages[1], "alimiter=limit=0.8414:level=false:latency=true")
+
+    def test_ebur128_measures_the_end_of_the_chain(self) -> None:
+        for case in (params(), params(fade_in=0, fade_out=0)):
+            with self.subTest(case=case):
+                self.assertEqual(filter_chain(case, 1.0).split(",")[-1], "ebur128=peak=true")
+
+    def test_zero_fades_are_left_out(self) -> None:
+        # afade with d=0 would be a one-second fade, not none.
+        self.assertEqual(
+            filter_chain(params(fade_in=0, fade_out=0), -3.5),
+            "volume=-3.50dB,alimiter=limit=0.8414:level=false:latency=true,ebur128=peak=true",
+        )
+        self.assertNotIn("t=out", filter_chain(params(fade_out=0), 0.0))
+        self.assertNotIn("t=in", filter_chain(params(fade_in=0), 0.0))
+        # Rounded to the printed precision before the zero check.
+        self.assertNotIn("afade", filter_chain(params(fade_in=0.0004, fade_out=0.0004), 0.0))
+
+    def test_fades_are_clamped_to_the_clip(self) -> None:
+        chain = filter_chain(params(fade_in=5.0, fade_out=5.0, duration=2.0), 0.0)
+        self.assertIn("afade=t=in:st=0:d=2.000:curve=qsin", chain)
+        self.assertIn("afade=t=out:st=0.000:d=2.000:curve=qsin", chain)
+
+    def test_non_finite_numbers_never_reach_the_chain(self) -> None:
+        for case, gain in ((params(fade_in=float("nan")), 0.0), (params(duration=float("inf")), 0.0),
+                           (params(), float("nan"))):
+            with self.subTest(case=case, gain=gain), self.assertRaises(ValueError):
+                filter_chain(case, gain)
+
+    def test_title_is_one_argument_whatever_it_holds(self) -> None:
+        for title in ("-y", "x -i /etc/passwd", "$(touch pwned); `id` | cat", "Ünïcødé 🎵"):
+            with self.subTest(title=title):
+                args = render_args(Path("in.wav"), Path("out.m4a"), params(title=title), 0.0)
+                self.assertEqual(args[args.index("-metadata") + 1], f"title={title}")
+                self.assertEqual(len(args), len(render_args(Path("in.wav"), Path("out.m4a"), params(), 0.0)))
+
+    def test_every_run_is_local_files_only_without_stdin(self) -> None:
+        for args in (measure_args(Path("in.wav")), render_args(Path("in.wav"), Path("out.m4a"), params(), 0.0)):
+            with self.subTest(args=args[-1]):
+                self.assertEqual(args[:7], ["-nostdin", "-hide_banner", "-nostats", "-threads", "1",
+                                            "-protocol_whitelist", "file"])
+                # The demuxer is named, never guessed from the content.
+                self.assertEqual(args[args.index("-i") - 2: args.index("-i")], ["-f", "wav"])
+        self.assertNotIn("-y", measure_args(Path("in.wav")))
+        self.assertIn("-y", render_args(Path("in.wav"), Path("out.m4a"), params(), 0.0))
+
+    def test_gain_clamp(self) -> None:
+        self.assertEqual(render.GAIN_CLAMP_DB, 20.0)
+        self.assertEqual(clamp_gain(56.0), 20.0)
+        self.assertEqual(clamp_gain(-25.0), -20.0)
+        self.assertEqual(clamp_gain(-3.25), -3.25)
+
+
+class CommandTest(unittest.TestCase):
+    def test_full_command_with_prlimit(self) -> None:
+        renderer = Renderer((FFMPEG,), 20, prlimit=(PRLIMIT,))
+        self.assertEqual(
+            renderer.full_command(["-nostdin"]),
+            ["/usr/bin/prlimit", "--as=536870912", "--cpu=20", "--fsize=67108864", "--nofile=64", "--",
+             "/usr/local/bin/ffmpeg", "-nostdin"],
+        )
+
+    def test_cpu_limit_follows_the_timeout_unless_given(self) -> None:
+        self.assertIn("--cpu=7", Renderer((FFMPEG,), 7, prlimit=(PRLIMIT,)).full_command([]))
+        limits = Limits(address_space_bytes=1, cpu_seconds=2, file_size_bytes=3, open_files=4)
+        self.assertEqual(
+            Renderer((FFMPEG,), 7, prlimit=(PRLIMIT,), limits=limits).full_command([]),
+            [PRLIMIT, "--as=1", "--cpu=2", "--fsize=3", "--nofile=4", "--", FFMPEG],
+        )
+
+    def test_full_command_without_prlimit(self) -> None:
+        self.assertEqual(Renderer(STUB_COMMAND, 20).full_command(["-a"]), [*STUB_COMMAND, "-a"])
+
+    def test_fixed_program_paths(self) -> None:
+        self.assertEqual(FFMPEG, "/usr/local/bin/ffmpeg")
+        self.assertEqual(PRLIMIT, "/usr/bin/prlimit")
+
+    def test_prlimit_always_on_linux_and_never_elsewhere(self) -> None:
+        # Not "when the file exists": a Linux host without prlimit fails
+        # renders instead of running ffmpeg unlimited.
+        with mock.patch.object(render.sys, "platform", "linux"), \
+                mock.patch("os.path.exists", side_effect=AssertionError("looked on disk")):
+            self.assertEqual(default_prlimit(), (PRLIMIT,))
+        with mock.patch.object(render.sys, "platform", "win32"):
+            self.assertIsNone(default_prlimit())
+
+    def test_construction_touches_no_file(self) -> None:
+        with mock.patch("os.stat", side_effect=AssertionError("stat")), \
+                mock.patch("os.path.exists", side_effect=AssertionError("exists")):
+            Renderer(("/nonexistent/ffmpeg",), 20, prlimit=("/nonexistent/prlimit",))
+
+    def test_bad_construction(self) -> None:
+        with self.assertRaises(ValueError):
+            Renderer((), 20)
+        with self.assertRaises(ValueError):
+            Renderer((FFMPEG,), 0)
+
+
+class SummaryTest(unittest.TestCase):
+    def test_real_summary(self) -> None:
+        loudness = parse_summary(REAL_SUMMARY)
+        assert loudness is not None
+        self.assertEqual((loudness.integrated, loudness.true_peak), (-23.5, -21.1))
+
+    def test_frame_lines_are_not_the_summary(self) -> None:
+        frames_only = REAL_SUMMARY.split("[Parsed_ebur128_0 @ 0x763e78002480] Summary:")[0]
+        self.assertIsNone(parse_summary(frames_only))
+
+    def test_silence_has_a_minus_inf_peak(self) -> None:
+        text = REAL_SUMMARY.replace("-23.5 LUFS\n", "-70.0 LUFS\n").replace("-21.1 dBFS\n", " -inf dBFS\n")
+        loudness = parse_summary(text)
+        assert loudness is not None
+        self.assertEqual(loudness.integrated, -70.0)
+        self.assertEqual(loudness.true_peak, float("-inf"))
+
+    def test_crlf_is_accepted(self) -> None:
+        self.assertIsNotNone(parse_summary(REAL_SUMMARY.replace("\n", "\r\n")))
+
+    def test_anything_else_is_refused(self) -> None:
+        summary = REAL_SUMMARY.split("] Summary:", 1)[1]
+        cases = {
+            "empty": "",
+            "two summaries": REAL_SUMMARY + REAL_SUMMARY,
+            "truncated": REAL_SUMMARY.split("  True peak:")[0],
+            "no peak section": REAL_SUMMARY.replace("  True peak:\n", ""),
+            "integrated -inf": REAL_SUMMARY.replace("-23.5 LUFS\n", " -inf LUFS\n"),
+            "nan": REAL_SUMMARY.replace("-23.5 LUFS\n", "  nan LUFS\n"),
+            "exponent": REAL_SUMMARY.replace("-23.5 LUFS\n", "-2e1 LUFS\n"),
+            "reordered": "Summary:" + summary.replace("  Integrated loudness:\n", "", 1),
+            "sample peak instead": REAL_SUMMARY.replace("  True peak:", "  Sample peak:"),
+        }
+        for label, text in cases.items():
+            with self.subTest(label):
+                self.assertIsNone(parse_summary(text))
+
+
+class StubTestCase(unittest.TestCase):
+    """A job directory with in.wav and a log of every stub run."""
+
+    def setUp(self) -> None:
+        # ignore_cleanup_errors: on Windows a killed run's grandchild may still
+        # hold the directory as its working directory for a moment.
+        temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(temp.cleanup)
+        self.temp = Path(temp.name)
+        self.job = self.temp / "job"
+        self.job.mkdir()
+        valid_wav(self.job / "in.wav", 1.0)
+        self.runs_log = self.temp / "runs.jsonl"
+        self.set_mode("ok")
+
+    def set_mode(self, mode: str) -> None:
+        patcher = mock.patch.dict(os.environ, {MODE_VAR: mode, LOG_VAR: str(self.runs_log)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def runs(self) -> list[dict[str, Any]]:
+        if not self.runs_log.exists():
+            return []
+        return [json.loads(line) for line in self.runs_log.read_text(encoding="utf-8").splitlines()]
+
+    def kinds(self) -> list[str]:
+        return ["render" if "-y" in run["argv"] else "measure" for run in self.runs()]
+
+    def job_names(self) -> list[str]:
+        return sorted(p.name for p in self.job.iterdir())
+
+
+class RenderTest(StubTestCase):
+    def test_measure_then_render(self) -> None:
+        result = Renderer(STUB_COMMAND, 20).render(self.job, params(duration=1.0))
+        self.assertEqual(self.kinds(), ["measure", "render"])
+        # The stub's upload measures -23 LUFS.
+        self.assertEqual(result.applied_gain_db, 9.0)
+        self.assertEqual(result.measured_lufs, -14.0)
+        self.assertEqual(result.duration, 1.0)
+        self.assertEqual(result.output, self.job / "out.m4a")
+        self.assertTrue(result.output.read_bytes().startswith(STUB_MAGIC))
+        self.assertEqual(self.job_names(), ["in.wav", "out.m4a"])
+        # Every run works inside the job directory.
+        self.assertEqual({Path(run["cwd"]) for run in self.runs()}, {self.job})
+
+    def test_the_render_pass_uses_the_measured_gain(self) -> None:
+        Renderer(STUB_COMMAND, 20).render(self.job, params(target_lufs=-11.0, duration=1.0))
+        render_run = self.runs()[1]["argv"]
+        self.assertTrue(render_run[render_run.index("-af") + 1].startswith("volume=12.00dB,"))
+
+    def test_normalize_false_runs_no_measure_pass_and_no_correction(self) -> None:
+        result = Renderer(STUB_COMMAND, 20).render(self.job, params(normalize=False, duration=1.0))
+        self.assertEqual(self.kinds(), ["render"])
+        self.assertEqual(result.applied_gain_db, 0.0)
+        # 9 LU from the target, yet no corrective pass: the user asked for none.
+        self.assertEqual(result.measured_lufs, -23.0)
+
+    def test_a_miss_gets_one_corrective_pass(self) -> None:
+        self.set_mode("offset")
+        result = Renderer(STUB_COMMAND, 20).render(self.job, params(duration=1.0))
+        self.assertEqual(self.kinds(), ["measure", "render", "render"])
+        self.assertEqual(result.applied_gain_db, 10.0)
+        self.assertEqual(result.measured_lufs, -14.0)
+        last = self.runs()[2]["argv"]
+        self.assertTrue(last[last.index("-af") + 1].startswith("volume=10.00dB,"))
+        # The corrective pass reads the original upload again.
+        self.assertEqual(last[last.index("-i") + 1], str(self.job / "in.wav"))
+
+    def test_a_small_miss_is_left_alone(self) -> None:
+        # -14.4 against -14: inside the 0.5 LU threshold.
+        result = Renderer(STUB_COMMAND, 20).render(self.job, params(target_lufs=-14.4, duration=1.0))
+        self.assertEqual(self.kinds(), ["measure", "render"])
+        self.assertEqual(render.CORRECTION_THRESHOLD_LU, 0.5)
+        self.assertAlmostEqual(result.measured_lufs, -14.4)
+
+    def test_only_one_correction_even_if_it_still_misses(self) -> None:
+        self.set_mode("stubborn")
+        result = Renderer(STUB_COMMAND, 20).render(self.job, params(duration=1.0))
+        self.assertEqual(self.kinds(), ["measure", "render", "render"])
+        # 9 + (-14 - -30) = 25, clamped to 20.
+        self.assertEqual(result.applied_gain_db, 20.0)
+        self.assertEqual(result.measured_lufs, -30.0)
+
+    def test_silence_clamps_the_gain_and_skips_a_useless_correction(self) -> None:
+        self.set_mode("silence")
+        result = Renderer(STUB_COMMAND, 20).render(self.job, params(duration=1.0))
+        self.assertEqual(result.applied_gain_db, 20.0)
+        self.assertEqual(result.measured_lufs, -50.0)
+        # The corrected gain would be clamped to the same 20 dB.
+        self.assertEqual(self.kinds(), ["measure", "render"])
+
+    def test_unparsable_measure_fails_and_writes_nothing(self) -> None:
+        self.set_mode("unparsable")
+        with self.assertRaises(RenderError) as raised:
+            Renderer(STUB_COMMAND, 20).render(self.job, params(duration=1.0))
+        self.assertEqual(raised.exception.code, "measure_failed")
+        self.assertEqual(self.job_names(), ["in.wav"])
+
+    def test_unparsable_render_fails_and_removes_its_output(self) -> None:
+        self.set_mode("unparsable")
+        with self.assertRaises(RenderError) as raised:
+            Renderer(STUB_COMMAND, 20).render(self.job, params(normalize=False, duration=1.0))
+        self.assertEqual(raised.exception.code, "render_failed")
+        # The stub wrote out.m4a before failing to report loudness.
+        self.assertEqual(self.kinds(), ["render"])
+        self.assertEqual(self.job_names(), ["in.wav"])
+
+    def test_non_zero_exit_fails(self) -> None:
+        self.set_mode("fail")
+        for normalize, code in ((True, "measure_failed"), (False, "render_failed")):
+            with self.subTest(normalize=normalize):
+                with self.assertRaises(RenderError) as raised:
+                    Renderer(STUB_COMMAND, 20).render(self.job, params(normalize=normalize, duration=1.0))
+                self.assertEqual(raised.exception.code, code)
+                self.assertEqual(self.job_names(), ["in.wav"])
+
+    def test_a_render_that_writes_no_output_fails(self) -> None:
+        # Exit 0 and a summary, but no file: never reported as a result.
+        real_popen = subprocess.Popen
+
+        def without_output(command: list[str], **kwargs: Any) -> subprocess.Popen[bytes]:
+            proc = real_popen(command, **kwargs)
+            if "-y" in command:
+                proc.wait()
+                (self.job / "out.m4a").unlink()
+            return proc
+
+        with mock.patch.object(render.subprocess, "Popen", without_output):
+            with self.assertRaises(RenderError) as raised:
+                Renderer(STUB_COMMAND, 20).render(self.job, params(normalize=False, duration=1.0))
+        self.assertEqual(raised.exception.code, "render_failed")
+
+    def test_wrong_arguments_fail(self) -> None:
+        # The stub refuses anything but the pinned list, so a renderer that
+        # dropped, say, level=false would fail here as well as above.
+        with mock.patch.object(render, "LIMITER_LIMIT", "1.0"):
+            with self.assertRaises(RenderError):
+                Renderer(STUB_COMMAND, 20).render(self.job, params(normalize=False, duration=1.0))
+
+    def test_missing_program_fails_cleanly(self) -> None:
+        missing = str(self.temp / "no-such-ffmpeg")
+        with self.assertRaises(RenderError) as raised:
+            Renderer((missing,), 20).render(self.job, params(duration=1.0))
+        self.assertEqual(raised.exception.code, "measure_failed")
+        with self.assertRaises(RenderError) as raised:
+            Renderer(STUB_COMMAND, 20, prlimit=(missing,)).render(self.job, params(duration=1.0))
+        self.assertEqual(raised.exception.code, "measure_failed")
+        self.assertEqual(self.job_names(), ["in.wav"])
+
+    def test_stderr_never_leaves_the_renderer(self) -> None:
+        # The stub echoes the title on stderr, as ffmpeg does.
+        captured = io.StringIO()
+        for mode in ("ok", "unparsable", "fail"):
+            with self.subTest(mode=mode):
+                self.set_mode(mode)
+                with contextlib.redirect_stderr(captured), contextlib.redirect_stdout(captured):
+                    try:
+                        Renderer(STUB_COMMAND, 20).render(self.job, params(title="SecretTitle", duration=1.0))
+                    except RenderError as error:
+                        self.assertNotIn("SecretTitle", str(error))
+                        self.assertNotIn("SecretTitle", repr(error.args))
+                        self.assertIsNone(error.__cause__)
+        self.assertEqual(captured.getvalue(), "")
+
+    def test_the_title_reaches_ffmpeg_literally(self) -> None:
+        # No shell: metacharacters are just characters of one argument.
+        title = "$(touch pwned) `touch pwned2` ; | & ' \" -y"
+        result = Renderer(STUB_COMMAND, 20).render(self.job, params(title=title, normalize=False, duration=1.0))
+        content = json.loads(result.output.read_bytes()[len(STUB_MAGIC):])
+        self.assertEqual(content["title"], title)
+        self.assertEqual(self.job_names(), ["in.wav", "out.m4a"])
+
+
+class SubprocessGuardsTest(StubTestCase):
+    """The guards CLAUDE.md requires of every subprocess: list, no shell, fixed program, timeout."""
+
+    def spy(self) -> mock.MagicMock:
+        spy = mock.MagicMock(wraps=subprocess.Popen)
+        patcher = mock.patch.object(render.subprocess, "Popen", spy)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return spy
+
+    def test_popen_gets_a_list_and_no_shell(self) -> None:
+        spy = self.spy()
+        Renderer(STUB_COMMAND, 20).render(self.job, params(duration=1.0))
+        self.assertEqual(spy.call_count, 2)
+        for call in spy.call_args_list:
+            (command,), kwargs = call
+            self.assertIsInstance(command, list)
+            self.assertTrue(all(isinstance(part, str) for part in command))
+            self.assertNotIn("shell", kwargs)
+            self.assertNotIn("executable", kwargs)
+            self.assertNotIn("preexec_fn", kwargs)
+            self.assertIs(kwargs["stdin"], subprocess.DEVNULL)
+            self.assertIs(kwargs["stdout"], subprocess.PIPE)
+            self.assertIs(kwargs["stderr"], subprocess.PIPE)
+            self.assertIs(kwargs["start_new_session"], True)
+            self.assertEqual(kwargs["cwd"], self.job)
+
+    def test_the_program_is_the_fixed_path(self) -> None:
+        # The production renderer's first argument is FFMPEG or PRLIMIT, from
+        # code; nothing the client sends can change it.
+        spy = mock.MagicMock(side_effect=OSError("not here"))
+        for prlimit, program in ((None, FFMPEG), ((PRLIMIT,), PRLIMIT)):
+            with self.subTest(prlimit=prlimit), mock.patch.object(render.subprocess, "Popen", spy):
+                with self.assertRaises(RenderError):
+                    Renderer((FFMPEG,), 20, prlimit=prlimit).render(self.job, params(title="--evil", duration=1.0))
+                (command,), _ = spy.call_args
+                self.assertEqual(command[0], program)
+                self.assertIn(FFMPEG, command)
+
+    def test_communicate_has_the_wall_clock_timeout(self) -> None:
+        timeouts: list[float | None] = []
+        real = subprocess.Popen.communicate
+
+        def recording(proc: subprocess.Popen[bytes], input: Any = None, timeout: float | None = None) -> Any:
+            timeouts.append(timeout)
+            return real(proc, input, timeout)
+
+        with mock.patch.object(subprocess.Popen, "communicate", recording):
+            Renderer(STUB_COMMAND, 17).render(self.job, params(duration=1.0))
+        self.assertEqual(timeouts, [17, 17])
+
+
+class TimeoutTest(StubTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        # Shorter than the default, so a pipe held by a survivor on Windows
+        # costs half a second, not five.
+        patcher = mock.patch.object(render, "DRAIN_SECONDS", 0.5)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_a_hung_run_times_out(self) -> None:
+        self.set_mode("hang")
+        started = time.monotonic()
+        with self.assertRaises(RenderError) as raised:
+            Renderer(STUB_COMMAND, 1).render(self.job, params(duration=1.0))
+        self.assertEqual(raised.exception.code, "render_timeout")
+        self.assertLess(time.monotonic() - started, 1 + 0.5 + 5)
+        self.assertEqual(self.job_names(), ["in.wav"])
+
+    def test_the_whole_process_group_dies(self) -> None:
+        self.set_mode("grandchild")
+        pid_file = self.job / "grandchild.pid"
+        with self.assertRaises(RenderError) as raised:
+            Renderer(STUB_COMMAND, 2).render(self.job, params(duration=1.0))
+        self.assertEqual(raised.exception.code, "render_timeout")
+        self.assertTrue(pid_file.exists(), "the stub never started its grandchild")
+        grandchild = int(pid_file.read_text(encoding="ascii"))
+        # Registered after the job directory, so it runs first: no sleeper
+        # outlives the test on any platform, and on Windows the directory it
+        # sits in can be removed.
+        self.addCleanup(kill_quietly, grandchild)
+        if not hasattr(os, "killpg"):
+            # Windows has no process groups to kill; there the renderer can
+            # only end the direct child.
+            return
+        deadline = time.monotonic() + 5
+        while alive(grandchild) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertFalse(alive(grandchild), "the grandchild survived the timeout")
+
+    def test_a_survivor_holding_the_pipes_cannot_hang_the_request(self) -> None:
+        # As if the kill had missed: the run still holds stdout and stderr
+        # open. The bounded drain gives up instead of waiting for it.
+        self.set_mode("hang")
+        started = time.monotonic()
+        with mock.patch.object(render, "_kill_group", lambda proc: None):
+            with self.assertRaises(RenderError) as raised:
+                Renderer(STUB_COMMAND, 1).render(self.job, params(duration=1.0))
+        self.assertEqual(raised.exception.code, "render_timeout")
+        self.assertLess(time.monotonic() - started, 1 + 0.5 + 5)
+
+    @unittest.skipUnless(hasattr(os, "killpg"), "process groups are POSIX")
+    def test_the_kill_targets_the_group_not_just_the_child(self) -> None:
+        self.set_mode("hang")
+        with mock.patch.object(render.os, "killpg", wraps=os.killpg) as killpg:
+            with self.assertRaises(RenderError):
+                Renderer(STUB_COMMAND, 1).render(self.job, params(duration=1.0))
+        self.assertEqual(killpg.call_count, 1)
+        self.assertEqual(killpg.call_args[0][1], signal.SIGKILL)
+
+
+@unittest.skipUnless(sys.platform.startswith("linux") and os.path.exists(PRLIMIT), "util-linux prlimit")
+class PrlimitTest(StubTestCase):
+    def test_the_run_has_the_limits(self) -> None:
+        renderer = Renderer(STUB_COMMAND, 20, prlimit=(PRLIMIT,))
+        renderer.render(self.job, params(duration=1.0))
+        for run in self.runs():
+            self.assertEqual(run["limits"], {
+                "RLIMIT_AS": 512 * 1024 * 1024,
+                "RLIMIT_CPU": 20,
+                "RLIMIT_FSIZE": 64 * 1024 * 1024,
+                "RLIMIT_NOFILE": 64,
+            })
+
+
+if __name__ == "__main__":
+    unittest.main()
