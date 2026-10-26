@@ -2,10 +2,17 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 from pathlib import Path
 from types import ModuleType
 
-SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / "scripts"
+# The core package lives under core/ (docs/PLAN.md section 11) and is not
+# installed, so tests import it from the checkout.
+CORE = ROOT / "core"
+if str(CORE) not in sys.path:
+    sys.path.insert(0, str(CORE))
 
 
 def load_script(name: str) -> ModuleType:

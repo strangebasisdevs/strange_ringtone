@@ -1,8 +1,9 @@
 # strange_ringtone: research and v0.1.0 plan
 
-Status: design agreed on 2026-10-24 (decisions in section 3). No code has been
-written. This file is the design record; the README's "Deployment contract"
-becomes the source of truth for operators once v0.1.0 ships.
+Status: design agreed on 2026-10-24 (decisions in section 3). Milestones 0
+and 1 are done, and the core server of milestone 2 is implemented (section 12).
+This file is the design record; the README's "Deployment contract" becomes the
+source of truth for operators once v0.1.0 ships.
 
 ## 1. Short answer
 
@@ -134,7 +135,7 @@ without the fetcher.
 | Method | Path | Purpose |
 | --- | --- | --- |
 | GET | `/` | App page. Static HTML, config in escaped `data-*` attributes, no inline script. |
-| GET | `/static/…` | JS, CSS and icons from an in-memory allowlist, `immutable` caching |
+| GET | `/static/<version>/…` | JS, CSS and icons from an in-memory allowlist. The version segment is the image's `VERSION` build argument (`dev` outside a release), so `immutable` caching is safe: a release changes the URLs. |
 | GET | `/healthz` | `200`, empty body |
 | POST | `/api/render` | Body: `audio/wav`. Query: `fade_in`, `fade_out`, `normalize`, `target_lufs`. The name goes in the `X-Tone-Name` header. Returns JSON `{result_id, duration, measured_lufs, applied_gain_db}`. |
 | GET | `/api/result/<id>.m4a` and `.m4r` | The rendered tone (attachment). `<id>` is 128 random bits and expires after `RESULT_TTL_SECONDS`. |
@@ -169,23 +170,36 @@ behind on any path (section 10).
 
 ### 5.3 Render pipeline (sketch; exact flags are checked against the pinned build)
 
-ffmpeg runs twice, each time as a subprocess with an argument list (never a
-shell). Both runs go through `prlimit` (address space, CPU seconds, file size,
-open files) and `subprocess.run(timeout=RENDER_TIMEOUT_SECONDS)`, which kills the
-process group. Each run uses `-nostdin -hide_banner -threads 1
+ffmpeg runs two or three times per render, each time as a subprocess with an
+argument list (never a shell). Every run is wrapped in the util-linux `prlimit`
+binary (address space, CPU seconds, file size, open files), which execs into
+ffmpeg, so the PID is unchanged. `preexec_fn` is not used: the stdlib documents
+it as unsafe in a threaded process, and this server is threaded. The child
+starts in its own session (`start_new_session=True`), `communicate()` enforces
+`RENDER_TIMEOUT_SECONDS`, and on timeout the whole process group is killed with
+`os.killpg` and reaped. `subprocess.run(timeout=…)` alone would kill only the
+direct child. Each run uses `-nostdin -hide_banner -threads 1
 -protocol_whitelist file -f wav -i <job>/in.wav`.
 
 1. **Measure:** `-af ebur128=peak=true -f null -`. A strict regex reads the
    integrated loudness and true peak from the summary. If parsing fails, the
-   render fails.
-2. **Render:** `-af volume=<gain>dB,alimiter=limit=<ceiling>:level=false:latency=true,afade=t=in:…,afade=t=out:…`,
+   render fails. The `null` muxer still encodes what it discards, with
+   `pcm_s16le` by default, so that encoder is part of the build.
+2. **Render:** `-af volume=<gain>dB,alimiter=limit=<ceiling>:level=false:latency=true,afade=t=in:…,afade=t=out:…,ebur128=peak=true`,
    then `-ar 44100 -map_metadata -1 -fflags +bitexact -metadata title=<sanitised>
    -c:a aac -b:a 256k -movflags +faststart -f ipod <job>/out.m4a`.
    `alimiter` defaults to `level=true`, which re-normalises its output and
    silently undoes the gain. `latency=true` keeps the clip length exact.
    `+bitexact` drops the encoder tag, so the title is the only metadata. iOS
    ignores the title tag and names the tone after the filename (Phase 0), so
-   the title only matters to other players.
+   the title only matters to other players. The trailing `ebur128` measures
+   the signal after the limiter and the fades in the same run that encodes
+   it. The image cannot decode its own output (WAV in, AAC out, nothing
+   else), so this post-chain measurement is the authority.
+3. **Correct (when needed):** if the post-chain loudness misses the target by
+   more than 0.5 LU, run step 2 once more from `in.wav` with the gain
+   adjusted by the error. `measured_lufs` in the response is the post-chain
+   value of the final render.
 
 The gain is the target minus the measured loudness, clamped to ±20 dB. Louder
 targets push the limiter harder, and the UI warns past −11 LUFS.
@@ -193,12 +207,16 @@ targets push the limiter harder, and the UI warns past −11 LUFS.
 Measured in the Phase 0 spike (ffmpeg 8.1.1, synthetic loop, 2026-10-24):
 
 - **Loudness:** a single pass landed within 0.2 LU of −14 and −11 LUFS. At −9 the
-  limiter cost 0.5 LU (−9.5 measured). The render should re-measure its output
-  and run one corrective pass when the error exceeds 0.5 LU.
+  limiter cost 0.5 LU (−9.5 measured). That is why the render pass measures
+  its own output and the corrective pass exists.
 - **True peak:** with the limiter at −1.0 dBFS, the AAC output measured −0.8 dBTP
   at −9 LUFS, because encoding adds inter-sample overs. With the ceiling at
   −1.5 dBFS every render stayed at or below −1.3 dBTP. At −9 LUFS that took the
-  corrective pass (−9.7, then −9.3 LUFS), so −1.5 dBFS is the default.
+  corrective pass (−9.7, then −9.3 LUFS), so −1.5 dBFS is the default. The
+  production image never measures the true peak after encoding, because it
+  has no AAC decoder; the −1.5 dBFS ceiling is the margin, and
+  `tools/spike/phase0.py` with a full ffmpeg is the check when the ceiling or
+  the encoder changes.
 - **Duration:** the ipod muxer reports exact durations (29.900 s in, 29.900 s
   out), so the encoder's priming samples don't push a clip over the cap. The `.m4a` and
 `.m4r` downloads are the same bytes. Only the name and `Content-Type` differ
@@ -211,16 +229,20 @@ SHA-256 and the FFmpeg release signature. Configure flags:
 enable only these:
 
 - demuxer `wav`
-- decoders `pcm_s16le`
-- encoder `aac`
-- muxers `ipod`, `null`
+- decoder `pcm_s16le`
+- encoders `aac` and `pcm_s16le` (the `null` muxer needs an encoder, 5.3 step 1)
+- muxers `ipod` and `null`, plus what configure pulls in for `ipod`: the `mov`
+  muxer, the bitstream filters and the parser its `_select` lines name. The
+  committed allowlist names each of them, with the reason, so the test
+  documents the whole binary.
 - protocol `file`
 - filters `ebur128`, `volume`, `alimiter`, `afade`, `aformat`, `aresample`,
   `anull`
 
-The licence stays LGPL-2.1+. A CI test runs `ffmpeg -protocols`, `-demuxers`,
-`-decoders` and `-filters` in the built image and fails on anything outside this
-list.
+The licence stays LGPL-2.1+. A CI test compares `ffmpeg -buildconf` with the
+committed configure line, then runs `-protocols`, `-demuxers`, `-decoders`,
+`-encoders`, `-muxers`, `-bsfs`, `-parsers` and `-filters` in the built image
+and fails on anything outside the committed allowlist.
 
 ### 5.4 Fades and loudness preview
 
@@ -236,6 +258,10 @@ authority. "Hear final" plays the real render.
   scratch tmpfs. It lives only long enough to be previewed and downloaded.
 - A sweeper thread deletes results after `RESULT_TTL_SECONDS` (default 600),
   and startup clears the whole scratch path.
+- At most `MAX_RESULTS` (default 50) results exist at once. When the cap is
+  reached a render answers 503 with `Retry-After` until the sweep frees room.
+  Nothing is evicted early: a result lives exactly its TTL, so the tmpfs has
+  a known upper bound (5.7).
 - There is no database, no data directory and no volume. A restart forgets
   everything.
 - Logs record the method, the path without its query string, the status and the
@@ -282,21 +308,23 @@ the user types becomes the filename. Decision 9 keeps it readable:
 | User | UID 10001, GID 10001 (fixed, non-root) |
 | Port | 8080/tcp, plain HTTP. TLS is the proxy's job. |
 | Runs with | `read_only: true`, `cap_drop: [ALL]`, `no-new-privileges`. No egress needed (internal network). |
-| Writable | `/tmp` (tmpfs, size ≥ 64 MB) and nothing else. No volumes, and nothing survives a restart. |
+| Writable | `/tmp` (tmpfs) and nothing else. No volumes, and nothing survives a restart. Size it at `MAX_RESULTS × 1 MB + RENDER_CONCURRENCY × (MAX_BODY_BYTES + 1 MB)`, which is 64 MB with the defaults. |
 | Health | `GET /healthz` returns 200 with an empty body |
 
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `PUBLIC_ORIGIN` | *(required)* | For example `https://ringtones.example.internal`. The server refuses to start without it. |
-| `TRUSTED_PROXIES` | empty | CIDRs whose `X-Forwarded-For` is honoured. The rightmost untrusted hop is the client. |
+| `TRUSTED_PROXIES` | empty | CIDRs whose `X-Forwarded-For` is honoured. The rightmost untrusted hop is the client. The walk from the right stops at the first malformed hop, and without an untrusted hop before it (or when the header is missing or lists only trusted proxies) the socket peer is the client. Behind a proxy with this empty, every client shares the proxy's address and the per-client rate limit becomes global. |
 | `MAX_CLIP_SECONDS` | 30 | 1 to 40 |
 | `DEFAULT_TARGET_LUFS` | −14 | −24 to −9 |
 | `RENDER_TIMEOUT_SECONDS` | 20 | Wall clock, per ffmpeg run |
 | `RENDER_CONCURRENCY` | 2 | |
 | `RATE_LIMIT_RENDERS_PER_MINUTE` | 10 | Per client IP |
 | `RESULT_TTL_SECONDS` | 600 | |
+| `MAX_RESULTS` | 50 | Results held at once; 503 when full (5.5) |
 | `FETCH_ENABLED` | false | Only shows the YouTube box in the UI. The core never calls the fetcher. |
 | `SOURCE_URL` | baked at build | The AGPL source link. Forks override it. |
+| `VERSION` | baked at build, `dev` outside a release | The `/static/<version>/` path segment (5.1): 1 to 64 letters, digits, `.`, `_` or `-`, starting with a letter or digit |
 
 The core has no secrets in v0.1.0, so `.env.example` holds only
 `PUBLIC_ORIGIN=` and commented optional settings. Any later secret arrives as
@@ -319,9 +347,23 @@ The core has no secrets in v0.1.0, so `.env.example` holds only
   - `--write-info-json`, with `-o`/`-P` pointing into a fresh `/tmp` job directory
 
   It runs under `prlimit` and a wall-clock timeout, one job at a time
-  (`FETCH_CONCURRENCY=1`), with its own per-IP rate limit.
-- **Output:** `GET /fetch/api/jobs/<id>` returns status plus whitelisted
-  metadata only:
+  (`FETCH_CONCURRENCY=1`), with its own per-IP rate limit. The fetcher's
+  `prlimit` set is CPU seconds, file size, open files and process count, with
+  no address-space limit: Deno reserves a huge virtual address space at
+  startup, so `RLIMIT_AS` would kill it. Memory is bounded by the deployment's
+  cgroup limit (`mem_limit` in `compose.example.yaml`), which the contract
+  documents as the operator's job. `DENO_DIR` and yt-dlp's cache directory
+  point under `/tmp`, because the root filesystem is read-only.
+- **Logging:** yt-dlp runs with `--quiet --no-warnings --no-progress`, and its
+  stdout and stderr are never logged: they carry the destination filename,
+  which contains the title that becomes the tone name (CLAUDE.md: tone names
+  stay out of logs). Failures map to a fixed error set: `blocked`, `too_long`,
+  `not_found`, `timeout`, `failed`. A test with a stubbed yt-dlp asserts the
+  log never contains the stub's title.
+- **Output:** `POST /fetch/api/jobs` answers 202 with `{job_id}` (128 random
+  bits). `GET /fetch/api/jobs/<id>` returns `status` (`queued`, `running`,
+  `done` or `failed`), `error` (from the fixed set below, only when failed)
+  and whitelisted metadata only:
   - `title` (sanitised, at most 200 characters)
   - `duration`
   - `heatmap`, validated as at most 200 points with times within the duration
@@ -338,7 +380,15 @@ The core has no secrets in v0.1.0, so `.env.example` holds only
   ranges) is documented as the deployment's job. It honours `HTTPS_PROXY`.
   Settings: `PUBLIC_ORIGIN` (required), `TRUSTED_PROXIES`, `FETCH_MAX_SECONDS`
   (900), `FETCH_MAX_BYTES` (40 MB), `FETCH_TIMEOUT_SECONDS` (120),
-  `RATE_LIMIT_FETCHES_PER_MINUTE` (5).
+  `RATE_LIMIT_FETCHES_PER_MINUTE` (5), `FETCH_RESULT_TTL_SECONDS` (600).
+- **Fetcher contract (the README gets a second table):** image
+  `ghcr.io/<owner>/strange_ringtone-fetcher:<semver>`, linux/amd64, UID/GID
+  10001, port 8080/tcp plain HTTP. The fetcher serves the `/fetch/` prefix
+  itself (`GET /fetch/healthz`, `POST /fetch/api/jobs`,
+  `GET /fetch/api/jobs/<id>` and `…/audio`), and the proxy forwards those
+  paths unchanged, so no rewriting is needed. Writable: `/tmp` (tmpfs) only,
+  sized at `2 × FETCH_MAX_BYTES + 16 MB` for the audio, the info JSON and the
+  Deno and yt-dlp caches: 96 MB with the defaults.
 
 ## 7. Web app
 
@@ -416,7 +466,12 @@ going off-site.
   - `Cross-Origin-Opener-Policy` and `-Resource-Policy: same-origin`.
   - A `Permissions-Policy` that denies camera, microphone, geolocation, payment
     and USB.
-  - HSTS when `PUBLIC_ORIGIN` is https.
+  - `Strict-Transport-Security: max-age=63072000; includeSubDomains` when
+    `PUBLIC_ORIGIN` is https, and none for http. Two years is the common
+    preload-grade value. The cost of `includeSubDomains`: browsers then insist
+    on HTTPS for every subdomain of the `PUBLIC_ORIGIN` host as well, so serve
+    the app on a host of its own rather than on a domain whose other hosts
+    lack TLS.
 - **CSRF:** every state change is a POST, and each requires exactly one `Origin`
   equal to `PUBLIC_ORIGIN` (no `Referer` fallback). Request bodies are
   `audio/wav` or `application/json` only.
@@ -429,7 +484,9 @@ going off-site.
   is the sanitised tone name, sent as `filename*` with an ASCII `filename`
   fallback (5.6).
 - **Process limits:** `python -I`. A fixed thread pool and global concurrency
-  caps. Body reads have socket timeouts. The proxy handles slow-client defence.
+  caps. Body reads have socket timeouts, and a whole body must arrive within
+  60 s of taking a render slot (408 otherwise), so a trickled upload can't hold
+  a slot indefinitely. The proxy handles slow-client defence beyond that.
 
 ## 9. Supply chain, CI and releases
 
@@ -460,7 +517,9 @@ Local jobs run with `permissions: contents: read`:
 - Unit tests.
 - A core image build and an integration test run inside it with
   `--network none` (the real ffmpeg, the corpus, and the build-configuration
-  checks), from the render milestone on.
+  checks), from the render milestone on. The job is named **Image tests** and
+  joins the required checks in the same milestone, because it is the only
+  test that proves the ffmpeg allowlist, `--network none` and `read_only`.
 - A **PR-title check** (conventional commits, so release-please works). It is a
   stdlib script that reads the title from an `env:` variable, never from inline
   `${{ }}`.
@@ -483,7 +542,9 @@ The **organisation security gate** (`security_gate.yml`) calls
 The gate's permissions are `actions: read`, `contents: read` and
 `security-events: write`; the shared workflows upload SARIF to code scanning,
 which needs the last of those. A PR from a fork gets a read-only token, so the
-SARIF upload fails there.
+SARIF upload fails there. Until strange_security skips the upload for forks
+while still failing on findings, a fork's PR cannot pass the gate; a
+maintainer pushes the fork's branch into this repository instead.
 
 **Branch ruleset on `main`** (set 2026-10-25): every change needs a PR, merges
 are squash only, and force pushes and deletion are blocked. These checks are
@@ -496,6 +557,7 @@ required, all reported by GitHub Actions:
 - Semgrep / Semgrep scan
 - Trivy / Trivy filesystem scan
 - Gitleaks / Gitleaks history scan
+- Image tests (added with the first Dockerfile, milestone 3)
 
 The repository squash-merges with the PR title as the commit subject, which is
 what release-please reads. A **tag ruleset** on `v*` lets only organisation
@@ -517,12 +579,17 @@ No workflow uses `pull_request_target` or `workflow_run`.
     scans them with Trivy (failing on HIGH or CRITICAL), pushes them, runs
     `actions/attest-build-provenance`, generates an SBOM and attests it with
     `actions/attest-sbom`, and appends both digests to the release notes.
-- **Known gotcha:** PRs that `GITHUB_TOKEN` creates don't trigger workflows, so
-  CI would never run on the release PR. Plan: the release-please job dispatches
-  `ci.yml` (`workflow_dispatch`) on the release branch, which reports the
-  required checks on the PR's head commit. Cost: that job also needs
-  `actions: write`. I rejected a GitHub App token because it would add a
-  long-lived private key. This approach is verified in Phase 6.
+- **Known gotcha (settled 2026-10-25):** a PR that `GITHUB_TOKEN` opens or
+  updates gets its `pull_request` workflow runs in an *approval-required*
+  state (GitHub docs, "Triggering a workflow from a workflow"). A maintainer
+  clicks **Approve workflows to run** on the release PR, and all three
+  workflows report their required checks on its head commit. Every push to
+  `main` re-synchronises the release PR and needs the click again. This
+  replaces the earlier idea of dispatching `ci.yml`, which could never have
+  reported the five required checks that live outside `ci.yml`, and which
+  needed `actions: write`. No GitHub App or PAT: both add a long-lived
+  secret. The repository setting "Allow GitHub Actions to create and approve
+  pull requests" must be on, or release-please cannot open the PR at all.
 - A consumer verifies with
   `gh attestation verify oci://ghcr.io/<owner>/strange_ringtone@sha256:… --repo <owner>/strange_ringtone`
   before pinning the digest.
@@ -567,10 +634,13 @@ security repository, and never patched with a local copy here.
   - an oversized body
   - a body cut off mid-stream
 - **Decoder invocation:** the argument list is built safely (no shell, no user
-  strings except the escaped title), the timeout kills the process, a failure
-  cleans up the job directory, and the build-configuration allowlist holds.
-  The limiter is always invoked with `level=false`, and a rendered fixture's
-  measured loudness lands within 0.5 LU of the target.
+  strings except the escaped title), the timeout kills the whole process group (the
+  test's stub ffmpeg forks a grandchild, which must be gone afterwards), a
+  failure cleans up the job directory, and the build-configuration allowlist
+  holds.
+  The limiter is always invoked with `level=false`, and the post-chain
+  loudness the render pass reports for a fixture lands within 0.5 LU of the
+  target.
 - **Headers and CSRF:** a missing, duplicated or wrong `Origin` is refused, the
   CSP is exact, and the XFF trust rules hold.
 - **Tone-name sanitisation (5.6):** bidi overrides, CR/LF and other controls,
@@ -595,7 +665,8 @@ LICENSE  README.md  SECURITY.md  CHANGELOG.md  CLAUDE.md  .env.example
 compose.example.yaml        # hardened example, ports only in a commented dev snippet
 core/
   Dockerfile  ffmpeg/{build.sh,VERSION,SHA256SUMS}
-  strange_ringtone/{server.py,http_guard.py,wav.py,render.py,names.py,results.py}
+  __main__.py               # checkout entry point: python -I core
+  strange_ringtone/{__main__.py,config.py,server.py,http_guard.py,static.py,wav.py,render.py,names.py,results.py}
   static/{index.html,app.js,waveform.js,loudness.js,suggest.js,share.js,style.css}
 fetcher/
   Dockerfile  requirements.in  requirements.txt
@@ -654,6 +725,13 @@ docs/PLAN.md
    vulnerability reporting in the repository settings.
 2. **Core server:** `/healthz`, headers, the Origin check, XFF and rate limits,
    static files and config, with tests.
+
+   From a checkout the server runs as `python -I core [--bind HOST]`, not
+   `python -I -m strange_ringtone`: `-I` keeps the current directory off
+   `sys.path`, so `-m` finds the package only where it is installed, while a
+   directory that Python runs is always on `sys.path`. `POST /api/render` ends
+   in 501 `render_unavailable` until milestone 3. How the image starts the
+   server is settled with the Dockerfile.
 3. **Render:** the minimal ffmpeg build, WAV validation, measure and render,
    results with TTL, the corpus, and the build-configuration tests.
 4. **Web app:** decode, waveform, selection, preview (fades and JS loudness),

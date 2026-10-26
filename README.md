@@ -38,6 +38,8 @@ shows.
 | Path | What |
 | --- | --- |
 | `docs/PLAN.md` | Research, decisions and the v0.1.0 plan |
+| `core/` | The core server: the `strange_ringtone` package and its static files |
+| `.env.example` | The core's settings, with placeholders and defaults |
 | `tools/spike/phase0.py` | Generates the test tones that established the share sheet's rules |
 | `scripts/` | Stdlib checks that CI runs on pull requests |
 | `tests/` | Stdlib `unittest` tests |
@@ -67,6 +69,25 @@ Regenerate the spike tones. This needs a local ffmpeg with the `aac` and
 ```bash
 python -I tools/spike/phase0.py
 ```
+
+**Run locally.** Start the core server on loopback, then open
+<http://127.0.0.1:8080/>:
+
+```bash
+PUBLIC_ORIGIN=http://127.0.0.1:8080 python -I core --bind 127.0.0.1
+```
+
+The other settings in [.env.example](.env.example) are read from the
+environment the same way, and an invalid value stops the server at startup.
+Uploads are written only under `/tmp/strange_ringtone` (on Windows, which is
+for development only, under the user's temporary directory); `TMPDIR` does
+not move it.
+Without `--bind` the server listens on `0.0.0.0:8080`, which is meant for the
+container; don't expose it on your LAN. `--bind` takes an IP address, never a
+host name, so starting the server makes no DNS lookup. The command passes the `core`
+directory rather than `-m strange_ringtone`: `-I` leaves the current directory
+off `sys.path`, so `-m` finds the package only where it is installed, while a
+directory that Python runs is always on `sys.path`.
 
 **Pull requests:** branch from `main` as `feat/…` or `fix/…`. PRs are
 squash-merged, so their titles must be conventional-commit subjects (`feat:`,
