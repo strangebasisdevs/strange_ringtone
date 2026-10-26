@@ -1707,6 +1707,12 @@ class RenderFailureTest(RenderFlowTestCase):
             with self.subTest(query=query):
                 self.assertFailed(self.render(query, name="SecretName"), 500, "render_failed")
 
+    def test_a_non_zero_exit_fails_even_with_a_valid_summary(self) -> None:
+        self.stub_mode("late_fail")
+        for query in ("", "?normalize=false"):
+            with self.subTest(query=query):
+                self.assertFailed(self.render(query, name="SecretName"), 500, "render_failed")
+
     def test_unparsable_measurement_is_a_render_failure(self) -> None:
         self.stub_mode("unparsable")
         for query in ("", "?normalize=false"):

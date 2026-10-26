@@ -17,6 +17,8 @@ STRANGE_RINGTONE_FFMPEG_STUB selects a behaviour:
     silence     the measure pass reports I -70.0 and peak -inf
     unparsable  no summary on stderr, exit 0 (a render pass still writes out.m4a)
     fail        exit 1 without output
+    late_fail   everything ok does (summary, and out.m4a on a render pass),
+                then exit 1, so only the exit status says the run failed
     hang        sleep 60 s
     grandchild  start a sleeping grandchild, write its PID to grandchild.pid in
                 the working directory, then sleep 60 s
@@ -35,7 +37,7 @@ from pathlib import Path
 
 MODE_VAR = "STRANGE_RINGTONE_FFMPEG_STUB"
 LOG_VAR = "STRANGE_RINGTONE_FFMPEG_STUB_LOG"
-MODES = ("ok", "offset", "stubborn", "silence", "unparsable", "fail", "hang", "grandchild")
+MODES = ("ok", "offset", "stubborn", "silence", "unparsable", "fail", "late_fail", "hang", "grandchild")
 INPUT_LUFS = -23.0
 INPUT_PEAK = -20.0
 OUTPUT_MAGIC = b"STUB-IPOD\n"
@@ -179,7 +181,7 @@ def main(argv: list[str]) -> int:
         peak = min(peak + gain, -1.5)
     err.write(summary(integrated, peak).encode("ascii"))
     err.flush()
-    return 0
+    return 1 if mode == "late_fail" else 0
 
 
 if __name__ == "__main__":

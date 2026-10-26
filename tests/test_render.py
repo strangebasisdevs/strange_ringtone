@@ -382,6 +382,19 @@ class RenderTest(StubTestCase):
                 self.assertEqual(raised.exception.code, code)
                 self.assertEqual(self.job_names(), ["in.wav"])
 
+    def test_non_zero_exit_fails_even_with_a_valid_summary(self) -> None:
+        # The summary parses and a render pass leaves out.m4a, so only the exit
+        # status says the run failed: a partial or damaged file is never a result.
+        self.set_mode("late_fail")
+        for normalize, code, kinds in ((True, "measure_failed", ["measure"]), (False, "render_failed", ["render"])):
+            with self.subTest(normalize=normalize):
+                self.runs_log.unlink(missing_ok=True)
+                with self.assertRaises(RenderError) as raised:
+                    Renderer(STUB_COMMAND, 20).render(self.job, params(normalize=normalize, duration=1.0))
+                self.assertEqual(raised.exception.code, code)
+                self.assertEqual(self.kinds(), kinds)
+                self.assertEqual(self.job_names(), ["in.wav"])
+
     def test_a_render_that_writes_no_output_fails(self) -> None:
         # Exit 0 and a summary, but no file: never reported as a result.
         real_popen = subprocess.Popen
