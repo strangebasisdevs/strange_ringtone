@@ -1,10 +1,10 @@
 """The container contract, checked from inside the running image (docs/PLAN.md 5.7).
 
 The test run uses the contract's own flags (README, Development): --network
-none, --read-only, a /tmp tmpfs, --cap-drop ALL and no-new-privileges. These
-tests prove the image works under them and that they hold: a fixed non-root
-user, no writable path but /tmp, no network, and a server that starts with the
-image's CMD and answers /healthz.
+none, --read-only, a /tmp tmpfs, --cap-drop ALL, no-new-privileges, --ipc none
+and --ulimit msgqueue=0. These tests prove the image works under them and that
+they hold: a fixed non-root user, no writable path but /tmp, no network, and a
+server that starts with the image's CMD and answers /healthz.
 """
 from __future__ import annotations
 
@@ -88,6 +88,11 @@ class FilesystemTest(unittest.TestCase):
         for directory in (
             "/", "/app", "/app/core", "/app/core/strange_ringtone", "/app/core/static", "/app/ffmpeg",
             "/usr/local/bin", "/usr/local/lib", "/etc", "/var/tmp", "/root", "/home", "/run",
+            # Docker gives every container a writable /dev/shm tmpfs and an
+            # mqueue mount whatever --read-only says; --ipc none removes the
+            # first and --ulimit msgqueue=0 stops anything being created in
+            # the second.
+            "/dev", "/dev/shm", "/dev/mqueue",
         ):
             path = Path(directory) / "strange_ringtone-write-probe"
             with self.subTest(directory=directory):
@@ -98,6 +103,7 @@ class FilesystemTest(unittest.TestCase):
                 handle.close()
                 os.unlink(path)
                 self.fail(f"{directory} is writable")
+        self.assertFalse("/dev/shm" in _mounts(), "a /dev/shm tmpfs is mounted; run with --ipc none")
 
     def test_shipped_files_cannot_be_modified(self) -> None:
         for path in (

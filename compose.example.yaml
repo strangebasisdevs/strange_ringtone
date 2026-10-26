@@ -31,6 +31,12 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+    # Docker otherwise mounts a writable /dev/shm tmpfs and lets the server
+    # create POSIX message queues under /dev/mqueue, both outside read_only.
+    # The server uses neither, so /tmp stays the only writable path.
+    ipc: none
+    ulimits:
+      msgqueue: 0
     tmpfs:
       # The only writable path: uploads and results, gone on restart. noexec
       # and nosuid keep anything written there from running. The size follows

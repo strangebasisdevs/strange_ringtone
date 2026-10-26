@@ -106,13 +106,16 @@ exactly `core/ffmpeg/configure.txt`. `--build-arg VERSION=…` and
 upstream repository.
 
 **Run the in-image tests** in a throwaway container with the deployment
-contract's restrictions: no network, a read-only root, only `/tmp` writable,
-no capabilities and no published ports. In Git Bash on Windows:
+contract's restrictions: no network, a read-only root, only `/tmp` writable
+(`--ipc none` and `--ulimit msgqueue=0` take away Docker's default `/dev/shm`
+and POSIX message queues), no capabilities and no published ports. In Git Bash
+on Windows:
 
 ```bash
 MSYS_NO_PATHCONV=1 docker run --rm --name strange_ringtone-image-tests \
   --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m,mode=1777 \
   --cap-drop ALL --security-opt no-new-privileges:true \
+  --ipc none --ulimit msgqueue=0 \
   -e PUBLIC_ORIGIN=https://example.internal -e STRANGE_RINGTONE_IMAGE_TESTS=1 \
   -v "$(cygpath -w "$PWD/tests"):/tests:ro" \
   strange_ringtone:local python -I -m unittest discover -s /tests/image -t /tests -v

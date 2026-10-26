@@ -51,7 +51,7 @@ jobs:
     name: Image tests
     # The only test of what ships: the real ffmpeg against its allowlist, and
     # the server under the contract's --network none, --read-only, tmpfs /tmp,
-    # cap-drop ALL and no-new-privileges (docs/PLAN.md 9.2).
+    # cap-drop ALL, no-new-privileges, ipc none and msgqueue=0 (docs/PLAN.md 9.2).
     runs-on: ubuntu-24.04
     # A cold build compiles ffmpeg; the GitHub Actions cache makes later runs
     # rebuild only the layers after it.
@@ -87,6 +87,7 @@ jobs:
             --network none --read-only \
             --tmpfs /tmp:rw,noexec,nosuid,size=64m,mode=1777 \
             --cap-drop ALL --security-opt no-new-privileges:true \
+            --ipc none --ulimit msgqueue=0 \
             -e PUBLIC_ORIGIN=https://example.internal -e STRANGE_RINGTONE_IMAGE_TESTS=1 \
             -v "$GITHUB_WORKSPACE/tests:/tests:ro" \
             strange_ringtone:ci \

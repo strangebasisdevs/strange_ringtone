@@ -314,8 +314,8 @@ the user types becomes the filename. Decision 9 keeps it readable:
 | Image | `ghcr.io/<owner>/strange_ringtone:<semver>`, consumed by digest, linux/amd64 |
 | User | UID 10001, GID 10001 (fixed, non-root) |
 | Port | 8080/tcp, plain HTTP. TLS is the proxy's job. |
-| Runs with | `read_only: true`, `cap_drop: [ALL]`, `no-new-privileges`. No egress needed (internal network). |
-| Writable | `/tmp` (tmpfs) and nothing else. No volumes, and nothing survives a restart. Size it at `MAX_RESULTS × 1 MB + RENDER_CONCURRENCY × (MAX_BODY_BYTES + 1 MB)`, which is 64 MB with the defaults. |
+| Runs with | `read_only: true`, `cap_drop: [ALL]`, `no-new-privileges`, `ipc: none`, `ulimits: msgqueue: 0`. No egress needed (internal network). |
+| Writable | `/tmp` (tmpfs) and nothing else. Docker would also give the container a writable `/dev/shm` tmpfs and POSIX message queues in `/dev/mqueue`; `ipc: none` and a zero `msgqueue` limit remove both. No volumes, and nothing survives a restart. Size it at `MAX_RESULTS × 1 MB + RENDER_CONCURRENCY × (MAX_BODY_BYTES + 1 MB)`, which is 64 MB with the defaults. |
 | Health | `GET /healthz` returns 200 with an empty body |
 
 | Variable | Default | Notes |
@@ -525,8 +525,9 @@ Local jobs run with `permissions: contents: read`:
 - **Image tests** (from the render milestone on): a core image build with
   buildx and the GitHub Actions cache, then the in-image tests
   (`tests/image`) in the built image with `--network none`, `--read-only`, a
-  `/tmp` tmpfs, `--cap-drop ALL` and `no-new-privileges`: the real ffmpeg, the
-  corpus, the build-configuration checks and the container contract. It is a
+  `/tmp` tmpfs, `--cap-drop ALL`, `no-new-privileges`, `--ipc none` and
+  `--ulimit msgqueue=0`: the real ffmpeg, the corpus, the build-configuration
+  checks and the container contract. It is a
   required check, because it is the only test that proves the ffmpeg
   allowlist, `--network none` and `read_only`.
 - A **PR-title check** (conventional commits, so release-please works). It is a
