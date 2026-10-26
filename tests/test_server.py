@@ -1395,12 +1395,14 @@ class LogTest(ServerTestCase):
 
     def test_control_characters_and_long_paths(self) -> None:
         self.request("GET", "/x\x1b[31mred")
-        self.request("GET", "/" + "a" * 5000)
+        # "z" is not a hex digit, so the result-ID mask leaves the path alone
+        # and only the length cap applies.
+        self.request("GET", "/" + "z" * 5000)
         lines = self.wait_for_log("GET /", count=2)
         self.assertNotIn("\x1b", self.log.getvalue())
         self.assertTrue(any(line.startswith("GET /x_[31mred 404 ") for line in lines))
-        long_line = next(line for line in lines if line.startswith("GET /aaa"))
-        self.assertEqual(long_line.split(" ")[1], "/" + "a" * 199)
+        long_line = next(line for line in lines if line.startswith("GET /zzz"))
+        self.assertEqual(long_line.split(" ")[1], "/" + "z" * 199)
 
     def test_unexpected_errors_log_one_line_without_a_traceback(self) -> None:
         def explode(handler: Handler) -> None:
