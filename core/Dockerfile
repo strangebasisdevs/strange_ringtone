@@ -25,10 +25,12 @@ WORKDIR /build
 COPY core/ffmpeg/VERSION core/ffmpeg/SHA256SUMS core/ffmpeg/ffmpeg-devel.asc core/ffmpeg/configure.txt ./
 
 # The tarball is trusted only after two independent checks: the SHA-256
-# committed when the version was reviewed, and FFmpeg's release signature made
-# with a subkey of the committed signing key. gpgv's own exit status is not
-# enough, because it accepts a signature from any key in the keyring; the
-# VALIDSIG status line's last field must name FFmpeg's primary key. VERSION
+# committed when the version was reviewed, and the signature by FFmpeg's
+# release signing key (the committed key; its primary key signs releases).
+# gpgv's own exit status is not enough, because it accepts a signature from
+# any key in the keyring. The VALIDSIG status line's last field is the
+# primary fingerprint of whichever key made the signature, so requiring
+# FFmpeg's there also covers a signing subkey added later. VERSION
 # becomes part of a URL and a path, so it may hold only a release number.
 RUN version="$(cat VERSION)"; \
     [[ "$version" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || { echo "bad VERSION: $version" >&2; exit 1; }; \
