@@ -649,6 +649,31 @@ class TimeoutTest(StubTestCase):
                     time.sleep(0.05)
                 self.assertFalse(alive(grandchild), "the grandchild survived the interrupted run")
 
+    def test_an_interrupted_render_removes_its_output(self) -> None:
+        # Not only a RenderError: whatever escapes the encoder after it has
+        # written out.m4a (an interrupt at shutdown, an OSError from a pipe)
+        # leaves no half-written output behind for anything to serve.
+        real_communicate = self.popen.communicate
+        written: list[bool] = []
+        for error in (KeyboardInterrupt, OSError):
+            with self.subTest(error=error.__name__):
+                self.procs.clear()
+                written.clear()
+
+                def interrupted(proc: subprocess.Popen[bytes], input: Any = None, timeout: float | None = None,
+                                error: type[BaseException] = error) -> Any:
+                    # The run completes and writes its output first.
+                    real_communicate(proc, input, timeout)
+                    written.append((self.job / "out.m4a").is_file())
+                    raise error()
+
+                with mock.patch.object(self.popen, "communicate", interrupted):
+                    with self.assertRaises(error):
+                        Renderer(STUB_COMMAND, 20).render(self.job, params(normalize=False, duration=1.0))
+                self.assertEqual(written, [True], "the stub never wrote out.m4a")
+                self.assertReaped()
+                self.assertEqual(self.job_names(), ["in.wav"])
+
     def test_a_survivor_holding_the_pipes_cannot_hang_the_request(self) -> None:
         # As if the kill had missed: the run still holds stdout and stderr
         # open. The bounded drain gives up instead of waiting for it.
