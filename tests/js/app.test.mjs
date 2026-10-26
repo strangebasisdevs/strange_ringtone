@@ -1,11 +1,15 @@
 // The trimmer's wiring (core/static/app.js), run against a fake DOM built from
 // the real index.html. The pure modules have their own tests; these pin what
-// app.js adds on top: the caps it hands them, the loudness controls, the
-// render request, the share click and what a render that went stale shows.
+// app.js adds on top: the caps it hands them, the loudness controls and the
+// preview gain they drive, the one playback context, the render request built
+// from the controls, the share click, the hidden YouTube place, and what a
+// render that went stale shows.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import { integratedLufs } from "../../core/static/audio/loudness.js";
+import { dbToGain } from "../../core/static/player.js";
+import { resultUrl, ShareError } from "../../core/static/share.js";
 import { loadApp, pickFile, settle, sleep, wavShape } from "./fake_dom.mjs";
 
 const RATE = 44100;
@@ -38,11 +42,13 @@ function m4a() {
   return new Response(new Uint8Array([0, 1, 2, 3]), { headers: { "Content-Disposition": DISPOSITION } });
 }
 
-// The server, answering at once unless a test holds the result back.
-function server(hold = null) {
+// The server, answering at once unless a test holds the result (hold) or the
+// render's answer (holdRender) back.
+function server(hold = null, { holdRender = null, resultId = RESULT_ID } = {}) {
   return (url) => {
     if (url.startsWith("/api/render?")) {
-      return Promise.resolve(json({ result_id: RESULT_ID, duration: 15, measured_lufs: -9.5, applied_gain_db: -4.5 }));
+      if (holdRender !== null) return holdRender;
+      return Promise.resolve(json({ result_id: resultId, duration: 15, measured_lufs: -9.5, applied_gain_db: -4.5 }));
     }
     if (url === `/api/result/${RESULT_ID}.m4a`) return hold === null ? Promise.resolve(m4a()) : hold;
     return Promise.resolve(json({ error: "not_found" }, 404));
@@ -177,6 +183,10 @@ test("Get on this iPhone calls navigator.share inside the click, before anything
   page.el("share").dispatch("click");
   // Checked before yielding even once: a call after an await would come later.
   assert.equal(shared.length, 1);
+  // Only the file: a title or text would be shared alongside it, and some
+  // targets then take the text instead of the tone.
+  assert.deepEqual(Object.keys(shared[0]), ["files"]);
+  assert.equal(shared[0].files.length, 1);
   const [file] = shared[0].files;
   assert.equal(file.name, "Server Name.m4a");
   assert.equal(file.type, "audio/mp4");
@@ -223,4 +233,145 @@ test("a change while the result downloads leaves no stale numbers on the page", 
   assert.equal(page.el("render-status").textContent, "Changed while rendering. Tap Hear final to render it again.");
   assert.equal(page.el("result-info").hidden, true);
   assert.equal(page.el("deliver").hidden, true);
+});
+
+const SHARE_SHEET = { canShare: () => true, share: () => Promise.resolve() };
+
+test("Hear final without a Play first creates and resumes the one AudioContext and plays the tone", async () => {
+  const page = await loadApp({ maxClipSeconds: "15", fetch: server(), navigator: SHARE_SHEET });
+  await pickFile(page, "My Song.mp3", [SONG]);
+  // Decoding uses an OfflineAudioContext: no live context before a gesture.
+  assert.equal(page.contexts().length, 0);
+  await renderNow(page);
+  assert.equal(page.contexts().length, 1);
+  const [context] = page.contexts();
+  assert.equal(context.resumes, 1, "resumed inside the click, as iOS requires");
+  assert.equal(context.decoded.length, 1, "the fetched tone is decoded on the playback context");
+  const final = context.sources.filter((source) => source.loop);
+  assert.equal(final.length, 1);
+  assert.equal(final[0].buffer, context.decoded[0]);
+  assert.equal(final[0].starts.length, 1);
+  assert.equal(page.el("render-status").textContent, "Playing the finished tone on a loop.");
+  assert.equal(page.el("render").textContent, "Stop final");
+  // Play selection afterwards reuses the same context.
+  page.el("play").dispatch("click");
+  page.el("play").dispatch("click");
+  assert.equal(page.contexts().length, 1);
+});
+
+test("the Softer-Louder slider moves the preview gain live, and levelling off plays at 0 dB", async () => {
+  const page = await loadApp({ maxClipSeconds: "15", fetch: server() });
+  await pickFile(page, "My Song.mp3", [SONG]);
+  await sleep(300);
+  page.el("play").dispatch("click");
+  const [context] = page.contexts();
+  // The second GainNode is the loudness gain (player.js).
+  const level = context.gains[1].gain;
+  const atBaseline = level.lastValue();
+  assert.ok(Math.abs(20 * Math.log10(atBaseline)) > 1, "the test signal needs a preview gain away from 0 dB");
+
+  const target = page.el("target");
+  target.value = "-20";
+  target.dispatch("input");
+  assert.equal(level.calls[level.calls.length - 1].method, "setTargetAtTime");
+  // 6 LU softer is 6 dB less gain, applied while the preview plays.
+  const ratio = level.lastValue() / atBaseline;
+  assert.ok(Math.abs(ratio - dbToGain(-6)) < 1e-9, `${ratio}`);
+
+  const normalize = page.el("normalize");
+  normalize.checked = false;
+  normalize.dispatch("input");
+  assert.equal(level.lastValue(), 1, "levelling off: 0 dB");
+  // A preview started with levelling off starts at 0 dB too.
+  page.el("play").dispatch("click");
+  page.el("play").dispatch("click");
+  assert.equal(page.el("play").textContent, "Stop");
+  assert.equal(level.lastValue(), 1);
+  page.el("play").dispatch("click");
+});
+
+test("Hear final sends what the fade and loudness controls say", async () => {
+  const page = await loadApp({ maxClipSeconds: "15", fetch: server(), navigator: SHARE_SHEET });
+  await pickFile(page, "My Song.mp3", [SONG]);
+  for (const id of ["fade-in-on", "fade-out-on", "normalize"]) {
+    page.el(id).checked = false;
+    page.el(id).dispatch("input");
+  }
+  await renderNow(page);
+  assert.equal(page.fetchCalls[0].url, "/api/render?fade_in=0.000&fade_out=0.000&normalize=false&target_lufs=-14.0");
+
+  // Back on, with the sliders moved: the slider values are sent.
+  const next = await loadApp({ maxClipSeconds: "15", fetch: server(), navigator: SHARE_SHEET });
+  await pickFile(next, "My Song.mp3", [SONG]);
+  next.el("fade-in-on").checked = false;
+  next.el("fade-in-on").dispatch("input");
+  next.el("fade-out").value = "3";
+  next.el("fade-out").dispatch("input");
+  next.el("target").value = "-12.5";
+  next.el("target").dispatch("input");
+  await renderNow(next);
+  assert.equal(next.fetchCalls[0].url, "/api/render?fade_in=0.000&fade_out=3.000&normalize=true&target_lufs=-12.5");
+});
+
+test("the YouTube place shows only when data-fetch-enabled is exactly 'true'", async () => {
+  for (const [value, hidden] of [["false", true], ["true", false], ["yes", true], ["", true], ["TRUE", true]]) {
+    const page = await loadApp({ fetchEnabled: value, fetch: server() });
+    assert.equal(page.el("youtube").hidden, hidden, JSON.stringify(value));
+  }
+});
+
+test("a result ID that is not 32 lower-case hex digits is never built into a URL", async () => {
+  assert.equal(resultUrl(RESULT_ID, "m4r"), `/api/result/${RESULT_ID}.m4r`);
+  for (const id of ["../../x", RESULT_ID.toUpperCase(), RESULT_ID.slice(1), RESULT_ID + "0", `${RESULT_ID}/x`, ""]) {
+    assert.throws(() => resultUrl(id, "m4a"), ShareError, id);
+  }
+  const page = await loadApp({ maxClipSeconds: "15", fetch: server(null, { resultId: "../../x" }) });
+  await pickFile(page, "My Song.mp3", [SONG]);
+  await renderNow(page);
+  assert.equal(page.fetchCalls.length, 1, "nothing is fetched with that ID");
+  assert.equal(page.el("render-status").textContent,
+    "The server sent an answer this page does not understand. Reload the page and try again.");
+  assert.equal(page.el("deliver").hidden, true);
+});
+
+test("a nudge moves an edge by exactly its step in frames", async () => {
+  for (const [edge, step, frames] of [["start", "0.1", 15 * RATE - 4410], ["end", "-0.1", 15 * RATE - 4410],
+    ["end", "-1", 14 * RATE]]) {
+    const page = await loadApp({ maxClipSeconds: "15", fetch: server(), navigator: SHARE_SHEET });
+    await pickFile(page, "My Song.mp3", [SONG]);
+    await page.nudge(edge, step);
+    await renderNow(page);
+    assert.equal(postedFrames(page), frames, `${edge} ${step}`);
+  }
+});
+
+test("hiding the page stops a looping preview", async () => {
+  const page = await loadApp({ maxClipSeconds: "15", fetch: server() });
+  await pickFile(page, "My Song.mp3", [SONG]);
+  page.el("play").dispatch("click");
+  const [context] = page.contexts();
+  // Becoming visible is not a reason to stop.
+  page.fireDocument("visibilitychange");
+  assert.equal(page.el("play").textContent, "Stop");
+  document.hidden = true;
+  page.fireDocument("visibilitychange");
+  assert.equal(page.el("play").textContent, "Play selection");
+  assert.ok(context.sources.length > 0 && context.sources.every((source) => source.stopped));
+});
+
+test("a change while the render runs means its result is never fetched", async () => {
+  let release;
+  const holdRender = new Promise((resolve) => { release = resolve; });
+  const page = await loadApp({ maxClipSeconds: "15", fetch: server(null, { holdRender }), navigator: SHARE_SHEET });
+  await pickFile(page, "My Song.mp3", [SONG]);
+  page.el("render").dispatch("click");
+  await settle();
+  assert.equal(page.fetchCalls.length, 1, "the render should be in flight");
+  page.el("name").value = "Another name";
+  page.el("name").dispatch("input");
+  release(json({ result_id: RESULT_ID, duration: 15, measured_lufs: -9.5, applied_gain_db: -4.5 }));
+  await settle();
+  assert.equal(page.fetchCalls.length, 1, "a stale render's result is not fetched");
+  assert.equal(page.el("result-info").hidden, true);
+  assert.equal(page.el("render-status").textContent, "Changed while rendering. Tap Hear final to render it again.");
 });

@@ -148,25 +148,88 @@ class FakeAudioBuffer {
   copyToChannel() {}
 }
 
-class FakeAudioContext {
+// An AudioParam that records what player.js schedules on it.
+class FakeParam {
   constructor() {
-    this.state = "running";
-    this.currentTime = 0;
-    this.destination = sink();
+    this.calls = [];
   }
 
-  resume() { return Promise.resolve(); }
-  createGain() { return { gain: sink(), connect() {}, disconnect() {} }; }
-  createBufferSource() { return sink(); }
+  setValueAtTime(value, time) { this.calls.push({ method: "setValueAtTime", value, time }); }
+  setTargetAtTime(value, time) { this.calls.push({ method: "setTargetAtTime", value, time }); }
+  setValueCurveAtTime(curve, time, duration) { this.calls.push({ method: "setValueCurveAtTime", time, duration }); }
+  cancelScheduledValues(time) { this.calls.push({ method: "cancelScheduledValues", time }); }
+
+  /** The last value set or aimed at. */
+  lastValue() {
+    const set = this.calls.filter((call) => "value" in call);
+    return set.length === 0 ? undefined : set[set.length - 1].value;
+  }
+}
+
+class FakeSource {
+  constructor() {
+    this.buffer = null;
+    this.loop = false;
+    this.starts = [];
+    this.stopped = false;
+  }
+
+  connect() {}
+  disconnect() {}
+  addEventListener() {}
+  start(...args) { this.starts.push(args); }
+  stop() { this.stopped = true; }
+}
+
+// Every AudioContext app.js creates, in order, for the tests to inspect.
+let contexts = [];
+
+class FakeAudioContext {
+  constructor() {
+    // Suspended until resumed, as a context made outside a gesture is on iOS.
+    this.state = "suspended";
+    this.resumes = 0;
+    this.currentTime = 0;
+    this.destination = sink();
+    this.gains = [];
+    this.sources = [];
+    this.decoded = [];
+    contexts.push(this);
+  }
+
+  resume() {
+    this.resumes += 1;
+    this.state = "running";
+    return Promise.resolve();
+  }
+
+  createGain() {
+    const node = { gain: new FakeParam(), connect() {}, disconnect() {} };
+    this.gains.push(node);
+    return node;
+  }
+
+  createBufferSource() {
+    const source = new FakeSource();
+    this.sources.push(source);
+    return source;
+  }
+
   createBuffer(count, length, sampleRate) {
     return new FakeAudioBuffer(Array.from({ length: count }, () => new Float32Array(length)), sampleRate);
   }
+
   // The rendered .m4a: its content does not matter to app.js.
-  decodeAudioData() { return Promise.resolve(new FakeAudioBuffer([new Float32Array(44100)], 44100)); }
+  decodeAudioData() {
+    const buffer = new FakeAudioBuffer([new Float32Array(44100)], 44100);
+    this.decoded.push(buffer);
+    return Promise.resolve(buffer);
+  }
 }
 
 let instance = 0;
 let nextDecoded = null;
+const realSetInterval = globalThis.setInterval;
 
 class FakeOfflineAudioContext {
   constructor(count, length, sampleRate) {
@@ -181,20 +244,33 @@ class FakeOfflineAudioContext {
 /**
  * Install fresh fakes and load a fresh copy of app.js (a new query string is
  * a new module instance, so no state leaks between tests).
- * @param {{maxClipSeconds?: string, defaultTarget?: string, fetch?: Function, navigator?: object}} options
+ * @param {{maxClipSeconds?: string, defaultTarget?: string, fetchEnabled?: string, fetch?: Function,
+ *   navigator?: object}} options
  */
 export async function loadApp(options = {}) {
   const { byId, nudges } = buildDom();
   const app = byId.get("app");
   app.dataset.maxClipSeconds = options.maxClipSeconds ?? "30";
   app.dataset.defaultTargetLufs = options.defaultTarget ?? "-14.0";
-  app.dataset.fetchEnabled = "false";
+  app.dataset.fetchEnabled = options.fetchEnabled ?? "false";
 
   const fetchCalls = [];
+  const documentListeners = new Map();
   globalThis.document = {
     hidden: false,
     getElementById: (id) => byId.get(id) ?? null,
-    addEventListener() {},
+    addEventListener(type, listener) {
+      if (!documentListeners.has(type)) documentListeners.set(type, []);
+      documentListeners.get(type).push(listener);
+    },
+  };
+  contexts = [];
+  // The player's pump timer must not keep node running when a test that
+  // started playback fails before stopping it.
+  globalThis.setInterval = (callback, ms) => {
+    const timer = realSetInterval(callback, ms);
+    timer.unref();
+    return timer;
   };
   globalThis.window = { devicePixelRatio: 2, matchMedia: () => ({ addEventListener() {} }), addEventListener() {} };
   globalThis.getComputedStyle = () => ({ getPropertyValue: () => "" });
@@ -225,6 +301,10 @@ export async function loadApp(options = {}) {
       if (button === undefined) throw new Error(`no ${edge} ${step} nudge in the template`);
       return app.children[0].dispatch("click", { target: button });
     },
+    /** Fire a document event, such as visibilitychange. */
+    fireDocument: (type) => (documentListeners.get(type) ?? []).map((listener) => listener({ type })),
+    /** The AudioContexts app.js created so far. */
+    contexts: () => [...contexts],
     fetchCalls,
   };
 }
