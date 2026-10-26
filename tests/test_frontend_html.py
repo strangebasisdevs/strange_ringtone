@@ -281,6 +281,11 @@ class TemplateTest(unittest.TestCase):
         self.assertIn("checked", by_id["fade-out-on"][1])
         self.assertIn("checked", by_id["normalize"][1])
         self.assertEqual((by_id["target"][1]["min"], by_id["target"][1]["max"]), ("-24", "-9"))
+        # Shown only when the target goes above -11 LUFS.
+        self.assertIn("hidden", by_id["target-warning"][1])
+        buttons = [dict(attrs) for tag, attrs in page.elements if tag == "button"]
+        nudges = [(attrs["data-edge"], attrs["data-step"]) for attrs in buttons if "data-edge" in attrs]
+        self.assertEqual(nudges, [(edge, step) for edge in ("start", "end") for step in ("-1", "-0.1", "0.1", "1")])
         # Nothing on the page submits anywhere.
         self.assertNotIn("form", [tag for tag, _ in page.elements])
 
@@ -294,6 +299,50 @@ class TemplateTest(unittest.TestCase):
             "If you hear nothing, turn off Silent mode.",
         ):
             self.assertIn(phrase, text)
+
+
+def css_declarations(text: str, selector: str) -> dict[str, str]:
+    """The declarations every rule naming exactly `selector` sets, later ones winning."""
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+    found: dict[str, str] = {}
+    for selectors, body in re.findall(r"([^{}]+)\{([^{}]*)\}", text):
+        if selector not in (part.strip() for part in selectors.split(",")):
+            continue
+        for declaration in body.split(";"):
+            name, colon, value = declaration.partition(":")
+            if colon:
+                found[name.strip().lower()] = value.strip().lower()
+    return found
+
+
+class TouchTest(unittest.TestCase):
+    """Done criterion 1: the handles can be dragged with a finger on iOS."""
+
+    def test_canvas_takes_the_touch_gestures(self) -> None:
+        # Without touch-action: none iOS scrolls or zooms the page while a
+        # handle is dragged; without user-select a long press selects it.
+        with open(STATIC_DIR / "style.css", encoding="utf-8") as handle:
+            rules = css_declarations(handle.read(), "#waveform")
+        self.assertEqual(rules.get("touch-action"), "none")
+        self.assertEqual(rules.get("user-select"), "none")
+        self.assertEqual(rules.get("-webkit-user-select"), "none")
+
+    def test_css_reader(self) -> None:
+        css = "/* #waveform { touch-action: auto } */ a, #waveform { touch-action: none } #waveform { color: red; }"
+        self.assertEqual(css_declarations(css, "#waveform"), {"touch-action": "none", "color": "red"})
+        self.assertEqual(css_declarations("#waveform-x { touch-action: none }", "#waveform"), {})
+        self.assertEqual(css_declarations("#waveform { touch-action: none } #waveform { touch-action: auto }",
+                                          "#waveform")["touch-action"], "auto")
+
+    def test_handles_have_44px_hit_areas(self) -> None:
+        # Apple's minimum touch target; the handles are drawn thinner.
+        with open(STATIC_DIR / "waveform.js", encoding="utf-8") as handle:
+            text = handle.read()
+        match = re.search(r"^const HANDLE_HIT_CSS_PX = (\d+);$", text, re.MULTILINE)
+        self.assertIsNotNone(match)
+        assert match is not None
+        self.assertGreaterEqual(int(match.group(1)), 44)
+        self.assertIn("const reach = HANDLE_HIT_CSS_PX / 2;", text)
 
 
 class JsAuditTest(unittest.TestCase):
