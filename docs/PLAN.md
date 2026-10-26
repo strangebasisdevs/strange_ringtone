@@ -178,8 +178,9 @@ it as unsafe in a threaded process, and this server is threaded. The child
 starts in its own session (`start_new_session=True`), `communicate()` enforces
 `RENDER_TIMEOUT_SECONDS`, and on timeout the whole process group is killed with
 `os.killpg` and reaped. `subprocess.run(timeout=…)` alone would kill only the
-direct child. Each run uses `-nostdin -hide_banner -threads 1
--protocol_whitelist file -f wav -i <job>/in.wav`.
+direct child. Each run uses `-nostdin -hide_banner -nostats -threads 1
+-protocol_whitelist file -f wav -i <job>/in.wav`, and each render run adds `-y`,
+because the corrective render overwrites `out.m4a`.
 
 1. **Measure:** `-af ebur128=peak=true -f null -`. A strict regex reads the
    integrated loudness and true peak from the summary. If parsing fails, the
