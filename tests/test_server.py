@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import http.client
+import importlib.util
 import io
 import ipaddress
 import json
@@ -572,6 +573,11 @@ class StaticTest(ServerTestCase):
         self.assertIsNone(files.get("audio/../app.js"))
         self.assertIsNone(files.get("audio"))
         self.assertIsNone(files.get("package.json"))
+        # Exact, case included: the routes check ALLOWED first, so this pins
+        # the lookup itself, which must not be the one place that folds case.
+        for name in ("APP.JS", "App.js", "AUDIO/wav.js", "audio/WAV.js", "Style.css"):
+            with self.subTest(name):
+                self.assertIsNone(files.get(name))
         self.assertIsNotNone(files.get("app.js"))
         self.assertIsNotNone(files.get("audio/wav.js"))
 
@@ -582,6 +588,30 @@ class StaticTest(ServerTestCase):
             with self.subTest(name):
                 with self.assertRaises(ValueError):
                     static.check_names([name])
+
+    def test_a_bad_allowlist_name_fails_at_import(self) -> None:
+        # The module checks ALLOWED as it is imported, so a bad entry stops the
+        # server before it binds a port, whatever builds StaticFiles later. A
+        # copy of the module with one bad key is imported from a temporary
+        # directory; the unmodified copy is imported too, so the failure is
+        # the check and not the copying.
+        with open(static.__file__, encoding="utf-8") as handle:
+            source = handle.read()
+        entry = '    "app.js": _JS,\n'
+        self.assertEqual(source.count(entry), 1)
+        bad = source.replace(entry, entry + '    "../strange_ringtone/server.py": _JS,\n')
+
+        def load(text: str, name: str) -> None:
+            path = self.temp / f"{name}.py"
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(text)
+            spec = importlib.util.spec_from_file_location(name, path)
+            assert spec is not None and spec.loader is not None
+            spec.loader.exec_module(importlib.util.module_from_spec(spec))
+
+        load(source, "static_copy_good")
+        with self.assertRaisesRegex(ValueError, "bad static file name"):
+            load(bad, "static_copy_bad")
 
     def test_a_bad_allowlist_name_fails_startup(self) -> None:
         # StaticFiles is where a name becomes a path, so it checks too: a ".."
