@@ -154,7 +154,10 @@ def main(argv: list[str]) -> int:
         # Inherits stdout and stderr, like anything ffmpeg could start: the
         # renderer must not hang on pipes this process keeps open.
         child = subprocess.Popen([sys.executable, "-I", "-c", "import time; time.sleep(60)"])
-        Path("grandchild.pid").write_text(str(child.pid), encoding="ascii")
+        # Written aside and renamed into place, so a test that sees
+        # grandchild.pid never reads it empty or half-written.
+        Path("grandchild.pid.tmp").write_text(str(child.pid), encoding="ascii")
+        os.replace("grandchild.pid.tmp", "grandchild.pid")
         time.sleep(60)
         return 0
     if mode == "fail":

@@ -96,6 +96,25 @@ def alive(pid: int) -> bool:
         return True
 
 
+def read_pid(pid_file: Path, timeout: float = 10) -> int | None:
+    """The PID in pid_file once it holds one, or None after timeout.
+
+    Waits for the content, not just the file: a file that exists may still be
+    empty under load, and int("") would fail the test for the wrong reason.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            text = pid_file.read_text(encoding="ascii").strip()
+        except OSError:
+            text = ""
+        if text:
+            return int(text)
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.05)
+
+
 def kill_quietly(pid: int) -> None:
     # On Windows os.kill with SIGTERM is TerminateProcess.
     try:
@@ -574,8 +593,9 @@ class TimeoutTest(StubTestCase):
         with self.assertRaises(RenderError) as raised:
             Renderer(STUB_COMMAND, 2).render(self.job, params(duration=1.0))
         self.assertEqual(raised.exception.code, "render_timeout")
-        self.assertTrue(pid_file.exists(), "the stub never started its grandchild")
-        grandchild = int(pid_file.read_text(encoding="ascii"))
+        grandchild = read_pid(pid_file, timeout=5)
+        self.assertIsNotNone(grandchild, "the stub never started its grandchild")
+        assert grandchild is not None
         # Registered after the job directory, so it runs first: no sleeper
         # outlives the test on any platform, and on Windows the directory it
         # sits in can be removed.
@@ -606,17 +626,16 @@ class TimeoutTest(StubTestCase):
                 def interrupted(proc: subprocess.Popen[bytes], input: Any = None, timeout: float | None = None,
                                 error: type[BaseException] = error) -> Any:
                     # Only once the grandchild exists, so there is a group to kill.
-                    deadline = time.monotonic() + 10
-                    while not pid_file.exists() and time.monotonic() < deadline:
-                        time.sleep(0.05)
+                    read_pid(pid_file)
                     raise error()
 
                 started = time.monotonic()
                 with mock.patch.object(self.popen, "communicate", interrupted):
                     with self.assertRaises(error):
                         Renderer(STUB_COMMAND, 20).render(self.job, params(duration=1.0))
-                self.assertTrue(pid_file.exists(), "the stub never started its grandchild")
-                grandchild = int(pid_file.read_text(encoding="ascii"))
+                grandchild = read_pid(pid_file, timeout=0)
+                self.assertIsNotNone(grandchild, "the stub never started its grandchild")
+                assert grandchild is not None
                 self.addCleanup(kill_quietly, grandchild)
                 # Killed, not waited out: the stub would sleep for 60 s.
                 self.assertLess(time.monotonic() - started, 10 + 5)
