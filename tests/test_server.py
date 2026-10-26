@@ -1828,11 +1828,11 @@ class ResultRouteTest(RenderFlowTestCase):
         self.assertNotIn(result_id, self.log.getvalue())
 
     def test_log_hides_ids_in_any_result_path(self) -> None:
-        secret = "0123456789abcdef0123456789abcdef"
-        self.request("GET", f"/api/result/{secret}.m4a?x=1")
-        self.request("GET", f"/api/result/{secret.upper()}{secret}.mp3")
+        probe_id = "0123456789abcdef0123456789abcdef"
+        self.request("GET", f"/api/result/{probe_id}.m4a?x=1")
+        self.request("GET", f"/api/result/{probe_id.upper()}{probe_id}.mp3")
         self.wait_for_log("GET /api/result/", count=2)
-        self.assertNotIn(secret, self.log.getvalue().lower())
+        self.assertNotIn(probe_id, self.log.getvalue().lower())
         self.assertIn("GET /api/result/<id>.m4a 404 ", self.log.getvalue())
 
 
