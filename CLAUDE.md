@@ -112,19 +112,14 @@ starts enforcing once `.release-please-manifest.json` records a release.
   - Only Semgrep findings qualify. Trivy and Gitleaks findings never get an
     inline suppression: a secret finding means rotate first, and a reviewed
     false positive goes in `.gitleaksignore`.
-  - Suppress the narrowest thing: one line, one rule, as
-    `# nosemgrep: <rule-id>`, never a bare `# nosemgrep`. No file-level or
-    directory excludes, no `.semgrepignore` entries for source code, no
-    `--exclude-rule`.
-  - The line directly above says why that line is safe, not that the tool
-    is wrong.
+  - The rules (inline only, one rule per suppression, a one-line reason
+    directly above, listed in the PR description) live in strange_security's
+    `docs/SUPPRESSIONS.md`; read it there rather than restating it here.
   - For a subprocess such as ffmpeg, make the call safe first, then suppress:
     an argument list with no `shell=True`, a fixed program path never taken
     from input, only validated values and server-generated paths as
     arguments, and a timeout. The reason names those guards, and a test pins
     them.
-  - Every suppression is called out in the PR description, so the reviewer
-    sees each judgment.
 - **`main` is protected by a ruleset:** changes go through a PR, squash-merge
   only, and the required checks are Ruff, Unit tests, Image tests,
   Conventional PR title, Deployment contract change, and the gate's Semgrep,
