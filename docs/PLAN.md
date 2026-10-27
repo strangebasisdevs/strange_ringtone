@@ -509,7 +509,7 @@ going off-site.
 
 - Every Action is pinned by full commit SHA with a `# vX.Y.Z` comment. Base
   images are pinned by digest. There is no `curl | sh`.
-- **Exception (owner's decision, 2026-10-25):** reusable workflows owned by
+- Reusable workflows owned by
   `strangebasisdevs` are called at the SHA pin `@26c089bb86b845fac6e3417c24469bef6bf9a713 # v1.0.0`,
   bumped by Dependabot, so a fix in the organisation's security repository
   reaches every repository through a reviewed bump. This applies only to
