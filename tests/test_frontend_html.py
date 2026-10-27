@@ -209,6 +209,18 @@ class TemplateAuditTest(unittest.TestCase):
     def test_good_sample_passes(self) -> None:
         self.assertEqual(audit_template(GOOD_TEMPLATE), [])
 
+    def test_rule_sets_are_pinned(self) -> None:
+        # Removing a member would let that element or attribute through.
+        self.assertEqual(URL_ATTRIBUTES, frozenset({
+            "href", "src", "action", "formaction", "poster", "data", "srcset", "background", "cite", "ping",
+            "manifest", "icon", "longdesc", "xlink:href",
+        }))
+        self.assertEqual(FORBIDDEN_ELEMENTS, frozenset({
+            "base", "iframe", "frame", "frameset", "object", "embed", "applet", "form", "portal",
+        }))
+        self.assertTrue(ABSOLUTE_URL_RE.flags & re.IGNORECASE)
+        self.assertTrue(SCHEME_RE.flags & re.IGNORECASE)
+
     def test_each_violation_is_caught(self) -> None:
         # Each case names the problem it must produce, not just "some problem":
         # several rules overlap (a javascript: href is also not the Source
@@ -270,9 +282,17 @@ class TemplateAuditTest(unittest.TestCase):
                 "the YouTube section is not hidden"),
             "base": (body("<head>", "<head><base>"), "<base> element"),
         }
-        for tag in sorted(FORBIDDEN_ELEMENTS - {"base"}):
+        # Spelled out rather than taken from the sets, so that dropping a
+        # member from FORBIDDEN_ELEMENTS or URL_ATTRIBUTES fails here instead
+        # of silently removing its own case.
+        for tag in ("iframe", "frame", "frameset", "object", "embed", "applet", "form", "portal"):
             cases[tag] = (add(f"<{tag}></{tag}>"), f"<{tag}> element")
-        self.assertTrue({"embed", "applet", "portal", "object", "iframe", "form"} <= set(cases))
+        for name in ("href", "src", "action", "formaction", "poster", "data", "srcset", "background", "cite",
+                     "ping", "manifest", "icon", "longdesc", "xlink:href"):
+            cases[f"{name} attribute"] = (add(f'<p {name}="/x"></p>'),
+                                          f"{name}='/x' is neither a static asset nor the Source link")
+        cases["upper-case external text"] = (add("<p>see HTTPS://example.internal</p>"),
+                                             "an http(s) URL in the template")
         for label, (sample, expected) in cases.items():
             with self.subTest(label):
                 problems = audit_template(sample)
