@@ -85,6 +85,16 @@ test("a buffer at another rate is resampled to the target", async () => {
   assert.deepEqual(contexts[1].args, [1, 44100 * 2, 44100]);
 });
 
+test("a resampled length that falls between frames rounds up, keeping the last frame", async () => {
+  // 48007 frames at 48 kHz is 44106.43 frames at 44.1 kHz: rounding down
+  // (or to nearest) would cut the decoded audio's final partial frame.
+  install(fakeBuffer(1, 48007, 48000));
+  const result = await decodeFile(file, 44100);
+  assert.deepEqual(contexts[1].args, [1, 44107, 44100]);
+  assert.equal(result.length, 44107);
+  assert.equal(result.channels[0].length, 44107);
+});
+
 test("input longer than MAX_INPUT_SECONDS is refused with a message", async () => {
   install(fakeBuffer(1, 44100 * MAX_INPUT_SECONDS + 1, 44100));
   await assert.rejects(decodeFile(file), /longer than 10 minutes/);
