@@ -84,6 +84,28 @@ test("the absolute gate drops blocks at or below -70 LUFS", () => {
   near(integratedLufs([mixed], 44100), integratedLufs([loud], 44100), 0.2, "absolute gate");
 });
 
+test("a steady tone below -70 LUFS measures -Infinity; one just above is measured", () => {
+  // A mono 1 kHz sine at amplitude A reads about 20 log10(A / 0.1) - 23 LUFS.
+  // With nothing louder present the relative gate cannot hide the absolute
+  // one: every block of the -80 LUFS tone is at or below -70 and dropped.
+  const amplitude = (lufs) => 0.1 * 10 ** ((lufs + 23) / 20);
+  assert.equal(integratedLufs([sine(3, 44100, 1000, amplitude(-80))], 44100), -Infinity);
+  assert.equal(integratedLufs([sine(3, 44100, 1000, amplitude(-72))], 44100), -Infinity);
+  near(integratedLufs([sine(3, 44100, 1000, amplitude(-68))], 44100), -68, 0.3, "just above the gate");
+});
+
+test("near the gate, blocks the relative gate keeps are still dropped by the absolute one", () => {
+  // -65 LUFS then -73 LUFS: the quiet half is within 10 LU of the loud one,
+  // so only the absolute gate removes it. Counting it would read ~2.5 dB lower.
+  const amplitude = (lufs) => 0.1 * 10 ** ((lufs + 23) / 20);
+  const loud = sine(5, 44100, 1000, amplitude(-65));
+  const quiet = sine(5, 44100, 1000, amplitude(-73));
+  const mixed = new Float32Array(loud.length + quiet.length);
+  mixed.set(loud);
+  mixed.set(quiet, loud.length);
+  near(integratedLufs([mixed], 44100), integratedLufs([loud], 44100), 0.2, "absolute gate near -70");
+});
+
 test("the relative gate drops blocks more than 10 LU below the gated mean", () => {
   // A tone 20 dB lower (about -43 LUFS) passes the absolute gate but not the
   // relative one, so the result is the loud part alone.
