@@ -203,6 +203,13 @@ test("an unknown code is named; anything else falls back to the status", () => {
   assert.equal(errorMessage(502, "<html>"), errorMessage(502, null));
   assert.match(errorMessage(502, null), /HTTP 502/);
   assert.match(errorMessage(undefined, undefined), /error/);
+  // A status that is not an integer (a network failure has none) is left
+  // out rather than shown as "HTTP undefined".
+  for (const status of [undefined, null, NaN, 404.5, "500"]) {
+    for (const message of [errorMessage(status, undefined), errorMessage(status, null), errorMessage(status, "teapot_mode")]) {
+      assert.doesNotMatch(message, /HTTP|undefined|null|NaN/, String(status));
+    }
+  }
   // Inherited properties are not codes.
   assert.match(errorMessage(400, "constructor"), /constructor/);
   assert.match(errorMessage(400, "__proto__"), /HTTP 400/);
