@@ -510,10 +510,13 @@ going off-site.
 - Every Action is pinned by full commit SHA with a `# vX.Y.Z` comment. Base
   images are pinned by digest. There is no `curl | sh`.
 - Reusable workflows owned by
-  `strangebasisdevs` are called at the SHA pin `@26c089bb86b845fac6e3417c24469bef6bf9a713 # v1.0.0`,
-  bumped by Dependabot, so a fix in the organisation's security repository
-  reaches every repository through a reviewed bump. This applies only to
-  organisation-owned reusable workflows. Third-party actions stay SHA-pinned.
+  `strangebasisdevs` are pinned by full commit SHA with a `# vX.Y.Z` comment and
+  never called at `@main`. `security_gate.yml` is the single source of truth for
+  the current pin. Dependabot (`github-actions` ecosystem) opens the bump PRs
+  from `strange_security` release tags, so a fix in the organisation's security
+  repository reaches every repository through a reviewed bump. This applies
+  only to organisation-owned reusable workflows. Third-party actions stay
+  SHA-pinned.
   The cost: a fix merged to `strange_security` runs here only after the bump PR
   in this repository merges.
 - The core has no Python dependencies. The fetcher's yt-dlp lock and ruff use
@@ -551,7 +554,7 @@ Local jobs run with `permissions: contents: read`:
 
 The **organisation security gate** (`security_gate.yml`) calls
 `strangebasisdevs/strange_security`'s `semgrep.yml`, `trivy.yml` and
-`gitleaks.yml` at `@26c089bb86b845fac6e3417c24469bef6bf9a713 # v1.0.0`. They are this repository's only security scans:
+`gitleaks.yml`, each pinned as described in 9.1. They are this repository's only security scans:
 
 - Semgrep `p/default` fails on any finding.
 - Trivy fails on any secret at any severity, and on HIGH or CRITICAL fixable
