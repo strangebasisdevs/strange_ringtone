@@ -96,18 +96,19 @@ starts enforcing once `.release-please-manifest.json` records a release.
 - Pin Actions by full commit SHA with a `# vX.Y.Z` comment, and base images by
   digest. No `curl | sh`. Dependabot covers pip, github-actions and docker,
   with a 7-day cooldown.
-- **Exception, the owner's decision on 2026-10-25:** reusable workflows owned by
-  the `strangebasisdevs` organisation are called at `@main`, for example
-  `strangebasisdevs/strange_security/.github/workflows/semgrep.yml@main`. This
-  covers organisation-owned reusable workflows only. Every third-party action
-  stays SHA-pinned.
+- Reusable workflows owned by the `strangebasisdevs` organisation, such as
+  `strangebasisdevs/strange_security/.github/workflows/semgrep.yml`, are pinned
+  by full commit SHA with a `# vX.Y.Z` comment like any other action, and
+  Dependabot bumps them. They are not called at `@main`.
 - **Security scanning belongs to `strangebasisdevs/strange_security`,** the
   organisation's one-stop security repository. `security_gate.yml` calls its
   Semgrep, Trivy and Gitleaks workflows, and this repository runs no security
   scans of its own. Fix gaps in those scans in strange_security, never with a
   local copy here (`docs/PLAN.md`, section 9.4).
 - **Semgrep suppressions are allowed, narrowly** (owner's decision, 2026-10-25):
-  policy stays central in strange_security; this is per-repository triage.
+  policy stays central in strange_security (its `docs/SUPPRESSIONS.md` is the
+  source of truth, and its check runs in the security gate); this is
+  per-repository triage.
   - Only Semgrep findings qualify. Trivy and Gitleaks findings never get an
     inline suppression: a secret finding means rotate first, and a reviewed
     false positive goes in `.gitleaksignore`.
