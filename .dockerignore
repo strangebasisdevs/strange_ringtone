@@ -1,6 +1,13 @@
-# An allowlist: the build context holds only core/, so nothing else in the
-# checkout (a local .env, spike output, tests, .git) can reach an image layer.
+# An allowlist: the build context holds only core/ and fetcher/, so nothing
+# else in the checkout (a local .env, spike output, tests, .git) can reach an
+# image layer. Both images share this context, and each Dockerfile copies only
+# the paths it names (the fetcher image takes three files of core/).
 *
 !core
+!fetcher
 **/__pycache__
 **/*.pyc
+# Marks core/static/**/*.js as ES modules for `node --test` only. It is not in
+# the static allowlist, so it is never served; leaving it out of the image
+# keeps /app/core/static to the files the server actually loads.
+core/static/package.json

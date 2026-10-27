@@ -1,7 +1,9 @@
 # strange_ringtone: research and v0.1.0 plan
 
 Status: design agreed on 2026-10-24 (decisions in section 3). Milestones 0
-to 2 are done, and milestone 3 (render) is implemented (section 12).
+to 2 are done, milestone 3 (render) is implemented, and milestone 4 (web app)
+is implemented with its Web Share check pending the owner's phone test
+(section 12).
 This file is the design record; the README's "Deployment contract" becomes the
 source of truth for operators once v0.1.0 ships.
 
@@ -96,7 +98,8 @@ install through Finder or iMazing.
   of 0 to 5 s. Ringtones loop while ringing, so a fade-out plus a short fade-in
   makes the loop seamless and avoids clicks.
 - Loudness normalisation is on by default. The baseline (`DEFAULT_TARGET_LUFS`)
-  is −14 LUFS, with a slider from −24 (softer) to −9 (louder) and a true-peak
+  is −14 LUFS, with a slider from −24 (softer) to −9 (louder) in 0.1 LU steps
+  (the page rounds a baseline with more decimals to one) and a true-peak
   ceiling of −1 dBTP. Phase 0 didn't compare it by ear with a built-in tone, so
   the baseline is adjusted later through the slider or the env var.
 - The frontend has no dependencies: plain ES modules, with a canvas waveform
@@ -142,8 +145,14 @@ without the fetcher.
 
 That is the whole API. Nothing else reads or writes state.
 
-`<audio>` elements play responses regardless of `Content-Disposition`, so
-"Hear final" can use the attachment URL.
+"Hear final" fetches `/api/result/<id>.m4a` once with `fetch()`, decodes the
+bytes with `decodeAudioData` and loops them through Web Audio, with no fades or
+gain of its own because the file already has them. An `<audio>` element
+pointed at the attachment URL would not work: Safari's media loader sends
+`Range` (and `HEAD`) requests, and the result route supports neither. The
+same bytes become the `File` for Web Share (7.3), and nothing needs a `blob:`
+URL, which the CSP's `'self'` does not cover. The download links point at the
+result URLs directly.
 
 ### 5.2 Input checks, in order, before ffmpeg runs
 
@@ -261,8 +270,9 @@ option), and fails on anything outside the committed allowlist
 
 ### 5.4 Fades and loudness preview
 
-The browser previews everything immediately. Fades are gain ramps on an
-`AudioBufferSourceNode`. Loudness uses a small JS BS.1770 meter (K-weighting
+The browser previews everything immediately. Fades are quarter-sine gain
+curves, the same shape as the server's `afade=curve=qsin`, drawn with one
+`setValueCurveAtTime` per loop iteration. Loudness uses a small JS BS.1770 meter (K-weighting
 filters, 400 ms blocks, absolute and relative gating) applied to the selection,
 so the slider moves the preview gain live. The server's measurement is the
 authority. "Hear final" plays the real render.
@@ -343,7 +353,14 @@ the user types becomes the filename. Decision 9 keeps it readable:
 
 The core has no secrets in v0.1.0, so `.env.example` holds only
 `PUBLIC_ORIGIN=` and commented optional settings. Any later secret arrives as
-`*_FILE`, with no usable default.
+`*_FILE`, with no usable default. The same file carries the optional fetcher's
+settings in a block of their own, all commented out; `compose.example.yaml`
+gives both services that one `.env`, and each server reads only its own
+variables (`PUBLIC_ORIGIN` and `TRUSTED_PROXIES` are shared).
+
+The fetcher image is a second, separate contract with its own table in the
+README (section 6, "Fetcher contract"). Nothing in it changes the core's: the
+core still needs no egress, and `FETCH_ENABLED` only shows the YouTube box.
 
 ## 6. Fetcher image (opt-in)
 
@@ -352,23 +369,46 @@ The core has no secrets in v0.1.0, so `.env.example` holds only
   typed ever reaches yt-dlp, which removes the SSRF path (yt-dlp's generic
   extractor would otherwise fetch anything).
 - **Invocation:** `python -I -m yt_dlp`, run as a subprocess with an argument
-  list:
-  - `--ignore-config --no-playlist --use-extractors youtube` (verify flag names
-    against the pinned version)
+  list. The flags were checked against the pinned yt-dlp 2026.10.26, and an
+  in-image test runs the real yt-dlp with the exact list (offline, so it can
+  only fail at name resolution) to prove that version accepts every one:
+  - `--ignore-config --no-playlist --use-extractors youtube`
+  - `--js-runtimes deno:/usr/local/bin/deno` (the image's fixed path) and
+    `--no-cache-dir`
   - `-f "bestaudio[ext=m4a]"` (AAC, which Safari decodes, so the fetcher needs
     no ffmpeg)
-  - `--match-filter "duration <= FETCH_MAX_SECONDS & !is_live"`
-  - `--max-filesize`
-  - `--write-info-json`, with `-o`/`-P` pointing into a fresh `/tmp` job directory
+  - `--break-match-filters "duration <= FETCH_MAX_SECONDS & !is_live"`, not
+    `--match-filter`: a plain filter skips the video and exits 0 having
+    written nothing, while the breaking one exits 101, which is how
+    `too_long` is told apart
+  - `--max-filesize FETCH_MAX_BYTES` (checked before the download; a larger
+    file is skipped with exit 0 and no audio, which maps to `failed`)
+  - `--write-info-json --quiet --no-warnings --no-progress --socket-timeout 20`
+  - `-P <job directory> -o "%(id)s.%(ext)s"`, so file names come from the
+    validated ID only, then `--` and the URL the server built
 
-  It runs under `prlimit` and a wall-clock timeout, one job at a time
-  (`FETCH_CONCURRENCY=1`), with its own per-IP rate limit. The fetcher's
-  `prlimit` set is CPU seconds, file size, open files and process count, with
-  no address-space limit: Deno reserves a huge virtual address space at
-  startup, so `RLIMIT_AS` would kill it. Memory is bounded by the deployment's
-  cgroup limit (`mem_limit` in `compose.example.yaml`), which the contract
-  documents as the operator's job. `DENO_DIR` and yt-dlp's cache directory
-  point under `/tmp`, because the root filesystem is read-only.
+  It runs under `prlimit` and a wall-clock timeout (`communicate()`; on
+  timeout the whole process group is killed and the pipes drained), in its
+  own session, one job at a time (`FETCH_CONCURRENCY=1`, with 4 more queued
+  and 503 `busy` beyond), with its own per-IP rate limit. The fetcher's
+  `prlimit` set is CPU seconds, file size, open files and process count
+  (512, because `RLIMIT_NPROC` counts every thread of UID 10001, V8's
+  included), with no address-space limit: Deno reserves a huge virtual
+  address space at startup, so `RLIMIT_AS` would kill it. Memory is bounded
+  by the deployment's cgroup limit (`mem_limit` in `compose.example.yaml`),
+  which the contract documents as the operator's job. yt-dlp's environment
+  is built from scratch: fixed values, `HOME` and `DENO_DIR` inside the job
+  directory under `/tmp` (the root filesystem is read-only, and nothing
+  carries over between jobs), and `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY`
+  when the operator set them, never the server's own environment. yt-dlp
+  hands that environment to Deno, which it runs with `--no-remote
+  --cached-only`.
+- **Success** is judged by exactly `<id>.m4a` (a regular file of at most
+  `FETCH_MAX_BYTES`) and `<id>.info.json` being in the job directory, never
+  by exit 0 alone. Exit 101 is `too_long`, a timeout is `timeout`, and other
+  failures are `blocked` or `not_found` when stderr matches a few fixed
+  phrases (bot checks, HTTP 403; unavailable, private or removed videos) and
+  `failed` otherwise. The job directory is removed in `finally` on every path.
 - **Logging:** yt-dlp runs with `--quiet --no-warnings --no-progress`, and its
   stdout and stderr are never logged: they carry the destination filename,
   which contains the title that becomes the tone name (CLAUDE.md: tone names
@@ -384,26 +424,54 @@ The core has no secrets in v0.1.0, so `.env.example` holds only
   - `heatmap`, validated as at most 200 points with times within the duration
     and values from 0 to 1
 
-  `GET …/audio` streams the file once, then deletes it. A TTL sweep catches any
-  file that was never collected.
-- **Runtime:** Deno is copied from the official image, pinned by digest so
-  Dependabot tracks it. yt-dlp and yt-dlp-ejs come from a hashed pip-tools lock
-  (`--require-hashes --no-deps --only-binary :all:`).
+  `GET …/audio` claims the job atomically (a concurrent second request gets
+  404), streams the file once as `audio/mp4` with `no-store`, then deletes it
+  and forgets the job, so a later status request is a 404 too. A TTL sweep
+  (`FETCH_RESULT_TTL_SECONDS` from completion) catches any file that was never
+  collected. The fetcher holds **at most one** finished, uncollected result:
+  `/tmp` is sized for one download in flight plus one waiting, so when a
+  download finishes, an older one still waiting is deleted. A result being
+  streamed counts too, because its file keeps its space until the stream
+  closes it: before the next download starts, the oldest uncollected result
+  goes, and if streams alone fill the budget, the oldest stream is cut at its
+  next chunk and the worker waits for it to let go. This rule is the
+  fetcher's only; the core's no-early-eviction rule (5.5) is unchanged.
+- **Runtime:** the same `python:3.12-slim-bookworm` base and digest as the
+  core, with its `prlimit`. Deno (2.9.8; yt-dlp needs at least 2.3.0) is
+  copied from the official `denoland/deno:bin` image, a named build stage
+  pinned by digest so Dependabot tracks it. yt-dlp and yt-dlp-ejs come from a
+  hashed pip-tools lock (`fetcher/requirements.txt`, compiled from
+  `requirements.in`; `--require-hashes --no-deps --only-binary :all:`), which
+  holds exactly those two distributions: yt-dlp declares no required
+  dependencies, and yt-dlp-ejs must equal the version yt-dlp's own `default`
+  extra pins (an in-image test checks both, and Dependabot bumps them as one
+  group). Without `requests`, yt-dlp talks to a proxy through urllib, so only
+  `http://` proxies work. The fetcher shares the core's
+  `strange_ringtone.config` and `strange_ringtone.http_guard` (the Origin,
+  length, `X-Forwarded-For` and rate-limit rules): `fetcher/__main__.py` puts
+  `../core` first on `sys.path`, and the image copies exactly those modules
+  to `/app/core`.
 - **Contract:** the same UID, read-only and capability rules as the core. It
   needs **internet egress** to YouTube's hosts and no access to any private
   network. Restricting egress (an allowlisting proxy, firewall rules for private
   ranges) is documented as the deployment's job. It honours `HTTPS_PROXY`.
   Settings: `PUBLIC_ORIGIN` (required), `TRUSTED_PROXIES`, `FETCH_MAX_SECONDS`
-  (900), `FETCH_MAX_BYTES` (40 MB), `FETCH_TIMEOUT_SECONDS` (120),
-  `RATE_LIMIT_FETCHES_PER_MINUTE` (5), `FETCH_RESULT_TTL_SECONDS` (600).
+  (600, at most 600: `decode.js` refuses input over 10 minutes, so a longer
+  video would be downloaded only for the phone to refuse it), `FETCH_MAX_BYTES`
+  (40 MiB; 10 minutes of YouTube's AAC is about 10 MB),
+  `FETCH_TIMEOUT_SECONDS` (120), `RATE_LIMIT_FETCHES_PER_MINUTE` (5),
+  `FETCH_RESULT_TTL_SECONDS` (600).
 - **Fetcher contract (the README gets a second table):** image
   `ghcr.io/<owner>/strange_ringtone-fetcher:<semver>`, linux/amd64, UID/GID
   10001, port 8080/tcp plain HTTP. The fetcher serves the `/fetch/` prefix
   itself (`GET /fetch/healthz`, `POST /fetch/api/jobs`,
   `GET /fetch/api/jobs/<id>` and `…/audio`), and the proxy forwards those
   paths unchanged, so no rewriting is needed. Writable: `/tmp` (tmpfs) only,
-  sized at `2 × FETCH_MAX_BYTES + 16 MB` for the audio, the info JSON and the
-  Deno and yt-dlp caches: 96 MB with the defaults.
+  sized at `2 × FETCH_MAX_BYTES + 16 MB` for one download in flight, one
+  finished result, the info JSON and Deno's cache: 96 MB with the defaults.
+  Health: `GET /fetch/healthz` answers 200 `ok`. The in-image tests live in
+  `tests/image_fetcher/` (not `tests/image/`, which is the core's), gated by
+  `STRANGE_RINGTONE_FETCHER_IMAGE_TESTS=1`.
 
 ## 7. Web app
 
@@ -432,8 +500,8 @@ The first rule that applies places the selection:
 3. Otherwise, it goes on the window with the highest mean short-term loudness,
    since choruses tend to be the loudest part.
 
-The start then moves to the nearest local energy minimum within ±1 s, to avoid
-cutting a word.
+The start then moves to the quietest 50 ms (lowest RMS) within ±1 s, to avoid
+cutting a word, and the window keeps its full length.
 
 ### 7.3 Getting it onto the phone
 
@@ -443,7 +511,18 @@ Phase 0 confirmed that path: in Safari's downloads list, tap the file, then
 Share offers "Use as Ringtone".
 
 Phase 4 checks whether the Web Share sheet offers it too. If it doesn't, the
-download becomes the main button. The help text covers the Duplicate Ringtone
+download becomes the main button.
+
+As built in milestone 4, the page fetches the `.m4a` right after the render
+and enables **Get on this iPhone** only once the bytes are in hand. Its click
+handler calls `navigator.share({files: [file]})` with no `await` before it,
+because WebKit's user activation does not survive an awaited fetch. The file
+is `new File([bytes], <name>.m4a, {type: 'audio/mp4'})`, with the name the
+server sanitised (read from `Content-Disposition`), and `navigator.canShare`
+checks that very file. Cancelling the sheet is silent; any other failure, or a
+browser without the sheet, shows the plain download link. A status line says
+"Share sheet: available" or "not available". **Pending the owner's phone
+test:** whether the sheet lists "Use as Ringtone", and what it does. The help text covers the Duplicate Ringtone
 error, and explains that tones are removed by swiping left in the Ringtone or
 Text Tone list. Web Share needs a secure
 context, so the origin must use a certificate the phone trusts. With a private
@@ -538,6 +617,13 @@ Local jobs run with `permissions: contents: read`:
   checks and the container contract. It is a
   required check, because it is the only test that proves the ffmpeg
   allowlist, `--network none` and `read_only`.
+- **Fetcher image tests** (from milestone 5 on): the fetcher image built the
+  same way (in its own cache scope), then `tests/image_fetcher` in it under
+  the same flags with a 96 MB tmpfs: the container contract, the installed
+  yt-dlp and yt-dlp-ejs against the lock and each other, Deno under the
+  fetcher's `prlimit` set, the real yt-dlp accepting the exact argument list
+  (offline), the CMD answering `/fetch/healthz`, and the fetcher's unit tests
+  again under the image's Python 3.12, with the yt-dlp stub.
 - A **PR-title check** (conventional commits, so release-please works). It is a
   stdlib script that reads the title from an `env:` variable, never from inline
   `${{ }}`.
@@ -576,6 +662,8 @@ required, all reported by GitHub Actions:
 - Trivy / Trivy filesystem scan
 - Gitleaks / Gitleaks history scan
 - Image tests (from milestone 3; the owner adds it to the ruleset)
+- Fetcher image tests (from milestone 5; the owner adds it to the ruleset,
+  named exactly so)
 
 The repository squash-merges with the PR title as the commit subject, which is
 what release-please reads. A **tag ruleset** on `v*` lets only organisation
@@ -682,18 +770,22 @@ security repository, and never patched with a local copy here.
 ```
 LICENSE  README.md  SECURITY.md  CHANGELOG.md  CLAUDE.md  .env.example
 compose.example.yaml        # hardened example, ports only in a commented dev snippet
-.dockerignore               # allowlist: only core/ reaches the build context
+.dockerignore               # allowlist: only core/ and fetcher/ reach the build context
 core/
   Dockerfile  ffmpeg/{VERSION,SHA256SUMS,ffmpeg-devel.asc,configure.txt,components.txt}
   __main__.py               # checkout entry point: python -I core
   strange_ringtone/{__main__.py,config.py,server.py,http_guard.py,static.py,wav.py,render.py,names.py,results.py}
-  static/{index.html,app.js,waveform.js,loudness.js,suggest.js,share.js,style.css}
+  static/{index.html,style.css,app.js,waveform.js,player.js,share.js,fetch.js}   # fetch.js: link parser, /fetch/ client
+  static/audio/{decode,wav,loudness,suggest,fades,request}.js   # pure audio code, unit-tested under Node
+  static/package.json       # {"type": "module"} for the Node tests only: not served, not in the image
 fetcher/
-  Dockerfile  requirements.in  requirements.txt
-  strange_ringtone_fetch/{server.py,ytdlp.py}
-tests/  tests/corpus/  tests/image/  tests/stubs/
+  Dockerfile  requirements.in  requirements.txt   # yt-dlp and yt-dlp-ejs, hashed lock
+  __main__.py               # checkout entry point: python -I fetcher; puts ../core on sys.path
+  strange_ringtone_fetch/{__init__,__main__,config,server,jobs,ytdlp}.py   # imports only config and http_guard from core
+tests/  tests/corpus/  tests/image/  tests/image_fetcher/  tests/stubs/{ffmpeg_stub,ytdlp_stub}.py  tests/js/
 scripts/{check_pr_title.py,check_contract_change.py,check_ffmpeg_release.py}   # stdlib checks CI runs
 tools/spike/phase0.py       # regenerates the iOS test tones into spike-out/
+tools/dev_fetch_stack.py    # loopback dev stack: core, stubbed fetcher and one origin, for the offline product check
 .github/{dependabot.yml,workflows/{ci,pr-checks,security_gate,release-please,ffmpeg-watch}.yml}
 release-please-config.json  .release-please-manifest.json
 docs/PLAN.md
@@ -768,8 +860,39 @@ docs/PLAN.md
 4. **Web app:** decode, waveform, selection, preview (fades and JS loudness),
    render and "Hear final", share or download, and energy-based suggestions.
    Finish the Web Share part of the spike here.
+
+   Implemented: the browser decodes the file (up to 10 minutes) and resamples
+   it to 44100 Hz, suggests the loudest window, and previews the selection
+   with qsin fades and a BS.1770 meter. The page sends exactly the selection
+   as 16-bit WAV, then fetches and plays the result (5.1) and offers the share
+   sheet or the downloads (7.3). The pure audio modules have Node unit tests
+   (`tests/js/`), run by the stdlib suite when `node` is present. Still open:
+   the owner's phone test of the share sheet, recorded in 7.3.
 5. **Fetcher** image and UI integration (paste a link, the `#yt=` fragment,
    heatmap suggestions), plus the Shortcut docs.
+
+   Implemented: the opt-in fetcher image (section 6) and, in the page, the
+   **From YouTube** box that `FETCH_ENABLED` reveals. `core/static/fetch.js`
+   parses a pasted link or the `#yt=` fragment on the device (7.4), posts
+   only the video ID to `/fetch/api/jobs`, polls the job every 2 s, fetches
+   the audio once into memory and hands it to the same decode path as a
+   picked file, with plain words for every fetcher error code. The fragment
+   is removed with `history.replaceState` before any request, and with
+   `FETCH_ENABLED` off no `/fetch/` request is ever made. `suggest.js` now
+   applies rules 1 (`t=`) and 2 (the heatmap) of 7.2 before rule 3, with the
+   same snap; an invalid timestamp or heatmap falls through to the next rule.
+   The README documents the YouTube flow, the Shortcut with a placeholder
+   origin, and the privacy notes of section 13. The CSP is unchanged: every
+   URL the page fetches is a same-origin `/fetch/` path.
+
+   The product check runs offline: the UI is driven in a browser against
+   `tools/dev_fetch_stack.py`, which serves the core and the fetcher with the
+   stubbed yt-dlp on one loopback origin, so no YouTube traffic leaves the
+   development machine. Still open: the owner's decision on one real fetch
+   from a throwaway container before v0.1.0, to confirm that
+   `bestaudio[ext=m4a]` is still served without a PO token; without it the
+   first real fetch happens in a deployment. Also open: the owner's phone test
+   of the Shortcut.
 6. **Release:** release-please, publish with provenance, SBOM and image scans, a
    complete README contract, then **v0.1.0**. Stop there. Integration into an
    infrastructure repository happens from that repository.
