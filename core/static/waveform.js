@@ -85,6 +85,17 @@ export class Waveform {
     this.resize();
   }
 
+  /**
+   * Drop the audio. A ten-minute stereo clip is about 200 MB of samples, and
+   * holding the old one while the next file decodes would need room for both.
+   */
+  clear() {
+    this.channels = null;
+    this.length = 0;
+    this.peaks = null;
+    this.selection = { start: 0, end: 0 };
+  }
+
   setSelection(start, end) {
     this.selection = { start, end };
     this.draw();

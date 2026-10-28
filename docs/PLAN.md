@@ -147,7 +147,11 @@ That is the whole API. Nothing else reads or writes state.
 
 "Hear final" fetches `/api/result/<id>.m4a` once with `fetch()`, decodes the
 bytes with `decodeAudioData` and loops them through Web Audio, with no fades or
-gain of its own because the file already has them. An `<audio>` element
+gain of its own because the file already has them. The page learns
+`RESULT_TTL_SECONDS` from a data attribute and forgets the result when that
+time has passed, so its download links never point at a tone the sweeper has
+deleted; a tone finished while the page is hidden waits for the next "Hear
+final" instead of starting a loop in a background tab. An `<audio>` element
 pointed at the attachment URL would not work: Safari's media loader sends
 `Range` (and `HEAD`) requests, and the result route supports neither. The
 same bytes become the `File` for Web Share (7.3), and nothing needs a `blob:`

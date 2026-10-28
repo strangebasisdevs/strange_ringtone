@@ -29,7 +29,8 @@ iOS 26's **Share → Use as Ringtone**. No GarageBand, no computer and no cable.
    still to be confirmed on a phone; the download path is.)
 
 iOS names the tone after the file, so the name you type is the name Settings
-shows. Finished tones stay on the server for a few minutes only.
+shows. Finished tones stay on the server for a few minutes only; when one has
+gone, the page says so, and **Hear final** makes it again.
 
 ## Design
 

@@ -96,6 +96,9 @@ class StaticFiles:
             "max_clip_seconds": str(settings.max_clip_seconds),
             "default_target_lufs": str(settings.default_target_lufs),
             "fetch_enabled": "true" if settings.fetch_enabled else "false",
+            # The page forgets a finished tone when the server does, so its
+            # download links never point at a result that is gone.
+            "result_ttl_seconds": str(settings.result_ttl_seconds),
             "source_url": settings.source_url,
             "version": settings.version,
             "static_prefix": "/static/" + settings.version,

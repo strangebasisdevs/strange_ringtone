@@ -375,3 +375,41 @@ test("a change while the render runs means its result is never fetched", async (
   assert.equal(page.el("result-info").hidden, true);
   assert.equal(page.el("render-status").textContent, "Changed while rendering. Tap Hear final to render it again.");
 });
+
+test("a tone finished while the page is hidden waits for Hear final instead of playing", async () => {
+  const page = await loadApp({ maxClipSeconds: "15", fetch: server(), navigator: SHARE_SHEET });
+  await pickFile(page, "My Song.mp3", [SONG]);
+  document.hidden = true;
+  await renderNow(page);
+  const [context] = page.contexts();
+  assert.equal(context.sources.filter((source) => source.loop).length, 0, "nothing plays in a hidden tab");
+  assert.equal(page.el("render-status").textContent, "The tone is ready. Tap Hear final to play it.");
+  assert.equal(page.el("render").textContent, "Hear final");
+  assert.equal(page.el("deliver").hidden, false, "the result is kept for the links and the share sheet");
+  const renders = page.fetchCalls.filter((call) => call.url.startsWith("/api/render")).length;
+  // Back in view, Hear final plays the kept tone without another render.
+  document.hidden = false;
+  page.el("render").dispatch("click");
+  assert.equal(context.sources.filter((source) => source.loop).length, 1);
+  assert.equal(page.el("render").textContent, "Stop final");
+  assert.equal(page.fetchCalls.filter((call) => call.url.startsWith("/api/render")).length, renders);
+});
+
+test("a tone the server has dropped is forgotten here too, and Hear final makes it again", async () => {
+  const page = await loadApp({ maxClipSeconds: "15", resultTtlSeconds: "0.2", fetch: server(), navigator: SHARE_SHEET });
+  await pickFile(page, "My Song.mp3", [SONG]);
+  await renderNow(page);
+  assert.equal(page.el("render").textContent, "Stop final");
+  assert.equal(page.el("download-m4r").href, `/api/result/${RESULT_ID}.m4r`);
+  await sleep(350);
+  assert.equal(page.el("render-status").textContent,
+    "The finished tone has expired on the server. Tap Hear final to make it again.");
+  assert.equal(page.el("deliver").hidden, true);
+  assert.equal(page.el("download-m4r").href, undefined, "no link to a result that is gone");
+  assert.equal(page.el("render").textContent, "Hear final");
+  const [context] = page.contexts();
+  assert.ok(context.sources.every((source) => source.stopped), "the expired tone stops looping");
+  await renderNow(page);
+  assert.equal(page.fetchCalls.filter((call) => call.url.startsWith("/api/render")).length, 2, "rendered again");
+  assert.equal(page.el("render-status").textContent, "Playing the finished tone on a loop.");
+});

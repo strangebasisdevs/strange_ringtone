@@ -359,11 +359,11 @@ class IndexTest(ServerTestCase):
 
     def test_configuration_in_data_attributes(self) -> None:
         self.start(max_clip_seconds=30, default_target_lufs=-9.5, fetch_enabled=True, version="1.2.3",
-                   source_url="https://example.internal/source")
+                   source_url="https://example.internal/source", result_ttl_seconds=120)
         page = self.page()
         self.assertIn(
             '<main id="app" data-max-clip-seconds="30" data-default-target-lufs="-9.5" data-fetch-enabled="true" '
-            'data-source-url="https://example.internal/source" data-version="1.2.3" '
+            'data-result-ttl-seconds="120" data-source-url="https://example.internal/source" data-version="1.2.3" '
             'data-static-prefix="/static/1.2.3">',
             page,
         )
@@ -377,6 +377,7 @@ class IndexTest(ServerTestCase):
         self.assertIn('data-max-clip-seconds="1"', page)
         self.assertIn('data-default-target-lufs="-14.0"', page)
         self.assertIn('data-fetch-enabled="false"', page)
+        self.assertIn('data-result-ttl-seconds="600"', page)
         self.assertIn('data-version="dev"', page)
 
     def test_values_are_escaped(self) -> None:

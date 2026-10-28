@@ -8,7 +8,7 @@
 <script type="module" src="{{static_prefix}}/app.js"></script>
 </head>
 <body>
-<main id="app" data-max-clip-seconds="{{max_clip_seconds}}" data-default-target-lufs="{{default_target_lufs}}" data-fetch-enabled="{{fetch_enabled}}" data-source-url="{{source_url}}" data-version="{{version}}" data-static-prefix="{{static_prefix}}">
+<main id="app" data-max-clip-seconds="{{max_clip_seconds}}" data-default-target-lufs="{{default_target_lufs}}" data-fetch-enabled="{{fetch_enabled}}" data-result-ttl-seconds="{{result_ttl_seconds}}" data-source-url="{{source_url}}" data-version="{{version}}" data-static-prefix="{{static_prefix}}">
 <h1>strange_ringtone</h1>
 <p>Turns an audio clip into an iPhone ringtone. Clips can be up to <span id="max-clip-seconds"></span> seconds long.</p>
 
@@ -112,7 +112,7 @@
 <li><strong>Duplicate Ringtone</strong> means iOS already has this tone. Delete the old one, or type a new name and tap Hear final again.</li>
 <li>To delete a tone, open Settings &gt; Sounds &amp; Haptics &gt; Ringtone (or Text Tone), swipe left on the tone and tap Delete.</li>
 <li>If you hear nothing, turn off Silent mode.</li>
-<li>A finished tone is kept on the server for a few minutes only. If a download says it has expired, tap Hear final again.</li>
+<li>A finished tone is kept on the server for a few minutes only. When it has gone, the page says so, and Hear final makes it again.</li>
 </ul>
 </section>
 </main>

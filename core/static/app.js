@@ -46,12 +46,15 @@ function readConfig() {
   // string such as "-14.0"; the server validated both at startup.
   const maxClipSeconds = Number.parseInt(app.dataset.maxClipSeconds ?? "", 10);
   const defaultTarget = Number(app.dataset.defaultTargetLufs ?? "");
+  const resultTtl = Number(app.dataset.resultTtlSeconds ?? "");
   return {
     maxClipSeconds: Number.isInteger(maxClipSeconds) && maxClipSeconds > 0 ? maxClipSeconds : 30,
     defaultTarget: Number.isFinite(defaultTarget)
       ? roundToStep(Math.min(Math.max(defaultTarget, TARGET_MIN_LUFS), TARGET_MAX_LUFS))
       : -14,
     fetchEnabled: app.dataset.fetchEnabled === "true",
+    // How long the server keeps a finished tone (RESULT_TTL_SECONDS).
+    resultTtlSeconds: Number.isFinite(resultTtl) && resultTtl > 0 ? resultTtl : 600,
   };
 }
 
@@ -107,6 +110,8 @@ const state = {
   // render that finishes after a change is not mistaken for the current one.
   generation: 0,
   result: null,
+  // Forgets the result when the server's TTL has passed.
+  resultTimer: null,
   busy: false,
   playing: null,
   decodeToken: 0,
@@ -224,6 +229,10 @@ function updateButtons() {
 
 function clearResult() {
   if (state.playing === "final") stopPlayback();
+  if (state.resultTimer !== null) {
+    clearTimeout(state.resultTimer);
+    state.resultTimer = null;
+  }
   state.result = null;
   el.resultInfo.hidden = true;
   el.deliver.hidden = true;
@@ -232,6 +241,15 @@ function clearResult() {
   el.fallback.removeAttribute("href");
   el.downloadM4r.removeAttribute("href");
   setStatus(el.shareStatus, "");
+}
+
+// The server has deleted the tone by now, so the download links would only
+// fail. Hear final renders it again from the clip, which is still here.
+function expireResult() {
+  state.resultTimer = null;
+  if (state.result === null) return;
+  clearResult();
+  setStatus(el.renderStatus, "The finished tone has expired on the server. Tap Hear final to make it again.");
 }
 
 // Anything that changes what a render would produce.
@@ -298,9 +316,14 @@ async function renderFinal() {
     }
     if (generation !== state.generation) return;
     state.result = { id: info.result_id, info, file, buffer };
+    state.resultTimer = setTimeout(expireResult, config.resultTtlSeconds * 1000);
     showDeliver(state.result);
     if (buffer === null) {
       setStatus(el.renderStatus, "The tone is ready, but this browser could not play it. You can still save it.", true);
+    } else if (document.hidden) {
+      // The page was put away while the tone was being made: a loop that
+      // starts in a background tab has no visibility change left to stop it.
+      setStatus(el.renderStatus, "The tone is ready. Tap Hear final to play it.");
     } else {
       setStatus(el.renderStatus, "Playing the finished tone on a loop.");
       playFinal();
@@ -431,6 +454,9 @@ function resetForNewFile() {
   stopPlayback();
   clearResult();
   state.audio = null;
+  // The waveform held the old clip's samples too; the next file decodes
+  // into memory of its own, so the old one must go first.
+  waveform.clear();
   state.measured = null;
   state.generation += 1;
   el.editor.hidden = true;

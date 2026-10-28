@@ -138,3 +138,20 @@ test("a drag captures the pointer, moves the edge it picked up and releases on l
   canvas.fire("pointermove", 7, 200);
   assert.equal(changes.length, 1);
 });
+
+test("clear drops the clip's samples so the next file does not share memory with them", () => {
+  installBrowser(1);
+  const canvas = new FakeCanvas(300);
+  const waveform = new Waveform(canvas);
+  waveform.setAudio([new Float32Array(441_000)], 44_100, 441_000, { maxFrames: MAX, minFrames: MIN });
+  waveform.setSelection(1000, 50_000);
+  waveform.computePeaks(300);
+  assert.notEqual(waveform.peaks, null);
+  waveform.clear();
+  assert.equal(waveform.channels, null);
+  assert.equal(waveform.length, 0);
+  assert.equal(waveform.peaks, null);
+  assert.deepEqual(waveform.selection, { start: 0, end: 0 });
+  // Drawing with nothing loaded is still fine.
+  waveform.draw();
+});

@@ -230,6 +230,7 @@ class FakeAudioContext {
 let instance = 0;
 let nextDecoded = null;
 const realSetInterval = globalThis.setInterval;
+const realSetTimeout = globalThis.setTimeout;
 
 class FakeOfflineAudioContext {
   constructor(count, length, sampleRate) {
@@ -253,6 +254,7 @@ export async function loadApp(options = {}) {
   app.dataset.maxClipSeconds = options.maxClipSeconds ?? "30";
   app.dataset.defaultTargetLufs = options.defaultTarget ?? "-14.0";
   app.dataset.fetchEnabled = options.fetchEnabled ?? "false";
+  app.dataset.resultTtlSeconds = options.resultTtlSeconds ?? "600";
 
   const fetchCalls = [];
   const documentListeners = new Map();
@@ -270,6 +272,14 @@ export async function loadApp(options = {}) {
   globalThis.setInterval = (callback, ms) => {
     const timer = realSetInterval(callback, ms);
     timer.unref();
+    return timer;
+  };
+  // A result's expiry timer runs for the server's TTL, minutes: it must not
+  // keep node alive after a test either. Short timers (polls, sleeps) stay
+  // as they are, so a test can wait on them.
+  globalThis.setTimeout = (callback, ms, ...args) => {
+    const timer = realSetTimeout(callback, ms, ...args);
+    if (ms >= 60_000) timer.unref();
     return timer;
   };
   globalThis.window = { devicePixelRatio: 2, matchMedia: () => ({ addEventListener() {} }), addEventListener() {} };
