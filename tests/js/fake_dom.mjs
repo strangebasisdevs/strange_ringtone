@@ -277,7 +277,9 @@ export async function loadApp(options = {}) {
   // A result's expiry timer runs for the server's TTL, minutes: it must not
   // keep node alive after a test either. Short timers (polls, sleeps) stay
   // as they are, so a test can wait on them.
+  const timerDelays = [];
   globalThis.setTimeout = (callback, ms, ...args) => {
+    timerDelays.push(ms);
     const timer = realSetTimeout(callback, ms, ...args);
     if (ms >= 60_000) timer.unref();
     return timer;
@@ -313,6 +315,8 @@ export async function loadApp(options = {}) {
     },
     /** Fire a document event, such as visibilitychange. */
     fireDocument: (type) => (documentListeners.get(type) ?? []).map((listener) => listener({ type })),
+    /** Every delay the page asked setTimeout for, in order. */
+    timerDelays: () => [...timerDelays],
     /** The AudioContexts app.js created so far. */
     contexts: () => [...contexts],
     fetchCalls,

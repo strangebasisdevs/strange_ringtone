@@ -395,21 +395,105 @@ test("a tone finished while the page is hidden waits for Hear final instead of p
   assert.equal(page.fetchCalls.filter((call) => call.url.startsWith("/api/render")).length, renders);
 });
 
-test("a tone the server has dropped is forgotten here too, and Hear final makes it again", async () => {
-  const page = await loadApp({ maxClipSeconds: "15", resultTtlSeconds: "0.2", fetch: server(), navigator: SHARE_SHEET });
+test("expired downloads go, the tone and the share sheet stay, and Hear final makes new downloads", async () => {
+  const page = await loadApp({ maxClipSeconds: "15", resultTtlSeconds: "1", fetch: server(), navigator: SHARE_SHEET });
   await pickFile(page, "My Song.mp3", [SONG]);
   await renderNow(page);
   assert.equal(page.el("render").textContent, "Stop final");
   assert.equal(page.el("download-m4r").href, `/api/result/${RESULT_ID}.m4r`);
-  await sleep(350);
+  await sleep(1300);
   assert.equal(page.el("render-status").textContent,
-    "The finished tone has expired on the server. Tap Hear final to make it again.");
-  assert.equal(page.el("deliver").hidden, true);
+    "The download links have expired on the server. Tap Hear final to make the tone again.");
+  // The links are gone; the file in memory is not.
+  assert.equal(page.el("download-m4r").hidden, true);
   assert.equal(page.el("download-m4r").href, undefined, "no link to a result that is gone");
-  assert.equal(page.el("render").textContent, "Hear final");
+  assert.equal(page.el("fallback").hidden, true);
+  assert.equal(page.el("deliver").hidden, false);
+  assert.equal(page.el("share").disabled, false, "the share sheet still has the file");
+  assert.equal(page.el("render").textContent, "Stop final", "playback goes on");
   const [context] = page.contexts();
-  assert.ok(context.sources.every((source) => source.stopped), "the expired tone stops looping");
+  assert.equal(context.sources.filter((source) => source.loop && !source.stopped).length, 1);
+  // Stop, then Hear final renders again instead of replaying.
+  page.el("render").dispatch("click");
+  assert.equal(page.el("render").textContent, "Hear final");
   await renderNow(page);
   assert.equal(page.fetchCalls.filter((call) => call.url.startsWith("/api/render")).length, 2, "rendered again");
+  assert.equal(page.el("render-status").textContent, "Playing the finished tone on a loop.");
+  assert.equal(page.el("download-m4r").hidden, false);
+  assert.equal(page.el("download-m4r").href, `/api/result/${RESULT_ID}.m4r`);
+});
+
+test("a TTL longer than a timer can hold does not expire the tone at once", async () => {
+  // 40 days in milliseconds is past 2^31 - 1, which a single setTimeout wraps.
+  const page = await loadApp({ maxClipSeconds: "15", resultTtlSeconds: String(40 * 24 * 3600), fetch: server(),
+    navigator: SHARE_SHEET });
+  await pickFile(page, "My Song.mp3", [SONG]);
+  await renderNow(page);
+  await sleep(60);
+  assert.equal(page.el("render-status").textContent, "Playing the finished tone on a loop.");
+  assert.equal(page.el("download-m4r").hidden, false);
+  assert.equal(page.el("render").textContent, "Stop final");
+  // Waited in slices a timer can hold, not re-armed every millisecond after
+  // the browser cut an overflowing delay down to one.
+  const delays = page.timerDelays().filter((ms) => ms > 1000);
+  assert.ok(delays.length >= 1 && delays.length <= 2, "one long timer, not a loop: " + page.timerDelays().length);
+  assert.ok(delays.every((ms) => ms <= 2 ** 31 - 1), "within the 32-bit limit");
+});
+
+test("the expiry clock starts with the render, not after the tone was fetched", async () => {
+  let release;
+  const hold = new Promise((resolve) => { release = resolve; });
+  // The server stored the result at the render; the fetch of it takes 0.8 s
+  // here, and the TTL is 1 s, so the downloads are gone 1 s after the click.
+  const page = await loadApp({ maxClipSeconds: "15", resultTtlSeconds: "1", fetch: server(hold), navigator: SHARE_SHEET });
+  await pickFile(page, "My Song.mp3", [SONG]);
+  page.el("render").dispatch("click");
+  await sleep(800);
+  release(m4a());
+  await settle();
+  assert.equal(page.el("render").textContent, "Stop final");
+  await sleep(600);
+  assert.equal(page.el("download-m4r").hidden, true, "expired 1.4 s after the click, not 1.8 s");
+});
+
+test("a blank or unreadable baseline falls back to -14, not to the loudest setting", async () => {
+  for (const defaultTarget of ["", "loud"]) {
+    const page = await loadApp({ defaultTarget, fetch: server() });
+    assert.equal(page.el("target").value, "-14");
+    assert.equal(page.el("target-value").textContent, "-14.0 LUFS (baseline)");
+  }
+});
+
+test("a new file frees Hear final at once, and the old render's end says nothing about it", async () => {
+  let release;
+  const holdRender = new Promise((resolve) => { release = resolve; });
+  // Only the first render is held; a Response can be read once.
+  let renders = 0;
+  const plain = server();
+  const fetch = (url, init) => {
+    if (url.startsWith("/api/render?")) {
+      renders += 1;
+      if (renders === 1) return holdRender;
+    }
+    return plain(url, init);
+  };
+  const page = await loadApp({ maxClipSeconds: "15", fetch, navigator: SHARE_SHEET });
+  await pickFile(page, "My Song.mp3", [SONG]);
+  page.el("render").dispatch("click");
+  await settle();
+  assert.equal(page.el("render").disabled, true, "rendering");
+  await pickFile(page, "Other.mp3", [SONG]);
+  assert.equal(page.el("render").disabled, false, "the new clip can be rendered");
+  assert.equal(page.el("render").textContent, "Hear final");
+  assert.equal(page.el("render-status").textContent, "");
+  release(json({ result_id: RESULT_ID, duration: 15, measured_lufs: -9.5, applied_gain_db: -4.5 }));
+  await settle();
+  await sleep(20);
+  assert.equal(page.el("render-status").textContent, "", "the abandoned render leaves the new file's line alone");
+  assert.equal(page.el("result-info").hidden, true);
+  assert.equal(page.el("render").disabled, false);
+  // The new clip renders as usual.
+  await renderNow(page);
+  assert.equal(page.el("render").textContent, "Stop final");
   assert.equal(page.el("render-status").textContent, "Playing the finished tone on a loop.");
 });

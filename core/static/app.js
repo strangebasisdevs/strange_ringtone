@@ -45,7 +45,8 @@ function readConfig() {
   // MAX_CLIP_SECONDS is an integer string and DEFAULT_TARGET_LUFS a float
   // string such as "-14.0"; the server validated both at startup.
   const maxClipSeconds = Number.parseInt(app.dataset.maxClipSeconds ?? "", 10);
-  const defaultTarget = Number(app.dataset.defaultTargetLufs ?? "");
+  // parseFloat: a blank attribute is NaN and falls back; Number("") would be 0.
+  const defaultTarget = Number.parseFloat(app.dataset.defaultTargetLufs ?? "");
   const resultTtl = Number(app.dataset.resultTtlSeconds ?? "");
   return {
     maxClipSeconds: Number.isInteger(maxClipSeconds) && maxClipSeconds > 0 ? maxClipSeconds : 30,
@@ -110,9 +111,12 @@ const state = {
   // render that finishes after a change is not mistaken for the current one.
   generation: 0,
   result: null,
-  // Forgets the result when the server's TTL has passed.
+  // Forgets the result's downloads when the server's TTL has passed.
   resultTimer: null,
   busy: false,
+  // The generation whose render is in flight, so a render abandoned by a new
+  // file pick does not keep the new file's Hear final greyed out.
+  renderToken: null,
   playing: null,
   decodeToken: 0,
 };
@@ -244,12 +248,33 @@ function clearResult() {
 }
 
 // The server has deleted the tone by now, so the download links would only
-// fail. Hear final renders it again from the clip, which is still here.
+// fail. The file and its decoded buffer are still here: the share sheet and
+// playback keep working, and Hear final makes the downloads again.
 function expireResult() {
   state.resultTimer = null;
-  if (state.result === null) return;
-  clearResult();
-  setStatus(el.renderStatus, "The finished tone has expired on the server. Tap Hear final to make it again.");
+  if (state.result === null || state.result.expired) return;
+  state.result.expired = true;
+  el.downloadM4r.hidden = true;
+  el.downloadM4r.removeAttribute("href");
+  el.fallback.hidden = true;
+  el.fallback.removeAttribute("href");
+  setStatus(el.renderStatus, "The download links have expired on the server. Tap Hear final to make the tone again.");
+}
+
+// A timer's delay is a 32-bit count of milliseconds: a longer TTL (legal for
+// RESULT_TTL_SECONDS) would wrap and fire at once, so it is waited in slices.
+const MAX_TIMER_MS = 2 ** 31 - 1;
+
+function scheduleExpiry(expiresAt) {
+  const remaining = expiresAt - Date.now();
+  if (remaining <= 0) {
+    expireResult();
+    return;
+  }
+  state.resultTimer = setTimeout(() => {
+    state.resultTimer = null;
+    scheduleExpiry(expiresAt);
+  }, Math.min(remaining, MAX_TIMER_MS));
 }
 
 // Anything that changes what a render would produce.
@@ -270,6 +295,7 @@ function showInfo(info) {
 
 function showDeliver(result) {
   el.downloadM4r.href = resultUrl(result.id, "m4r");
+  el.downloadM4r.hidden = false;
   el.fallback.href = resultUrl(result.id, "m4a");
   const available = canShareFile(result.file);
   // The button only appears where the share sheet can take this very file;
@@ -291,8 +317,13 @@ async function renderFinal() {
   stopPlayback();
   clearResult();
   const generation = state.generation;
+  const audio = state.audio;
   const { start, end } = state.selection;
+  // The server's TTL runs from when it stored the result, which is before the
+  // page has fetched and decoded it; counting from here errs on the early side.
+  const startedAt = Date.now();
   state.busy = true;
+  state.renderToken = generation;
   updateButtons();
   setStatus(el.renderStatus, "Rendering…");
   try {
@@ -315,8 +346,8 @@ async function renderFinal() {
       buffer = null;
     }
     if (generation !== state.generation) return;
-    state.result = { id: info.result_id, info, file, buffer };
-    state.resultTimer = setTimeout(expireResult, config.resultTtlSeconds * 1000);
+    state.result = { id: info.result_id, info, file, buffer, expired: false };
+    scheduleExpiry(startedAt + config.resultTtlSeconds * 1000);
     showDeliver(state.result);
     if (buffer === null) {
       setStatus(el.renderStatus, "The tone is ready, but this browser could not play it. You can still save it.", true);
@@ -334,9 +365,15 @@ async function renderFinal() {
     const text = error instanceof ShareError ? error.message : "The clip could not be prepared for the server.";
     setStatus(el.renderStatus, text, true);
   } finally {
-    state.busy = false;
+    // A new file pick already freed the button for its own clip.
+    if (state.renderToken === generation) {
+      state.busy = false;
+      state.renderToken = null;
+    }
     updateButtons();
-    if (generation !== state.generation && state.result === null) {
+    // A setting changed under this render, so its result was dropped. A new
+    // file (state.audio differs) has its own status line and says nothing here.
+    if (generation !== state.generation && state.result === null && state.audio === audio) {
       // invalidate() only clears a finished result, and this render never
       // became one, so its numbers would otherwise stay up describing a
       // selection or setting that has since changed.
@@ -454,6 +491,10 @@ function resetForNewFile() {
   stopPlayback();
   clearResult();
   state.audio = null;
+  // A render still running for the old clip is abandoned (its generation is
+  // behind), so it must not keep this clip's Hear final greyed out.
+  state.busy = false;
+  state.renderToken = null;
   // The waveform held the old clip's samples too; the next file decodes
   // into memory of its own, so the old one must go first.
   waveform.clear();
@@ -564,7 +605,9 @@ el.render.addEventListener("click", () => {
     stopPlayback();
     return;
   }
-  if (state.result !== null && state.result.buffer !== null) {
+  // An expired result still plays, but Hear final then makes the downloads
+  // again rather than replaying what the server no longer has.
+  if (state.result !== null && state.result.buffer !== null && !state.result.expired) {
     playFinal();
     return;
   }
