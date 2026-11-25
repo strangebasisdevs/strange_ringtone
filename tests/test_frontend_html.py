@@ -329,10 +329,14 @@ class TemplateTest(unittest.TestCase):
         # on iOS reads it as movie types (WebKit bug 242110), so the Files
         # picker greys audio out and offers videos. A type named by its
         # extension is allowed there, so the field names the audio types too.
-        # "audio/*" stays for the other browsers. This only filters the
-        # picker: the page decodes by content, whatever the name.
+        # "audio/*" stays for the other browsers. "video/*" is there on
+        # purpose (the owner's decision, 2026-11-24): a video is picked for
+        # its sound, from the iPhone's Photo Library above all, and without
+        # it that entry would rest on the Safari bug alone. This only
+        # filters the picker: the page decodes by content, whatever the name.
         self.assertEqual(by_id["file"], ("input", {
-            "type": "file", "id": "file", "accept": "audio/*,.m4a,.mp3,.wav,.aac,.aif,.aiff,.caf,.flac,.m4r"}))
+            "type": "file", "id": "file",
+            "accept": "audio/*,video/*,.m4a,.mp3,.wav,.aac,.aif,.aiff,.caf,.flac,.m4r"}))
         self.assertEqual(by_id["waveform"][0], "canvas")
         # The magnified view (docs/PLAN.md 7.1): its canvas, and one element
         # per bar to take the pointer. zoom.js shows each element when its
