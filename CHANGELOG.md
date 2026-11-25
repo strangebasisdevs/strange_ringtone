@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/strangebasisdevs/strange_ringtone/compare/v0.1.0...v0.2.0) (2026-11-25)
+
+
+### Features
+
+* make a ringtone from a video's sound ([#39](https://github.com/strangebasisdevs/strange_ringtone/issues/39)) ([29bee63](https://github.com/strangebasisdevs/strange_ringtone/commit/29bee6396e16f7cddfd38e007311cc8f92599cc8))
+
 ## 0.1.0 (2026-11-13)
 
 
