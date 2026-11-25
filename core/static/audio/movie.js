@@ -317,9 +317,9 @@ function soundEntry(bytes, view, stbl) {
  * The index's tracks.
  * @returns {{video: boolean, sounds: object[], partial: boolean, fragments: boolean}}
  *   whether one is a picture; the sound tracks that play, in the file's
- *   order; whether some track could not be looked at, so that "no sound
- *   track" is not known for sure; and whether the movie keeps frames in
- *   fragments
+ *   order; whether some track could not be looked at, so that neither "no
+ *   sound track" nor "no track is enabled" is known for sure; and whether
+ *   the index says the movie has fragments
  */
 function readTracks(bytes, view) {
   let video = false;
@@ -333,8 +333,10 @@ function readTracks(bytes, view) {
     if (top.type !== "trak") continue;
     count += 1;
     if (count > MAX_TRACKS) {
+      // Not looked at. The walk goes on past it all the same: the box that
+      // says the movie has fragments can come after the tracks.
       partial = true;
-      break;
+      continue;
     }
     const mdia = child(bytes, view, top, "mdia");
     const hdlr = mdia === null ? null : child(bytes, view, mdia, "hdlr");
@@ -361,9 +363,12 @@ function readTracks(bytes, view) {
   // What plays is what is enabled, and only that is taken (the owner's
   // decision, 2026-11-25): a disabled track can be other sound altogether,
   // a commentary or another language. A file that enables no sound track
-  // plays its first.
+  // plays its first, and that no track is enabled is known only when every
+  // track was looked at: one that could not be may be the one that plays,
+  // and then a disabled track is not taken in its place.
+  const unseen = partial || walk.broken;
   const playing = sounds.filter((track) => track.enabled);
-  return { video, sounds: playing.length > 0 ? playing : sounds, partial: partial || walk.broken, fragments };
+  return { video, sounds: playing.length > 0 || unseen ? playing : sounds, partial: unseen, fragments };
 }
 
 /**
@@ -380,16 +385,18 @@ function entryCount(view, table, width) {
 
 /**
  * Where a track's frames are in the file, from its sample tables.
- * @param {{rate: number, fragments: boolean, fileSize: number, maxSeconds: number}} given
- *   the stream's sample rate, whether the movie has fragments, and the limits
+ * @param {{rate: number, fileSize: number, maxSeconds: number}} given
+ *   the stream's sample rate, and the limits
  * @returns {{timescale: number, ticks: number, stts: Uint8Array, sizes: Uint32Array,
  *   ranges: number[][], total: number}} the ranges are [offset, length] in
  *   the file, one per chunk in playing order, and total is their bytes
  */
-function frameRanges(bytes, view, track, { rate, fragments, fileSize, maxSeconds }) {
+function frameRanges(bytes, view, track, { rate, fileSize, maxSeconds }) {
   const { mdhd, stbl } = track;
-  // mdhd: the track's clock. Version 1 has 64-bit times before it.
-  const timescaleAt = mdhd.start + (mdhd.end > mdhd.start && bytes[mdhd.start] === 1 ? 20 : 12);
+  // mdhd: the track's clock. Version 1 has 64-bit times before it. In an
+  // empty box the version byte read is not the box's own; the check after
+  // it refuses that box wherever the byte sends this.
+  const timescaleAt = mdhd.start + (bytes[mdhd.start] === 1 ? 20 : 12);
   need(timescaleAt + 4 <= mdhd.end);
   const timescale = view.getUint32(timescaleAt);
   need(timescale >= 1);
@@ -407,9 +414,9 @@ function frameRanges(bytes, view, track, { rate, fragments, fileSize, maxSeconds
     frames += count;
     ticks += count * view.getUint32(stts.start + 12 + i * 8);
   }
-  // A track with no frames here keeps them in fragments, which this does
-  // not read; the index then says so with an mvex box.
-  if (frames === 0) throw new Refused(fragments ? FRAGMENTS : FORMAT, false);
+  // A track with no frames is no sound this can take. (A movie that keeps
+  // them in fragments was refused before it got here.)
+  if (frames === 0) throw new Refused(FORMAT, false);
   // Before a byte of sound is read. The durations are the index's own
   // account of the length. The decoder goes by the frames, each of at least
   // MIN_FRAME_SAMPLES at the stream's rate, so those are counted too: an
@@ -634,6 +641,11 @@ export async function movieAudio(file, { maxBytes, maxSeconds }) {
     // "No sound" is for good only when every track was looked at. A damaged
     // index hides tracks, and then the whole file is still worth a try.
     if (sounds.length === 0) throw new Refused(partial ? UNREADABLE : NO_SOUND, !partial);
+    // A movie with fragments keeps its sound outside this index: all of it,
+    // or all but the beginning. The index's own tables can hold that
+    // beginning, and an M4A made of them would pass for the whole sound, so
+    // nothing is taken, however full the tables are.
+    if (fragments) throw new Refused(FRAGMENTS, false);
     let track = null;
     let entry = null;
     for (const candidate of sounds) {
@@ -644,7 +656,7 @@ export async function movieAudio(file, { maxBytes, maxSeconds }) {
       }
     }
     if (track === null) throw new Refused(FORMAT, false);
-    const tables = frameRanges(index, view, track, { rate: entry.rate, fragments, fileSize: size, maxSeconds });
+    const tables = frameRanges(index, view, track, { rate: entry.rate, fileSize: size, maxSeconds });
     const header = m4aHeader({ ...entry, ...tables });
     // The page's byte cap, on the whole of what the decoder is handed,
     // before any sound is read.

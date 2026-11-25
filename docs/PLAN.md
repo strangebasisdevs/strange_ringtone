@@ -182,7 +182,9 @@ Library, where picking a `.mov` ended in "could not be read as audio".
    be other sound altogether, a commentary or another language. The cost: a
    video over 64 MiB whose playing track is not AAC is refused even when it
    carries an AAC copy switched off. Whether an iPhone's spatial-audio
-   recording is laid out that way is not known.
+   recording is laid out that way is not known. Where a track could not be
+   looked at, it may be the one that plays, so a disabled track is not taken
+   then either.
 
 **How** (`core/static/audio/movie.js`, dependency-free like the rest of the
 page).
@@ -195,7 +197,8 @@ untouched, into an audio-only M4A in memory, and `decodeAudioData` gets that.
   `.m4a`) goes to the decoder whole, as before.
 - The page walks the file's top-level boxes to the index (`moov`) and reads
   the index whole. Of the sound tracks that play (the enabled ones, or all
-  of them in a file that enables none) it takes the first whose sample
+  of them in a file that enables none, which is known only when every track
+  could be looked at) it takes the first whose sample
   description is `mp4a` with an AAC `esds`, directly or inside QuickTime's
   `wave` box (sound description versions 0, 1 and 2). AAC here is Main, LC,
   SSR, LTP and HE-AAC (audio object types 1 to 5 and 29), whose frames hold
@@ -224,14 +227,19 @@ untouched, into an audio-only M4A in memory, and `decodeAudioData` gets that.
   and durations (every run of durations counts at least one frame).
 
 **When the sound cannot be taken out** (it is not AAC of those kinds, the
-track that plays is another codec, the frames are in fragments, or the index
+track that plays is another codec, the movie has fragments, or the index
 is damaged), or the decoder refuses the M4A, a video within 64 MiB is handed
 to the decoder whole, so a browser that reads such a file today still does.
-Over 64 MiB it is refused with the reason. A video that is too long is
-refused either way, and so is one with no sound track, provided every track
-could be looked at: where the index breaks off, a track does not say what it
-is, or there are more than 32, the sound may be in what was not seen, and
-the refusal is "could not be read", which leaves the whole file its try.
+Over 64 MiB it is refused with the reason. A movie whose index says it has
+fragments (an `mvex` box) is not taken from even when the index's own tables
+hold frames: they hold the beginning, the rest is in the fragments, and an
+M4A of the beginning would pass for the whole sound.
+
+A video that is too long is refused either way, and so is one with no sound
+track, provided every track could be looked at: where the index breaks off,
+a track does not say what it is, or there are more than 32, the sound may
+be in what was not seen, and the refusal is "could not be read", which
+leaves the whole file its try.
 
 **Bounds.** Every number in the index is checked against the box it is in
 and against the file before it is used as an offset, a length or a count.
@@ -271,12 +279,39 @@ read outside the file. What it did find, all changed the next day:
   playing track of another codec (decision 4), and a damaged index could
   end in "This video has no sound", which is final.
 
+**Reviewed again on 2026-11-25**, by GitHub's Copilot on the pull request.
+Two findings, each reproduced first and changed the same day:
+
+- A movie with fragments whose index holds the first frames itself gave
+  those frames as the whole sound: 2 seconds of 20 from a file made with
+  ffmpeg's `frag_keyframe`. It is now refused as fragmented whatever its
+  index holds.
+- A disabled AAC track was still taken when the track that plays could not
+  be looked at (its tables or its clock missing). The same held for a track
+  that does not say what it is, for tracks past the 32nd and for an index
+  that breaks off; all four are closed (decision 4).
+
+For that change the list of checks to remove in turn was made again from
+the file, branch by branch: 131 of them. Twelve older branches had no test
+of their own, two of them bounds: a run of chunks is looked for inside its
+table only, and the walk over the chunks ends with the last frame. Eleven
+have a test now; the twelfth, which no file could reach, is gone.
+
 **Accepted.**
 
 - Only AAC is taken out, and of AAC not the low-delay kinds or xHE-AAC.
   Those, PCM, Apple Lossless, AC-3, a spatial-audio track on its own and
   fragmented MP4 are left to the browser's decoder, within 64 MiB. Each
   could be added the same way.
+- A movie that says it has fragments is refused as fragmented even when it
+  has none and its index holds every frame; over 64 MiB that is a refusal
+  of a file the page could have taken. ffmpeg's `frag_keyframe` writes such
+  a file from a video with a single keyframe. Looking for a fragment after
+  the index would tell the two apart; that is not built. Whether an iPhone's
+  movie carries the box is part of what is not yet seen on a phone.
+- Where the index breaks off after a track that plays, that track is still
+  taken. A box past the break that said the movie has fragments is not
+  seen.
 - The hint names MP4 and MOV videos. Any other video (WebM, Matroska) is
   still measured whole against the 64 MiB, like an audio file.
 - The track's edit list is not carried over, so the sound can begin with
