@@ -25,8 +25,9 @@ export const MAX_INPUT_SECONDS = 600;
  * decoding makes of it.
  *
  * For a video it counts the sound alone (the owner's decision, 2026-11-24):
- * movie.js reads the index and the audio track, never the picture, so a
- * video of any size holds to the same bound. Telling a video from an audio
+ * movie.js reads the index and the audio track, never the picture, and the
+ * M4A it builds from them is held to this bound, header included, so a
+ * video of any size holds to it. Telling a video from an audio
  * file takes the file's first bytes and, for a file of the MP4 family, its
  * index, which movie.js caps on its own.
  */

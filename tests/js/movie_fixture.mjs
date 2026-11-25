@@ -17,11 +17,17 @@ export function concat(parts) {
   return out;
 }
 
-export function u32(...values) {
+// From an array, for tables of tens of thousands of entries: that many
+// arguments to one call would not fit the stack.
+function u32s(values) {
   const out = new Uint8Array(values.length * 4);
   const view = new DataView(out.buffer);
   values.forEach((value, i) => view.setUint32(i * 4, value));
   return out;
+}
+
+export function u32(...values) {
+  return u32s(values);
 }
 
 export function u16(...values) {
@@ -55,15 +61,30 @@ export const AAC_48K_STEREO = [0x11, 0x90];
 export const AAC_44K_MONO = [0x12, 0x08];
 
 /**
+ * Bytes from fields of [value, width in bits], packed from the top bit and
+ * padded with zeros: an AudioSpecificConfig written field by field.
+ */
+export function packed(...fields) {
+  let bits = "";
+  for (const [value, width] of fields) bits += value.toString(2).padStart(width, "0");
+  bits = bits.padEnd(Math.ceil(bits.length / 8) * 8, "0");
+  return Array.from({ length: bits.length / 8 }, (_, i) => Number.parseInt(bits.slice(i * 8, i * 8 + 8), 2));
+}
+
+/**
  * The content of an esds box. longLengths writes each descriptor's length in
  * four bytes, as ffmpeg does; the short form is the one byte Apple writes.
+ * `flags` is the ES descriptor's flags byte and `optional` the fields those
+ * flags announce, which sit before the decoder's configuration.
  */
-export function esdsPayload({ objectType = 0x40, config = AAC_48K_STEREO, longLengths = false } = {}) {
+export function esdsPayload({
+  objectType = 0x40, config = AAC_48K_STEREO, longLengths = false, flags = 0, optional = [],
+} = {}) {
   const sized = (length) => (longLengths ? [0x80, 0x80, 0x80, length] : [length]);
   const info = [0x05, ...sized(config.length), ...config];
   // Object type, stream type, buffer size, the two bitrates, then the config.
   const decoder = [objectType, 0x15, 0, 0, 0, 0, 1, 0xf4, 0, 0, 1, 0xf4, 0, ...info];
-  const es = [0, 0, 0, 0x04, ...sized(decoder.length), ...decoder, 0x06, ...sized(1), 0x02];
+  const es = [0, 0, flags, ...optional, 0x04, ...sized(decoder.length), ...decoder, 0x06, ...sized(1), 0x02];
   return Uint8Array.from([0, 0, 0, 0, 0x03, ...sized(es.length), ...es]);
 }
 
@@ -95,13 +116,16 @@ export function someFrames(count, { length = null, seed = 1 } = {}) {
   });
 }
 
-function trackBox({ id, handler, enabled, timescale, duration, mdhdVersion, stbl, mdhd: mdhdContent = null }) {
+function trackBox({
+  id, handler, enabled, timescale, duration, mdhdVersion, stbl, mdhd: mdhdContent = null, tkhd: tkhdContent = null,
+}) {
   let mdhd = mdhdVersion === 1
     ? box("mdhd", u32(0x01000000), u64(0), u64(0), u32(timescale), u64(duration), u16(0, 0))
     : box("mdhd", u32(0, 0, 0, timescale, duration), u16(0, 0));
   if (mdhdContent !== null) mdhd = box("mdhd", mdhdContent);
+  const tkhd = tkhdContent ?? concat([u32(enabled ? 0xf : 0xe, 0, 0, id, 0, duration, 0, 0), new Uint8Array(52)]);
   return box("trak",
-    box("tkhd", u32(enabled ? 0xf : 0xe, 0, 0, id, 0, duration, 0, 0), new Uint8Array(52)),
+    box("tkhd", tkhd),
     box("mdia",
       mdhd,
       // QuickTime names the component's kind before the handler.
@@ -125,14 +149,16 @@ function trackBox({ id, handler, enabled, timescale, duration, mdhdVersion, stbl
  *   the file; 0 for a file with no picture track
  * @param {object[]} [options.sounds] one per sound track: `frames`
  *   (Uint8Array[]), `perChunk`, `entry` (a sample description), `enabled`,
- *   `timescale`, `handler`, `co64`, `mdhdVersion`, `mdhd` (the content of
- *   that box, replacing it), and `tables`, which replaces the content of
+ *   `timescale`, `handler`, `co64`, `mdhdVersion`, `mdhd` and `tkhd` (the
+ *   content of that box, replacing it), `entryLast` (the sample descriptions after the
+ *   tables, not before them), and `tables`, which replaces the content of
  *   stsd, stts, stsc, stsz or stco (or the chunk boxes' name with
  *   `offsetsBox`), or drops stts, stsc, stsz or stco with null
  * @param {number} [options.extraTracks] metadata tracks before the sound
  * @param {Uint8Array[]} [options.before] whole boxes between ftyp and the data
- * @param {boolean} [options.tail] end the index with a udta box, as a phone
- *   does; false leaves the last track's last table at the very end
+ * @param {boolean | Uint8Array} [options.tail] end the index with a udta box,
+ *   as a phone does; false leaves the last track's last box at the very
+ *   end; bytes are put there as they are
  * @returns {{size: number, segments: {name: string, at: number, bytes: Uint8Array}[],
  *   sounds: {ranges: number[][], frames: Uint8Array[]}[], pictures: number[][],
  *   index: {at: number, length: number}}} the file as the pieces that hold
@@ -143,7 +169,9 @@ export function movie({
 } = {}) {
   const specs = sounds.map((spec) => ({
     frames: someFrames(7), perChunk: 3, entry: soundEntry({ version: 1, wave: true }), enabled: true,
-    timescale: 48000, handler: "soun", co64: false, mdhdVersion: 0, mdhd: null, tables: {}, ...spec,
+    timescale: 48000, handler: "soun", co64: false, mdhdVersion: 0, mdhd: null, tkhd: null, entryLast: false,
+    tables: {},
+    ...spec,
   }));
   const chunkCount = Math.max(1, ...specs.map((spec) => Math.ceil(spec.frames.length / spec.perChunk)));
 
@@ -180,7 +208,7 @@ export function movie({
           box("stts", u32(0, 1, pictures.length, 20)),
           box("stsc", u32(0, 1, 1, 1, 1)),
           box("stsz", u32(0, picture, pictures.length)),
-          box("co64", u32(0, pictures.length), ...pictures.map(([at]) => u64(at)))),
+          box("co64", u32(0, pictures.length), concat(pictures.map(([at]) => u64(at))))),
       }));
       id += 1;
     }
@@ -200,24 +228,25 @@ export function movie({
       const defaults = {
         stts: u32(0, 1, count, 1024),
         stsc: u32(0, runs.length / 3, ...runs),
-        stsz: u32(0, 0, count, ...spec.frames.map((frame) => frame.length)),
-        stco: spec.co64 ? concat([u32(0, offsets.length), ...offsets.map(u64)]) : u32(0, offsets.length, ...offsets),
+        stsz: concat([u32(0, 0, count), u32s(spec.frames.map((frame) => frame.length))]),
+        stco: concat([u32(0, offsets.length), spec.co64 ? concat(offsets.map(u64)) : u32s(offsets)]),
       };
       const table = (name, type = name) => {
         const content = name in spec.tables ? spec.tables[name] : defaults[name];
         return content === null ? new Uint8Array(0) : box(type, content);
       };
+      const stsd = "stsd" in spec.tables ? box("stsd", spec.tables.stsd) : box("stsd", u32(0, 1), spec.entry);
+      const others = [table("stts"), table("stsc"), table("stsz"),
+        table("stco", spec.tables.offsetsBox ?? (spec.co64 ? "co64" : "stco"))];
       tracks.push(trackBox({
         id, handler: spec.handler, enabled: spec.enabled, timescale: spec.timescale, duration: count * 1024,
-        mdhdVersion: spec.mdhdVersion, mdhd: spec.mdhd,
-        stbl: box("stbl",
-          "stsd" in spec.tables ? box("stsd", spec.tables.stsd) : box("stsd", u32(0, 1), spec.entry),
-          table("stts"), table("stsc"), table("stsz"),
-          table("stco", spec.tables.offsetsBox ?? (spec.co64 ? "co64" : "stco"))),
+        mdhdVersion: spec.mdhdVersion, mdhd: spec.mdhd, tkhd: spec.tkhd,
+        stbl: box("stbl", ...(spec.entryLast ? [...others, stsd] : [stsd, ...others])),
       }));
       id += 1;
     });
-    return box("moov", box("mvhd", new Uint8Array(100)), ...tracks, ...(tail ? [box("udta", u32(0))] : []));
+    const end = tail === true ? [box("udta", u32(0))] : tail === false ? [] : [tail];
+    return box("moov", box("mvhd", new Uint8Array(100)), ...tracks, ...end);
   };
 
   const head = concat([

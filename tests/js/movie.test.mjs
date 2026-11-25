@@ -6,10 +6,13 @@ import assert from "node:assert/strict";
 
 import * as movieModule from "../../core/static/audio/movie.js";
 import {
-  AAC_44K_MONO, ascii, box, concat, dig, esdsPayload, fileOf, movie, someFrames, soundEntry, u32,
+  AAC_44K_MONO, ascii, box, concat, dig, esdsPayload, fileOf, movie, packed, someFrames, soundEntry, u16, u32,
 } from "./movie_fixture.mjs";
 
-const { movieAudio, MAX_INDEX_BYTES, MAX_AUDIO_FRAMES, MAX_TOP_BOXES, MAX_GAP_BYTES, MAX_SPAN_BYTES } = movieModule;
+const {
+  movieAudio, MAX_INDEX_BYTES, MAX_AUDIO_FRAMES, MAX_TOP_BOXES, MAX_GAP_BYTES, MAX_SPAN_BYTES, MAX_SOUND_READS,
+  MAX_CONFIG_BYTES,
+} = movieModule;
 const MIB = 1024 * 1024;
 const GIB = 1024 * MIB;
 const LIMITS = { maxBytes: 64 * MIB, maxSeconds: 600 };
@@ -37,8 +40,13 @@ function text(bytes) {
   return String.fromCharCode(...bytes);
 }
 
-/** The result is an M4A whose one track holds exactly these frames. */
-function assertM4a(result, frames, { timescale = 48000, rate = 48000, channels = 2, esds = esdsPayload() } = {}) {
+/**
+ * The result is an M4A whose one track holds exactly these frames.
+ * `rateField` is the entry's own rate field, which holds 16 bits of hertz.
+ */
+function assertM4a(result, frames, {
+  timescale = 48000, rate = 48000, channels = 2, esds = esdsPayload(), rateField = rate * 65536,
+} = {}) {
   assert.notEqual(result, null);
   assert.equal(result.refusal, undefined, result.refusal);
   const { bytes } = result;
@@ -59,7 +67,7 @@ function assertM4a(result, frames, { timescale = 48000, rate = 48000, channels =
   // The decoder's configuration is the source's own, byte for byte.
   assert.deepEqual(dig(bytes, [...STBL, "stsd", "mp4a", "esds"]), esds);
   const entry = viewOf(dig(bytes, [...STBL, "stsd", "mp4a"]));
-  assert.deepEqual([entry.getUint16(16), entry.getUint16(18), entry.getUint32(24)], [channels, 16, rate * 65536]);
+  assert.deepEqual([entry.getUint16(16), entry.getUint16(18), entry.getUint32(24)], [channels, 16, rateField]);
   const mdhd = viewOf(dig(bytes, ["moov", "trak", "mdia", "mdhd"]));
   assert.deepEqual([mdhd.getUint32(12), mdhd.getUint32(16)], [timescale, frames.length * 1024]);
   assert.deepEqual([...dig(bytes, [...STBL, "stts"])], [...u32(0, 1, frames.length, 1024)]);
@@ -70,7 +78,8 @@ function assertM4a(result, frames, { timescale = 48000, rate = 48000, channels =
 
 function assertRefused(result, pattern, final) {
   assert.notEqual(result, null);
-  assert.equal(result.bytes, undefined);
+  // Not compared with assert.equal: a failure would print the whole M4A.
+  assert.ok(result.bytes === undefined, "the sound was taken, not refused");
   assert.match(result.refusal, pattern);
   assert.equal(result.final, final);
 }
@@ -83,9 +92,13 @@ function withIndex(made, change) {
   return { ...made, segments: made.segments.map((segment) => (segment === moov ? { ...segment, bytes } : segment)) };
 }
 
-// Where the last box of this name starts in the index (at its size field).
-function lastBox(bytes, name) {
-  return text(bytes).lastIndexOf(name) - 4;
+// Where the last box of this name starts in the index (at its size field),
+// or the one `fromEnd` boxes of that name before the end.
+function lastBox(bytes, name, fromEnd = 1) {
+  const all = text(bytes);
+  let at = all.length;
+  for (let i = 0; i < fromEnd; i += 1) at = all.lastIndexOf(name, at - 1);
+  return at - 4;
 }
 
 // --- what it takes out ----------------------------------------------------------------
@@ -151,6 +164,83 @@ test("an enabled sound track is taken before a disabled one", async () => {
   assertM4a((await take(none)).result, none.sounds[0].frames);
 });
 
+test("a track whose header is missing, or too short to say, does not count as enabled", async () => {
+  const other = someFrames(4, { seed: 9 });
+  // The first sound track's header box, the second from the end, renamed.
+  const missing = withIndex(movie({ sounds: [{ frames: other }, {}] }), (bytes) => {
+    bytes.set(ascii("free"), lastBox(bytes, "tkhd", 2) + 4);
+  });
+  assertM4a((await take(missing)).result, missing.sounds[1].frames);
+  // An empty header box: the byte where the flag would be is the next
+  // box's, the low byte of its size, and here that byte is odd.
+  const empty = movie({ sounds: [{ frames: other, tkhd: new Uint8Array(0), entry: soundEntry() }, {}] });
+  const index = empty.segments.find((segment) => segment.name === "moov").bytes;
+  assert.equal(index[lastBox(index, "mdia", 2) + 3] & 1, 1, "the fixture no longer puts an odd byte there");
+  assertM4a((await take(empty)).result, empty.sounds[1].frames);
+});
+
+test("a disabled track is not taken while another plays, though it is the only one the page could take", async () => {
+  // What plays is PCM. The AAC beside it is switched off: other sound, for
+  // all the file says.
+  const made = movie({
+    sounds: [{ entry: soundEntry({ format: "sowt", esds: null }) }, { enabled: false, frames: someFrames(4, { seed: 9 }) }],
+  });
+  const { result, file } = await take(made);
+  assertRefused(result, FORMAT, false);
+  assert.deepEqual(soundReads(file, made), []);
+});
+
+test("HE-AAC is taken, at the rate its frames count in", async () => {
+  // Named outright: type 5, the core's 24 kHz, stereo, then the 48 kHz it
+  // plays at and the LC underneath.
+  const esds = esdsPayload({ config: packed([5, 5], [6, 4], [2, 4], [3, 4], [2, 5]) });
+  const made = movie({ sounds: [{ entry: soundEntry({ esds }) }] });
+  assertM4a((await take(made)).result, made.sounds[0].frames, { esds, rate: 24000 });
+});
+
+test("a rate written out in the configuration, and one too high for the entry's field, are read", async () => {
+  // Index 15, then the rate itself in 24 bits.
+  const written = esdsPayload({ config: packed([2, 5], [15, 4], [44100, 24], [1, 4]) });
+  const one = movie({ sounds: [{ entry: soundEntry({ esds: written }) }] });
+  assertM4a((await take(one)).result, one.sounds[0].frames, { esds: written, rate: 44100, channels: 1 });
+  // 96 kHz does not fit the entry's 16 bits; the field is left at zero and
+  // the configuration says it.
+  const high = esdsPayload({ config: packed([2, 5], [0, 4], [2, 4]) });
+  const two = movie({ sounds: [{ entry: soundEntry({ esds: high }) }] });
+  assertM4a((await take(two)).result, two.sounds[0].frames, { esds: high, rate: 96000, rateField: 0 });
+});
+
+test("the optional fields of the stream's descriptor are stepped over", async () => {
+  const cases = {
+    "a stream it depends on": [0x80, [0, 1]],
+    "a URL": [0x40, [3, 0x61, 0x62, 0x63]],
+    "a clock reference": [0x20, [0, 2]],
+    "all three": [0xe0, [0, 1, 3, 0x61, 0x62, 0x63, 0, 2]],
+  };
+  for (const [name, [flags, optional]] of Object.entries(cases)) {
+    const esds = esdsPayload({ flags, optional });
+    const made = movie({ sounds: [{ entry: soundEntry({ esds }) }] });
+    const { result } = await take(made);
+    assert.equal(result.refusal, undefined, name);
+    assertM4a(result, made.sounds[0].frames, { esds });
+  }
+});
+
+test("a run of chunks begins at the chunk the index names, not one later", async () => {
+  // Eight frames end to end, in chunks of one, one, then two each.
+  const frames = someFrames(8);
+  const laid = movie({ picture: 0, sounds: [{ frames, perChunk: 1 }] });
+  const at = laid.sounds[0].ranges.map(([offset]) => offset);
+  const tables = { stsc: u32(0, 2, 1, 1, 1, 3, 2, 1), stco: u32(0, 5, at[0], at[1], at[2], at[4], at[6]) };
+  const made = movie({ picture: 0, sounds: [{ frames, perChunk: 1, tables }] });
+  assertM4a((await take(made)).result, frames);
+});
+
+test("an index that runs to the end of the file, by a size of zero, is read", async () => {
+  const made = withIndex(movie(), (bytes, view) => view.setUint32(0, 0));
+  assertM4a((await take(made)).result, made.sounds[0].frames);
+});
+
 test("frames of one size for all, as the index may say it, are cut the same", async () => {
   const frames = someFrames(6, { length: 9 });
   const made = movie({ sounds: [{ frames, tables: { stsz: u32(0, 9, 6) } }] });
@@ -182,6 +272,71 @@ test("no read through gaps is longer than MAX_SPAN_BYTES", async () => {
   const reads = soundReads(file, made);
   assert.equal(reads.length, 2);
   assert.ok(reads.every(([start, end]) => end - start <= MAX_SPAN_BYTES), JSON.stringify(reads));
+});
+
+test("no read of sound is longer than MAX_SPAN_BYTES, however the sound lies", async () => {
+  const frames = someFrames(3, { length: 1.5 * MIB });
+  const sound = concat(frames);
+  // One chunk of 4.5 MiB, then three chunks end to end: neither is one read.
+  for (const [perChunk, first] of [[3, 4 * MIB], [1, 3 * MIB]]) {
+    const made = movie({ picture: 0, sounds: [{ frames, perChunk }] });
+    const { result, file } = await take(made);
+    assert.equal(result.refusal, undefined);
+    assert.deepEqual(result.bytes.subarray(result.bytes.length - sound.length), sound);
+    const [start] = made.sounds[0].ranges[0];
+    assert.deepEqual(soundReads(file, made), [[start, start + first], [start + first, start + sound.length]]);
+  }
+});
+
+test("pieces that overlap are read once, and each is cut from that read", async () => {
+  // Four frames, three in the first chunk. The second chunk is said to
+  // begin one byte into the first, so its frame is a cut of those bytes.
+  const frames = someFrames(4);
+  const laid = movie({ sounds: [{ frames }] });
+  const [[first, length]] = laid.sounds[0].ranges;
+  const made = movie({ sounds: [{ frames, tables: { stco: u32(0, 2, first, first + 1) } }] });
+  const { result, file } = await take(made);
+  const cut = concat(frames.slice(0, 3)).subarray(1, 1 + frames[3].length);
+  assertM4a(result, [frames[0], frames[1], frames[2], cut]);
+  assert.deepEqual(soundReads(file, made), [[first, first + length]]);
+});
+
+test("sound the index names in two places, turn about, is read once for each place", async () => {
+  // Read in the order it plays, this would be a read for every frame, and
+  // an index can name 262,144 of them in a file of a megabyte.
+  const frames = someFrames(2000, { length: 1 });
+  const laid = movie({ picture: 100 * 1024, sounds: [{ frames, perChunk: 1 }] });
+  const [first, second] = laid.sounds[0].ranges.map(([at]) => at);
+  const offsets = frames.map((_, i) => (i % 2 === 0 ? first : second));
+  const made = movie({
+    picture: 100 * 1024, sounds: [{ frames, perChunk: 1, tables: { stco: u32(0, offsets.length, ...offsets) } }],
+  });
+  const { result, file } = await take(made);
+  assertM4a(result, frames.map((_, i) => frames[i % 2]));
+  assert.deepEqual(soundReads(file, made), [[first, first + 1], [second, second + 1]]);
+});
+
+test("sound in more pieces than MAX_SOUND_READS reads can fetch is refused before any is read", async () => {
+  assert.equal(MAX_SOUND_READS, 65536);
+  // A byte of sound after every stretch of picture too wide to read
+  // through: a file of over 4 GB. The length limit is out of the way.
+  const limits = { maxBytes: 64 * MIB, maxSeconds: 6000 };
+  const lay = (count) => {
+    const made = movie({
+      picture: MAX_GAP_BYTES + 1,
+      sounds: [{ frames: someFrames(count, { length: 1 }), perChunk: 1, co64: true }],
+    });
+    // The sound itself is left as holes: what is counted is the reads.
+    const file = fileOf(made.segments.filter((segment) => segment.name !== "sound"), made.size);
+    return { made, file };
+  };
+  const over = lay(MAX_SOUND_READS + 1);
+  assertRefused(await movieAudio(over.file, limits), UNREADABLE, false);
+  assert.deepEqual(soundReads(over.file, over.made), []);
+  const at = lay(MAX_SOUND_READS);
+  const taken = await movieAudio(at.file, limits);
+  assert.equal(taken.refusal, undefined);
+  assert.equal(soundReads(at.file, at.made).length, MAX_SOUND_READS);
 });
 
 test("pieces that play in another order than they lie in the file are still each read right", async () => {
@@ -251,7 +406,19 @@ test("sound that is not AAC is refused, and the whole file is still worth a try"
     "an unknown version": soundEntry({ version: 3 }),
     "a configuration cut short": soundEntry({ esds: esdsPayload({ config: [0x11] }) }),
     "no configuration": soundEntry({ esds: esdsPayload({ config: [] }) }),
+    // Version and flags, then: nothing that is a stream descriptor; one of
+    // an ID and flags alone; one whose decoder descriptor ends after its
+    // thirteen fixed bytes.
+    "no stream descriptor": soundEntry({ esds: Uint8Array.from([0, 0, 0, 0, 0x04, 1, 0]) }),
+    "no decoder descriptor": soundEntry({ esds: Uint8Array.from([0, 0, 0, 0, 0x03, 3, 0, 0, 0]) }),
+    "no configuration descriptor": soundEntry({
+      esds: Uint8Array.from([0, 0, 0, 0, 0x03, 18, 0, 0, 0, 0x04, 13, 0x40, 0x15, 0, 0, 0, 0, 1, 0xf4, 0, 0, 1, 0xf4, 0]),
+    }),
     "a reserved rate": soundEntry({ esds: esdsPayload({ config: [0x16, 0x90] }) }),
+    // Kinds of AAC with shorter frames, which the length check does not
+    // count right: low-delay, and xHE-AAC behind the escape to a longer type.
+    "low-delay AAC": soundEntry({ esds: esdsPayload({ config: packed([23, 5], [3, 4], [2, 4]) }) }),
+    "xHE-AAC": soundEntry({ esds: esdsPayload({ config: packed([31, 5], [10, 6], [3, 4], [2, 4]) }) }),
   };
   for (const [name, entry] of Object.entries(entries)) {
     const made = movie({ sounds: [{ entry }] });
@@ -261,6 +428,11 @@ test("sound that is not AAC is refused, and the whole file is still worth a try"
     assert.equal(result.final, false, name);
     assert.deepEqual(soundReads(file, made), [], name);
   }
+});
+
+test("a sound track with no sample description box is a format refusal", async () => {
+  const made = withIndex(movie(), (bytes) => bytes.set(ascii("free"), lastBox(bytes, "stsd") + 4));
+  assertRefused((await take(made)).result, FORMAT, false);
 });
 
 test("a sample description that claims to run past its box is not followed there", async () => {
@@ -286,11 +458,29 @@ test("a sample description box that holds none, or is too short to say, is a for
   assertRefused((await take(last)).result, FORMAT, false);
 });
 
-test("a track whose frames are in fragments is refused as a format", async () => {
-  const made = movie({ sounds: [{ tables: { stts: u32(0, 0), stsz: u32(0, 0, 0) } }] });
+test("a track whose frames are in fragments is refused as that", async () => {
+  const empty = { stts: u32(0, 0), stsz: u32(0, 0, 0) };
+  // The box that says the movie has fragments, after the tracks.
+  const made = movie({ tail: box("mvex", box("trex", new Uint8Array(24))), sounds: [{ tables: empty }] });
   const { result, file } = await take(made);
-  assertRefused(result, FORMAT, false);
+  assertRefused(result, /stored in fragments/, false);
   assert.deepEqual(soundReads(file, made), []);
+  // No frames and no word of fragments: a format this does not read.
+  assertRefused((await take(movie({ sounds: [{ tables: empty }] }))).result, FORMAT, false);
+});
+
+test("a decoder configuration longer than MAX_CONFIG_BYTES is not copied", async () => {
+  assert.equal(MAX_CONFIG_BYTES, 256);
+  // The real configuration, with nothing after it up to the length.
+  const padded = (length) => {
+    const esds = new Uint8Array(length);
+    esds.set(esdsPayload());
+    return esds;
+  };
+  const at = movie({ sounds: [{ entry: soundEntry({ esds: padded(MAX_CONFIG_BYTES) }) }] });
+  assertM4a((await take(at)).result, at.sounds[0].frames, { esds: padded(MAX_CONFIG_BYTES) });
+  const over = movie({ sounds: [{ entry: soundEntry({ esds: padded(MAX_CONFIG_BYTES + 1) }) }] });
+  assertRefused((await take(over)).result, FORMAT, false);
 });
 
 test("a video longer than the limit is refused by its index, before its sound is read", async () => {
@@ -305,18 +495,34 @@ test("a video longer than the limit is refused by its index, before its sound is
   assertRefused((await take(at)).result, UNREADABLE, false);
 });
 
-test("sound over the byte cap is refused by its index, before any of it is read", async () => {
+test("frames that play longer than the limit are refused, whatever the index says of their length", async () => {
+  // Durations of nothing: by the index's account the sound is no time at
+  // all. A frame is at least 960 samples, so 30,000 at 48 kHz are 600 s.
+  const lying = (count) => movie({ sounds: [{ tables: { stts: u32(0, 1, count, 0) } }] });
+  const over = lying(30001);
+  const { result, file } = await take(over);
+  assertRefused(result, /longer than 10 minutes/, true);
+  assert.deepEqual(soundReads(file, over), []);
+  // Exactly the limit passes this check, and fails a later one as above.
+  assertRefused((await take(lying(30000))).result, UNREADABLE, false);
+});
+
+test("an M4A over the byte cap is refused by the index, before any sound is read", async () => {
   const made = movie();
   const total = concat(made.sounds[0].frames).length;
-  const over = await take(made, { limits: { maxBytes: total - 1, maxSeconds: 600 } });
+  // The cap is on what the decoder is handed: the sound and the header
+  // built around it.
+  const whole = (await take(made)).result.bytes.length;
+  assert.ok(whole > total);
+  const over = await take(made, { limits: { maxBytes: whole - 1, maxSeconds: 600 } });
   assertRefused(over.result, /sound is larger than/, true);
   assert.deepEqual(soundReads(over.file, made), []);
-  assertM4a((await take(made, { limits: { maxBytes: total, maxSeconds: 600 } })).result, made.sounds[0].frames);
+  assertM4a((await take(made, { limits: { maxBytes: whole, maxSeconds: 600 } })).result, made.sounds[0].frames);
 
-  // With the page's own cap: frames that claim 12 MiB each, three to a
-  // chunk, so the second chunk passes it, in a file large enough that both
-  // chunks lie inside it.
-  const huge = movie({ picture: GIB, sounds: [{ tables: { stsz: u32(0, 12 * MIB, 7) } }] });
+  // With the page's own cap: six frames that claim 12 MiB each, three to a
+  // chunk, in a file large enough that both chunks lie inside it.
+  const sizes = [...Array(6).fill(12 * MIB), 1];
+  const huge = movie({ picture: GIB, sounds: [{ tables: { stsz: u32(0, 0, 7, ...sizes) } }] });
   const refused = await take(huge);
   assertRefused(refused.result, /sound is larger than 64 MB/, true);
   assert.deepEqual(soundReads(refused.file, huge), []);
@@ -366,8 +572,60 @@ test("a 64-bit size cut off by the end of the file ends the walk", async () => {
 
 test("a box inside the index that claims to run past its parent is not followed", async () => {
   const made = withIndex(movie(), (bytes, view) => view.setUint32(lastBox(bytes, "mdia"), 0x7ffffff0));
-  // The sound track's media box is gone with it, so no sound track is left.
-  assertRefused((await take(made)).result, /has no sound/, true);
+  // The sound track's media box is gone with it. No sound track is left,
+  // but one track could not be looked at, so the file is not called
+  // soundless: the whole of it is still worth a try.
+  assertRefused((await take(made)).result, UNREADABLE, false);
+});
+
+test("a sound track the index cannot show is not taken for a movie without sound", async () => {
+  const cases = {
+    "its tables are missing": (bytes) => bytes.set(ascii("free"), lastBox(bytes, "stbl") + 4),
+    "its clock is missing": (bytes) => bytes.set(ascii("free"), lastBox(bytes, "mdhd") + 4),
+    // The handler box of the track's media, not the data handler after it.
+    "what it is, is missing": (bytes) => bytes.set(ascii("free"), lastBox(bytes, "hdlr", 2) + 4),
+  };
+  for (const [name, change] of Object.entries(cases)) {
+    const { result } = await take(withIndex(movie(), change));
+    assert.notEqual(result, null, name);
+    assert.match(result.refusal, UNREADABLE, name);
+    assert.equal(result.final, false, name);
+  }
+});
+
+test("a track too short to say what it is does not borrow the bytes after it", async () => {
+  // An audio file, which is left to the decoder. Its last track's handler
+  // box ends before the kind, and the bytes after it spell a picture's.
+  const short = box("trak", box("mdia", box("hdlr", u32(0), ascii("mhlr"))));
+  const made = movie({
+    brand: "M4A ", picture: 0, sounds: [{ entry: soundEntry() }], tail: concat([short, ascii("vide"), u32(0)]),
+  });
+  assert.equal((await take(made)).result, null);
+});
+
+test("a 64-bit size in the last bytes of the index is not read past them", async () => {
+  // A size of 1 promises eight more bytes of size, and the index ends.
+  const made = movie({ tail: concat([u32(1), ascii("free")]) });
+  assertM4a((await take(made)).result, made.sounds[0].frames);
+});
+
+test("a few bytes left over at the end of the index, too few for a box, are not read as one", async () => {
+  const made = movie({ tail: new Uint8Array(3) });
+  assertM4a((await take(made)).result, made.sounds[0].frames);
+});
+
+test("a stream descriptor that promises a URL, at the very end of the index, is not read past it", async () => {
+  // Version and flags, then a descriptor of an ID and the URL flag alone.
+  const esds = Uint8Array.from([0, 0, 0, 0, 0x03, 3, 0, 0, 0x40]);
+  const made = movie({ tail: false, sounds: [{ entry: soundEntry({ esds }), entryLast: true }] });
+  assertRefused((await take(made)).result, FORMAT, false);
+});
+
+test("a sample description too short to say its version, at the very end of the index, is a format refusal", async () => {
+  // Sixteen bytes: size, type, six reserved, the data reference. No more.
+  const stsd = concat([u32(0, 1), u32(16), ascii("mp4a"), u16(0, 0, 0, 1)]);
+  const made = movie({ tail: false, sounds: [{ entryLast: true, tables: { stsd } }] });
+  assertRefused((await take(made)).result, FORMAT, false);
 });
 
 test("a 64-bit size inside the index is followed only when it is a real one", async () => {
@@ -378,9 +636,9 @@ test("a 64-bit size inside the index is followed only when it is a real one", as
   const real = sized(0, 108);
   assertM4a((await take(real)).result, real.sounds[0].frames);
   // A high word, or a size under the header's own: the walk ends there,
-  // before any track.
-  assertRefused((await take(sized(1, 108))).result, /has no sound/, true);
-  assertRefused((await take(sized(0, 0))).result, /has no sound/, true);
+  // before any track, and what it never saw is not called soundless.
+  assertRefused((await take(sized(1, 108))).result, UNREADABLE, false);
+  assertRefused((await take(sized(0, 0))).result, UNREADABLE, false);
 });
 
 test("an index that claims to run past the end of the file is not read", async () => {
@@ -399,20 +657,24 @@ test("only the first 32 tracks are looked at", async () => {
   // The picture, the metadata tracks, then the sound.
   const within = movie({ extraTracks: 30 });
   assertM4a((await take(within)).result, within.sounds[0].frames);
-  assertRefused((await take(movie({ extraTracks: 31 }))).result, /has no sound/, true);
+  // Past them the sound was never looked at, which is not "no sound".
+  assertRefused((await take(movie({ extraTracks: 31 }))).result, UNREADABLE, false);
 });
 
-test("more frames than MAX_AUDIO_FRAMES are refused, however short the index says they play", async () => {
+test("more frames than MAX_AUDIO_FRAMES are refused, however short they are said to play", async () => {
   assert.equal(MAX_AUDIO_FRAMES, 262144);
+  // The length limit is out of the way: at 48 kHz it would refuse these
+  // frames first. A stream that claims a rate in the megahertz gets here.
+  const limits = { maxBytes: 64 * MIB, maxSeconds: 6000 };
   const tables = (count) => ({ stts: u32(0, 1, count, 1), stsz: u32(0, 1, count), stsc: u32(0, 1, 1, count, 1) });
   const over = movie({ sounds: [{ frames: someFrames(1, { length: MAX_AUDIO_FRAMES + 1 }), perChunk: 1,
     tables: tables(MAX_AUDIO_FRAMES + 1) }] });
-  const { result, file } = await take(over);
+  const { result, file } = await take(over, { limits });
   assertRefused(result, UNREADABLE, false);
   assert.deepEqual(soundReads(file, over), []);
   const at = movie({ sounds: [{ frames: someFrames(1, { length: MAX_AUDIO_FRAMES }), perChunk: 1,
     tables: tables(MAX_AUDIO_FRAMES) }] });
-  const taken = (await take(at)).result;
+  const taken = (await take(at, { limits })).result;
   assert.equal(taken.refusal, undefined);
   assert.deepEqual(taken.bytes.subarray(taken.bytes.length - MAX_AUDIO_FRAMES), at.sounds[0].frames[0]);
 });
@@ -443,16 +705,19 @@ test("a table too short to hold its own count, at the very end of the index, is 
 
 test("tables that disagree, or claim more than their boxes hold, are refused unread", async () => {
   const laid = movie();
-  const [first, second] = laid.sounds[0].ranges.map(([at]) => at);
+  const [first, second, third] = laid.sounds[0].ranges.map(([at]) => at);
   const sizes = laid.sounds[0].frames.map((frame) => frame.length);
   const cases = {
     "stts claims more runs than it holds": { stts: u32(0, 1000, 7, 1024) },
+    "stts has a run of no frames": { stts: u32(0, 2, 7, 1024, 0, 1024) },
     "stsz counts another number of frames than stts": { stsz: u32(0, 0, 8, ...sizes, 5) },
     "stsz is cut short": { stsz: u32(0, 0, 7, ...sizes.slice(0, 6)) },
     // A run's worth of bytes follows the zero, for a reader that never asked.
     "stsc counts no runs": { stsc: u32(0, 0, 1, 3, 1) },
     "stsc claims more runs than it holds": { stsc: u32(0, 5, 1, 3, 1) },
     "stsc names a second sample description": { stsc: u32(0, 1, 1, 3, 2) },
+    // An empty chunk first, then the track's three as they are.
+    "a chunk that holds no frame": { stsc: u32(0, 3, 1, 0, 1, 2, 3, 1, 4, 1, 1), stco: u32(0, 4, first, first, second, third) },
     "the chunks hold fewer frames than the track has": { stsc: u32(0, 1, 1, 2, 1) },
     "fewer chunks than the frames need": { stco: u32(0, 2, first, second) },
     "stco claims more chunks than it holds": { stco: u32(0, 3, first, second) },
@@ -499,7 +764,7 @@ test("an index with bytes changed at random never throws, and never reads outsid
       outcomes.none += 1;
     } else if (result.bytes !== undefined) {
       outcomes.sound += 1;
-      assert.ok(result.bytes.length <= limits.maxBytes + 4096, `round ${round}`);
+      assert.ok(result.bytes.length <= limits.maxBytes, `round ${round}`);
     } else {
       outcomes.refused += 1;
       assert.equal(typeof result.refusal, "string");

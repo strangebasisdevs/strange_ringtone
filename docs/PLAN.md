@@ -177,6 +177,12 @@ Library, where picking a `.mov` ended in "could not be read as audio".
    can be picked.
 3. The picker and the hint under it name videos, in every browser
    (section 7.1).
+4. Only sound that plays is taken (2026-11-25, after the review below): a
+   disabled track is not used while another track is enabled, because it can
+   be other sound altogether, a commentary or another language. The cost: a
+   video over 64 MiB whose playing track is not AAC is refused even when it
+   carries an AAC copy switched off. Whether an iPhone's spatial-audio
+   recording is laid out that way is not known.
 
 **How** (`core/static/audio/movie.js`, dependency-free like the rest of the
 page).
@@ -187,28 +193,45 @@ untouched, into an audio-only M4A in memory, and `decodeAudioData` gets that.
   track, or a QuickTime file (brand `qt  `, or no `ftyp` at all). It is told
   by content, never by name or type. An audio file of that family (an
   `.m4a`) goes to the decoder whole, as before.
-- The page walks the file's top-level boxes to the index (`moov`), reads the
-  index whole, and takes the first enabled sound track whose sample
+- The page walks the file's top-level boxes to the index (`moov`) and reads
+  the index whole. Of the sound tracks that play (the enabled ones, or all
+  of them in a file that enables none) it takes the first whose sample
   description is `mp4a` with an AAC `esds`, directly or inside QuickTime's
-  `wave` box (sound description versions 0, 1 and 2). An encrypted entry
-  (`enca`) is not taken: its frames are ciphertext.
+  `wave` box (sound description versions 0, 1 and 2). AAC here is Main, LC,
+  SSR, LTP and HE-AAC (audio object types 1 to 5 and 29), whose frames hold
+  1024 samples or 960. An encrypted entry (`enca`) is not taken: its frames
+  are ciphertext.
 - From the track's tables (`stts`, `stsz`, `stsc`, `stco` or `co64`) it works
   out where each frame lies. A video over 10 minutes is refused from the
-  index alone, and so is sound over 64 MiB, both before any sound is read.
-- It reads the frames by byte range. Two pieces of sound at most 64 KiB
-  apart come in one read, which is never longer than 4 MiB, and the picture
-  in between is dropped at once: an MP4 that alternates sound and picture
-  with every video frame would otherwise cost tens of thousands of reads. In
-  a phone's movie the pieces lie megabytes apart, and the picture is not
-  read at all.
+  index, before any sound is read, on two counts: the durations the index
+  states, and the frames it lists, each at least 960 samples at the stream's
+  own rate. The second is what the decoder goes by, so an index that
+  understates its durations gets at most 10 minutes 40 seconds decoded
+  before `decode.js` refuses it by the decoded length. An M4A that would
+  pass 64 MiB, header included, is refused before any sound is read too.
+- It reads the frames by byte range, in the order they lie in the file and
+  not the order they play in. Two pieces of sound at most 64 KiB apart come
+  in one read, the picture in between is dropped at once, and no read is
+  longer than 4 MiB (a longer piece is read in parts): an MP4 that
+  alternates sound and picture with every video frame would otherwise cost
+  tens of thousands of reads. In a phone's movie the pieces lie megabytes
+  apart, and the picture is not read at all. Because the reads go by place,
+  an index that names the same places over and over costs one read for each
+  place: about one read for every 64 KiB of the file at the most, and never
+  more than 65,536.
 - The M4A is the plainest there is: `ftyp` `M4A `, one track, one chunk, the
-  source's `esds` byte for byte, and its frame sizes and durations.
+  source's `esds` byte for byte (at most 256 bytes), and its frame sizes
+  and durations (every run of durations counts at least one frame).
 
-**When the sound cannot be taken out** (it is not AAC, the frames are in
-fragments, or the index is damaged), or the decoder refuses the M4A, a video
-within 64 MiB is handed to the decoder whole, so a browser that reads such a
-file today still does. Over 64 MiB it is refused with the reason. A video
-with no sound track, or one that is too long, is refused either way.
+**When the sound cannot be taken out** (it is not AAC of those kinds, the
+track that plays is another codec, the frames are in fragments, or the index
+is damaged), or the decoder refuses the M4A, a video within 64 MiB is handed
+to the decoder whole, so a browser that reads such a file today still does.
+Over 64 MiB it is refused with the reason. A video that is too long is
+refused either way, and so is one with no sound track, provided every track
+could be looked at: where the index breaks off, a track does not say what it
+is, or there are more than 32, the sound may be in what was not seen, and
+the refusal is "could not be read", which leaves the whole file its try.
 
 **Bounds.** Every number in the index is checked against the box it is in
 and against the file before it is used as an offset, a length or a count.
@@ -219,8 +242,11 @@ and against the file before it is used as an offset, a length or a count.
 | Index read (`MAX_INDEX_BYTES`) | 16 MiB, refused before it is read |
 | Tracks looked at | 32 |
 | Audio frames taken (`MAX_AUDIO_FRAMES`) | 262,144 (ten minutes at 96 kHz is 56,250) |
-| Sound | 10 minutes and 64 MiB, the page's own limits |
-| One read through gaps | 4 MiB, over gaps of at most 64 KiB |
+| Length | 10 minutes, by the stated durations and by the frame count |
+| The M4A handed to the decoder | 64 MiB, header included |
+| Decoder configuration copied (`MAX_CONFIG_BYTES`) | 256 bytes |
+| One read of sound (`MAX_SPAN_BYTES`) | 4 MiB, through gaps of at most 64 KiB (`MAX_GAP_BYTES`) |
+| Reads of sound (`MAX_SOUND_READS`) | 65,536, refused before the first |
 
 What "before reading" now means: of any picked file the page reads the first
 16 bytes, and of a file of the MP4 family the index, before the 64 MiB cap
@@ -232,11 +258,27 @@ bytes were asked for. Each bound has a test that fails when the check is
 removed, and one test changes index bytes at random and requires that
 nothing throws and no read leaves the file.
 
+**Reviewed on 2026-11-24**, by a second session that read the change cold
+and attacked it with files of its own. It found no way past the caps and no
+read outside the file. What it did find, all changed the next day:
+
+- Reads were bounded only by the frame count: a crafted file of under 2 MB
+  cost 262,149 reads, 41 seconds in Chromium. They now go by place.
+- The cap counted the sound and not the header, which could carry 16 MiB
+  copied from the index.
+- The 10-minute refusal believed the durations the index stated.
+- Four bounds checks had no test, a disabled AAC track was taken over a
+  playing track of another codec (decision 4), and a damaged index could
+  end in "This video has no sound", which is final.
+
 **Accepted.**
 
-- Only AAC is taken out. PCM, Apple Lossless, AC-3, a spatial-audio track on
-  its own and fragmented MP4 are left to the browser's decoder, within
-  64 MiB. Each could be added the same way.
+- Only AAC is taken out, and of AAC not the low-delay kinds or xHE-AAC.
+  Those, PCM, Apple Lossless, AC-3, a spatial-audio track on its own and
+  fragmented MP4 are left to the browser's decoder, within 64 MiB. Each
+  could be added the same way.
+- The hint names MP4 and MOV videos. Any other video (WebM, Matroska) is
+  still measured whole against the 64 MiB, like an audio file.
 - The track's edit list is not carried over, so the sound can begin with
   the encoder's lead-in, about 20 to 45 ms that a video player skips. For a
   clip the user trims by ear it does not matter.
@@ -1642,7 +1684,8 @@ yt-dlp's info JSON and the media server's bytes:
   also names `video/*`, on purpose: a video is picked for its sound (section
   4.1), and the iPhone's "Photo Library" entry no longer rests on that bug
   alone. The field's label is "Audio or video file", and the hint under it
-  says the 64 MB is of audio. The list only filters the
+  names MP4 and MOV videos and says the 64 MB is of audio. The list only
+  filters the
   picker. The page decodes by content and refuses what it cannot decode.
 - Buttons: **Hear final**, **Get on this iPhone**, and **Download .m4r**.
 

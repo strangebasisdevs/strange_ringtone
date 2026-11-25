@@ -9,7 +9,9 @@
 // sound and picture alternate every few kilobytes, as in most MP4s, a read
 // runs on through the picture between two pieces of sound (MAX_GAP_BYTES,
 // MAX_SPAN_BYTES) and drops it at once; in a phone's movie the pieces lie
-// megabytes apart, and the picture is not read at all.
+// megabytes apart, and the picture is not read at all. The reads go by where
+// the sound lies in the file, not by the order it plays in, so the file's own
+// size bounds how many there are, whatever order the index names.
 //
 // Nothing here decodes audio: the frames pass through untouched, and the
 // browser's decoder still judges them. Every number below comes from the
@@ -25,8 +27,9 @@ export const MAX_INDEX_BYTES = 16 * 1024 * 1024;
 
 /**
  * The most audio frames taken from one track. Ten minutes of AAC at 96 kHz
- * is 56,250 frames, so nothing the length limit lets through comes near it;
- * it bounds the tables built from a file whose index lies about its length.
+ * is 56,250 frames, and the length check counts frames, so only a stream
+ * that claims a rate far above any real one comes near this. It bounds the
+ * tables built from the index however the stream describes itself.
  */
 export const MAX_AUDIO_FRAMES = 262144;
 
@@ -46,11 +49,26 @@ export const MAX_TOP_BOXES = 64;
 export const MAX_GAP_BYTES = 64 * 1024;
 
 /**
- * The most one such read takes, gaps included, so that the picture passing
- * through never adds more than this to what the page holds. A single piece
- * of sound larger than this is still read in one go.
+ * The most one read of sound takes, gaps included, so that a read never adds
+ * more than this to what the page holds beside the M4A it is filling. A
+ * piece of sound longer than this is read in parts.
  */
 export const MAX_SPAN_BYTES = 4 * 1024 * 1024;
+
+/**
+ * The most reads of sound. Ten minutes of AAC at 96 kHz with every frame a
+ * piece of its own, picture all around it, is under 60,000. Pieces closer
+ * than MAX_GAP_BYTES share a read, so a file that needs more than this is
+ * gigabytes of pieces set apart on purpose.
+ */
+export const MAX_SOUND_READS = 65536;
+
+/**
+ * The longest decoder configuration (the content of the esds box) taken. It
+ * goes into the M4A byte for byte, so it is held to a size; a real one is
+ * about 50 bytes.
+ */
+export const MAX_CONFIG_BYTES = 256;
 
 // The most tracks looked at. A phone's movie has under ten.
 const MAX_TRACKS = 32;
@@ -62,6 +80,13 @@ const FIRST_BOXES = new Set(["ftyp", "moov", "mdat", "free", "skip", "wide", "pn
 // The esds object types that are AAC: MPEG-4 Audio, and MPEG-2 AAC Main, LC
 // and SSR. An "mp4a" entry can also hold MP3, which an M4A must not.
 const AAC_OBJECT_TYPES = new Set([0x40, 0x66, 0x67, 0x68]);
+// The kinds of AAC taken, by the audio object type in the stream's own
+// configuration: Main, LC, SSR, LTP, and the two names HE-AAC goes by. Each
+// of their frames holds 1024 samples, or 960, which the length check counts
+// on. The low-delay kinds and xHE-AAC have shorter frames and are left to
+// the decoder with the whole file.
+const AAC_AUDIO_TYPES = new Set([1, 2, 3, 4, 5, 29]);
+const MIN_FRAME_SAMPLES = 960;
 const SAMPLE_RATES = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350];
 // Channels for each AAC channel configuration; 0 leaves it to the stream.
 const CHANNELS = [2, 1, 2, 3, 4, 5, 6, 8];
@@ -69,6 +94,8 @@ const CHANNELS = [2, 1, 2, 3, 4, 5, 6, 8];
 const NO_SOUND = "This video has no sound.";
 const FORMAT = "This video's sound is in a format this page cannot take out of a video. "
   + "Convert the video to MP4 with AAC sound, or save its sound as an M4A or MP3, then pick that.";
+const FRAGMENTS = "This video is stored in fragments, which this page cannot take sound out of. "
+  + "Save it again as an ordinary MP4 or MOV, or save its sound as an M4A or MP3, then pick that.";
 const UNREADABLE = "This video could not be read. It may be damaged or cut short. Try another file.";
 const INDEX_TOO_LARGE = "This file's index is too large for this page to read. Trim the file first, then pick it again.";
 
@@ -141,24 +168,32 @@ async function findIndex(file, size) {
 }
 
 /**
- * The boxes in bytes [start, end), one after another. Stops, without
- * complaint, at the first one that does not fit: what the caller needs is
- * then missing, and that is what it reports.
+ * The boxes in bytes [start, end), one after another. Stops at the first one
+ * that does not fit: what the caller needs is then missing, and that is what
+ * it reports. A caller that must know whether it saw every box passes
+ * `walk`, whose `broken` is set when the walk stopped that way.
  */
-function* boxes(bytes, view, start, end) {
+function* boxes(bytes, view, start, end, walk = null) {
   let at = start;
   while (end - at >= 8) {
     let length = view.getUint32(at);
     let header = 8;
+    let fits = true;
     if (length === 1) {
-      // Inside an index of at most MAX_INDEX_BYTES the high word is zero.
-      if (end - at < HEADER_BYTES || view.getUint32(at + 8) !== 0) return;
-      length = view.getUint32(at + 12);
-      header = HEADER_BYTES;
+      // A 64-bit size needs its sixteen bytes to be there, and inside an
+      // index of at most MAX_INDEX_BYTES its high word is zero.
+      fits = end - at >= HEADER_BYTES && view.getUint32(at + 8) === 0;
+      if (fits) {
+        length = view.getUint32(at + 12);
+        header = HEADER_BYTES;
+      }
     } else if (length === 0) {
       length = end - at;
     }
-    if (length < header || length > end - at) return;
+    if (!fits || length < header || length > end - at) {
+      if (walk !== null) walk.broken = true;
+      return;
+    }
     yield { type: fourcc(bytes, at + 4), start: at + header, end: at + length };
     at += length;
   }
@@ -172,13 +207,14 @@ function child(bytes, view, parent, type) {
 }
 
 // One MPEG-4 descriptor at `at`: a tag, a length of up to four 7-bit bytes,
-// and that much content.
+// and that much content. Null for one that does not lie inside [at, end).
+// That takes the one check at the bottom: a tag at or past `end`, or a
+// length cut off by it, leaves the content starting past `end`, whatever
+// the bytes read there were (past the index they read as nothing).
 function descriptor(bytes, at, end) {
-  if (at >= end) return null;
   let size = 0;
   let pos = at + 1;
   for (let i = 0; i < 4; i += 1) {
-    if (pos >= end) return null;
     const byte = bytes[pos];
     pos += 1;
     size = size * 128 + (byte & 0x7f);
@@ -200,24 +236,30 @@ function findDescriptor(bytes, start, end, tag) {
 
 /**
  * The sample rate and channel count an esds box declares, or null when it
- * is not AAC with a readable configuration.
+ * is not AAC of a kind taken (AAC_AUDIO_TYPES) with a readable configuration.
+ * For HE-AAC the rate is the core's, which is the one its frames count in.
  */
 function audioConfig(bytes, start, end) {
   // Version and flags, then the ES descriptor: an ID, a flags byte and the
   // optional fields those flags announce, then the decoder's configuration.
+  // A descriptor too short for what is read from it sends the search for the
+  // next one past its end, where descriptor() finds nothing.
   const es = findDescriptor(bytes, start + 4, end, 0x03);
-  if (es === null || es.end - es.start < 3) return null;
+  if (es === null) return null;
   const flags = bytes[es.start + 2];
   let at = es.start + 3;
   if (flags & 0x80) at += 2;
   if (flags & 0x40) {
+    // The URL's length is a byte of the file. Past the index there is none,
+    // and the place to go on from would not be a number at all.
     if (at >= es.end) return null;
     at += 1 + bytes[at];
   }
   if (flags & 0x20) at += 2;
   const decoder = findDescriptor(bytes, at, es.end, 0x04);
-  if (decoder === null || decoder.end - decoder.start < 13) return null;
+  if (decoder === null) return null;
   if (!AAC_OBJECT_TYPES.has(bytes[decoder.start])) return null;
+  // Thirteen bytes of type, buffer size and bitrates come first.
   const info = findDescriptor(bytes, decoder.start + 13, decoder.end, 0x05);
   if (info === null) return null;
 
@@ -232,12 +274,14 @@ function audioConfig(bytes, start, end) {
     }
     return value;
   };
-  if (bits(5) === 31 && bits(6) < 0) return null;
+  // An escape to a longer type (31) names none of the kinds taken.
+  if (!AAC_AUDIO_TYPES.has(bits(5))) return null;
   const rateIndex = bits(4);
   const rate = rateIndex === 15 ? bits(24) : SAMPLE_RATES[rateIndex];
-  const layout = bits(4);
-  if (rate === undefined || !(rate > 0) || layout < 0) return null;
-  return { rate, channels: layout < CHANNELS.length ? CHANNELS[layout] : 2 };
+  // A reserved index has no rate, and bits that ran out are -1. Whole bytes
+  // that held the rate hold the four bits of the layout too.
+  if (!(rate > 0)) return null;
+  return { rate, channels: CHANNELS[bits(4)] ?? 2 };
 }
 
 /**
@@ -264,41 +308,62 @@ function soundEntry(bytes, view, stbl) {
     if (box.type === "wave") esds = child(bytes, view, box, "esds");
     if (esds !== null) break;
   }
-  if (esds === null) return null;
+  if (esds === null || esds.end - esds.start > MAX_CONFIG_BYTES) return null;
   const config = audioConfig(bytes, esds.start, esds.end);
   return config === null ? null : { esds: bytes.subarray(esds.start, esds.end), ...config };
 }
 
 /**
- * The index's tracks: whether one is a picture, and the sound tracks in the
- * order to try them.
+ * The index's tracks.
+ * @returns {{video: boolean, sounds: object[], partial: boolean, fragments: boolean}}
+ *   whether one is a picture; the sound tracks that play, in the file's
+ *   order; whether some track could not be looked at, so that "no sound
+ *   track" is not known for sure; and whether the movie keeps frames in
+ *   fragments
  */
 function readTracks(bytes, view) {
   let video = false;
+  let fragments = false;
+  let partial = false;
   let count = 0;
+  const walk = { broken: false };
   const sounds = [];
-  for (const trak of boxes(bytes, view, 0, bytes.length)) {
-    if (trak.type !== "trak") continue;
+  for (const top of boxes(bytes, view, 0, bytes.length, walk)) {
+    if (top.type === "mvex") fragments = true;
+    if (top.type !== "trak") continue;
     count += 1;
-    if (count > MAX_TRACKS) break;
-    const mdia = child(bytes, view, trak, "mdia");
+    if (count > MAX_TRACKS) {
+      partial = true;
+      break;
+    }
+    const mdia = child(bytes, view, top, "mdia");
     const hdlr = mdia === null ? null : child(bytes, view, mdia, "hdlr");
-    if (hdlr === null || hdlr.end - hdlr.start < 12) continue;
+    // A track that does not say what it is may be the sound.
+    if (hdlr === null || hdlr.end - hdlr.start < 12) {
+      partial = true;
+      continue;
+    }
     const kind = fourcc(bytes, hdlr.start + 8);
     if (kind === "vide") video = true;
     if (kind !== "soun") continue;
     const minf = child(bytes, view, mdia, "minf");
     const stbl = minf === null ? null : child(bytes, view, minf, "stbl");
     const mdhd = child(bytes, view, mdia, "mdhd");
-    if (stbl === null || mdhd === null) continue;
-    const tkhd = child(bytes, view, trak, "tkhd");
-    // The low flag bit is "enabled". A movie with spatial audio carries a
-    // stereo track for everyone else, and marks which one plays.
+    if (stbl === null || mdhd === null) {
+      partial = true;
+      continue;
+    }
+    const tkhd = child(bytes, view, top, "tkhd");
+    // The low flag bit is "enabled".
     const enabled = tkhd !== null && tkhd.end - tkhd.start >= 4 && (bytes[tkhd.start + 3] & 1) === 1;
     sounds.push({ enabled, mdhd, stbl });
   }
-  sounds.sort((a, b) => Number(b.enabled) - Number(a.enabled));
-  return { video, sounds };
+  // What plays is what is enabled, and only that is taken (the owner's
+  // decision, 2026-11-25): a disabled track can be other sound altogether,
+  // a commentary or another language. A file that enables no sound track
+  // plays its first.
+  const playing = sounds.filter((track) => track.enabled);
+  return { video, sounds: playing.length > 0 ? playing : sounds, partial: partial || walk.broken, fragments };
 }
 
 /**
@@ -315,11 +380,13 @@ function entryCount(view, table, width) {
 
 /**
  * Where a track's frames are in the file, from its sample tables.
+ * @param {{rate: number, fragments: boolean, fileSize: number, maxSeconds: number}} given
+ *   the stream's sample rate, whether the movie has fragments, and the limits
  * @returns {{timescale: number, ticks: number, stts: Uint8Array, sizes: Uint32Array,
  *   ranges: number[][], total: number}} the ranges are [offset, length] in
- *   the file, in playing order, and total is their bytes
+ *   the file, one per chunk in playing order, and total is their bytes
  */
-function frameRanges(bytes, view, track, fileSize, maxBytes, maxSeconds) {
+function frameRanges(bytes, view, track, { rate, fragments, fileSize, maxSeconds }) {
   const { mdhd, stbl } = track;
   // mdhd: the track's clock. Version 1 has 64-bit times before it.
   const timescaleAt = mdhd.start + (mdhd.end > mdhd.start && bytes[mdhd.start] === 1 ? 20 : 12);
@@ -334,19 +401,25 @@ function frameRanges(bytes, view, track, fileSize, maxBytes, maxSeconds) {
   let ticks = 0;
   for (let i = 0; i < runs; i += 1) {
     const count = view.getUint32(stts.start + 8 + i * 8);
+    // The M4A carries these runs as they are. A run of no frames says
+    // nothing, and a file could fill its index with them.
+    need(count >= 1);
     frames += count;
     ticks += count * view.getUint32(stts.start + 12 + i * 8);
   }
   // A track with no frames here keeps them in fragments, which this does
-  // not read.
-  if (frames === 0) throw new Refused(FORMAT, false);
-  // Before a byte of sound is read: the index already says how long it is.
-  if (!(ticks / timescale <= maxSeconds)) {
+  // not read; the index then says so with an mvex box.
+  if (frames === 0) throw new Refused(fragments ? FRAGMENTS : FORMAT, false);
+  // Before a byte of sound is read. The durations are the index's own
+  // account of the length. The decoder goes by the frames, each of at least
+  // MIN_FRAME_SAMPLES at the stream's rate, so those are counted too: an
+  // index cannot call an hour of frames a second.
+  const seconds = Math.max(ticks / timescale, frames * MIN_FRAME_SAMPLES / rate);
+  if (!(seconds <= maxSeconds)) {
     throw new Refused(`This video is longer than ${maxSeconds / 60} minutes. `
       + "Trim it first (the Photos app can), or pick a shorter one.", true);
   }
-  // Short by its own account and still this many frames: the tables lie, and
-  // everything sized from them below would be as large as they say.
+  // Everything below is sized from the frame count.
   need(frames <= MAX_AUDIO_FRAMES);
   // The rebuilt header holds the duration in 32 bits.
   need(ticks <= 0xffffffff);
@@ -383,6 +456,9 @@ function frameRanges(bytes, view, track, fileSize, maxBytes, maxSeconds) {
   for (let chunk = 1; chunk <= chunks && frame < frames; chunk += 1) {
     while (group + 1 < groups && view.getUint32(stsc.start + 8 + (group + 1) * 12) <= chunk) group += 1;
     const perChunk = view.getUint32(stsc.start + 12 + group * 12);
+    // A chunk holds at least a frame, so this walk is as long as the track
+    // has frames and not as long as a table of empty chunks.
+    need(perChunk >= 1);
     // One description for the whole track: the rebuilt file has only one.
     need(view.getUint32(stsc.start + 16 + group * 12) === 1);
     const at = offsets.start + 8 + (chunk - 1) * width;
@@ -392,23 +468,52 @@ function frameRanges(bytes, view, track, fileSize, maxBytes, maxSeconds) {
     const last = Math.min(frame + perChunk, frames);
     for (; frame < last; frame += 1) length += sizes[frame];
     // Inside the file, or the read would be of something else, or nothing.
-    need(length <= fileSize && offset <= fileSize - length);
+    need(offset <= fileSize - length);
     total += length;
-    // The page's byte cap, on the sound alone, before any of it is read.
-    if (total > maxBytes) {
-      throw new Refused(`This video's sound is larger than ${maxBytes / (1024 * 1024)} MB. `
-        + "Trim the video first, then pick it again.", true);
-    }
-    const previous = ranges[ranges.length - 1];
-    if (previous !== undefined && previous[0] + previous[1] === offset) {
-      previous[1] += length;
-    } else if (length > 0) {
-      ranges.push([offset, length]);
-    }
+    ranges.push([offset, length]);
   }
   // Every frame the tables count has a place in some chunk.
   need(frame === frames);
   return { timescale, ticks, stts: bytes.subarray(stts.start + 8, stts.start + 8 + runs * 8), sizes, ranges, total };
+}
+
+/**
+ * The reads that fetch these ranges of the file, each one stretch of it with
+ * the pieces of sound it holds: [offset in the file, length, place in the
+ * M4A]. `at` is where the first range goes.
+ *
+ * The pieces are taken by where they lie in the file, not by the order they
+ * play in: an index can name the same two places in turn for every frame,
+ * and reading in playing order would then be a read for each frame. Sorted,
+ * pieces within MAX_GAP_BYTES of each other share a read of at most
+ * MAX_SPAN_BYTES, so the reads number about one for every MAX_GAP_BYTES of
+ * the file at the most.
+ */
+function planReads(ranges, at) {
+  const pieces = [];
+  for (const [offset, length] of ranges) {
+    // Cut to MAX_SPAN_BYTES, so that no read is longer however the sound lies.
+    for (let done = 0; done < length; done += MAX_SPAN_BYTES) {
+      const part = Math.min(MAX_SPAN_BYTES, length - done);
+      pieces.push([offset + done, part, at]);
+      at += part;
+    }
+  }
+  pieces.sort((a, b) => a[0] - b[0]);
+  const reads = [];
+  let current = null;
+  for (const piece of pieces) {
+    const end = piece[0] + piece[1];
+    if (current !== null && piece[0] - current.end <= MAX_GAP_BYTES
+        && Math.max(end, current.end) - current.start <= MAX_SPAN_BYTES) {
+      current.end = Math.max(end, current.end);
+      current.pieces.push(piece);
+    } else {
+      current = { start: piece[0], end, pieces: [piece] };
+      reads.push(current);
+    }
+  }
+  return reads;
 }
 
 // --- the audio-only M4A ---------------------------------------------------------------
@@ -444,8 +549,9 @@ function ascii(text) {
 }
 
 function box(type, ...parts) {
-  const body = concat(parts);
-  return concat([u32(8 + body.length), ascii(type), body]);
+  let length = 8;
+  for (const part of parts) length += part.length;
+  return concat([u32(length), ascii(type), ...parts]);
 }
 
 // The unity matrix every movie and track header carries.
@@ -462,7 +568,7 @@ function m4aHeader({ esds, rate, channels, timescale, ticks, stts, sizes, total 
   const stsz = new Uint8Array(frames * 4);
   const stszView = viewOf(stsz);
   sizes.forEach((size, i) => stszView.setUint32(i * 4, size));
-  const index = (dataOffset) => box("moov",
+  const moov = box("moov",
     // Version and flags, two dates, the clock and the length, then normal
     // speed and full volume, and the ID the next track would get.
     box("mvhd", u32(0, 0, 0, timescale, ticks, 0x00010000), u16(0x0100, 0), u32(0, 0), MATRIX,
@@ -488,23 +594,26 @@ function m4aHeader({ esds, rate, channels, timescale, ticks, stts, sizes, total 
             // One chunk holding every frame, using description 1.
             box("stsc", u32(0, 1, 1, frames, 1)),
             box("stsz", u32(0, 0, frames), stsz),
-            box("stco", u32(0, 1, dataOffset)))))));
-  // The chunk's offset is the header's own length, and the index is as long
-  // whatever offset it holds: build it once to measure, once for real.
-  const dataOffset = ftyp.length + index(0).length + 8;
-  return concat([ftyp, index(dataOffset), u32(8 + total), ascii("mdat")]);
+            box("stco", u32(0, 1, 0)))))));
+  const header = concat([ftyp, moov, u32(8 + total), ascii("mdat")]);
+  // The one chunk starts where this header ends. Its offset is the index's
+  // last four bytes, because stco is the last box in every box around it;
+  // written here, the index is built once and not a second time to measure.
+  viewOf(header).setUint32(ftyp.length + moov.length - 4, header.length);
+  return header;
 }
 
 /**
  * Take the sound out of a movie, as an audio-only M4A in memory.
  *
  * Reads the first bytes of any file, the index of a file of the MP4 family
- * (at most MAX_INDEX_BYTES), and of a movie the audio track's bytes (at most
- * maxBytes, plus the small gaps read through). A movie is a file of that
- * family with a picture track, or a QuickTime one.
+ * (at most MAX_INDEX_BYTES), and of a movie the audio track's bytes, with
+ * the small gaps read through, in at most MAX_SOUND_READS reads of at most
+ * MAX_SPAN_BYTES. A movie is a file of that family with a picture track, or
+ * a QuickTime one.
  * @param {Blob} file the picked file
- * @param {{maxBytes: number, maxSeconds: number}} limits the most sound, in
- *   bytes and in seconds
+ * @param {{maxBytes: number, maxSeconds: number}} limits the largest M4A
+ *   built, in bytes, and the longest sound, in seconds
  * @returns {Promise<null | {bytes: Uint8Array} | {refusal: string, final: boolean}>}
  *   null for a file that is not a movie, which the decoder gets whole as
  *   before; the M4A; or why not, in words for the user. A refusal that is
@@ -520,9 +629,11 @@ export async function movieAudio(file, { maxBytes, maxSeconds }) {
     if (found.length > MAX_INDEX_BYTES) throw new Refused(INDEX_TOO_LARGE, false);
     const index = await read(file, found.start, found.length);
     const view = viewOf(index);
-    const { video, sounds } = readTracks(index, view);
+    const { video, sounds, partial, fragments } = readTracks(index, view);
     if (!video && !found.quicktime) return null;
-    if (sounds.length === 0) throw new Refused(NO_SOUND, true);
+    // "No sound" is for good only when every track was looked at. A damaged
+    // index hides tracks, and then the whole file is still worth a try.
+    if (sounds.length === 0) throw new Refused(partial ? UNREADABLE : NO_SOUND, !partial);
     let track = null;
     let entry = null;
     for (const candidate of sounds) {
@@ -533,27 +644,22 @@ export async function movieAudio(file, { maxBytes, maxSeconds }) {
       }
     }
     if (track === null) throw new Refused(FORMAT, false);
-    const tables = frameRanges(index, view, track, size, maxBytes, maxSeconds);
+    const tables = frameRanges(index, view, track, { rate: entry.rate, fragments, fileSize: size, maxSeconds });
     const header = m4aHeader({ ...entry, ...tables });
+    // The page's byte cap, on the whole of what the decoder is handed,
+    // before any sound is read.
+    if (header.length + tables.total > maxBytes) {
+      throw new Refused(`This video's sound is larger than ${maxBytes / (1024 * 1024)} MB. `
+        + "Trim the video first, then pick it again.", true);
+    }
+    const reads = planReads(tables.ranges, header.length);
+    need(reads.length <= MAX_SOUND_READS);
     const bytes = new Uint8Array(header.length + tables.total);
     bytes.set(header, 0);
-    let at = header.length;
-    const { ranges } = tables;
-    for (let i = 0; i < ranges.length;) {
-      // One read for this piece and those after it that lie close behind.
-      const start = ranges[i][0];
-      let end = start + ranges[i][1];
-      let next = i + 1;
-      for (; next < ranges.length; next += 1) {
-        const [offset, length] = ranges[next];
-        if (offset < end || offset - end > MAX_GAP_BYTES || offset + length - start > MAX_SPAN_BYTES) break;
-        end = offset + length;
-      }
+    for (const { start, end, pieces } of reads) {
       const span = await read(file, start, end - start);
-      for (; i < next; i += 1) {
-        const [offset, length] = ranges[i];
+      for (const [offset, length, at] of pieces) {
         bytes.set(span.subarray(offset - start, offset - start + length), at);
-        at += length;
       }
     }
     return { bytes };
