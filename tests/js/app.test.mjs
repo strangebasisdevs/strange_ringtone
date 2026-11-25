@@ -13,6 +13,7 @@ import { fetchErrorMessage } from "../../core/static/fetch.js";
 import { dbToGain } from "../../core/static/player.js";
 import { resultUrl, ShareError } from "../../core/static/share.js";
 import { holdDecoding, loadApp, pickFile, setDecoded, settle, sleep, wavShape } from "./fake_dom.mjs";
+import { fileOf, movie } from "./movie_fixture.mjs";
 
 const RATE = 44100;
 const RESULT_ID = "0123456789abcdef0123456789abcdef";
@@ -963,7 +964,47 @@ test("the picker's hint gives both limits a picked file must meet", async () => 
   const hint = page.el("file-status").textContent;
   assert.match(hint, /\b10 minutes\b/);
   assert.match(hint, /\b64 MB\b/);
+  // A video is picked for its sound, and the size limit is on the sound.
+  assert.match(hint, /\bvideo\b/);
+  assert.match(hint, /\b64 MB of audio\b/);
   assert.equal(page.el("file-status").classes.has("error"), false);
+});
+
+test("a picked video far over 64 MB opens the editor on its sound, named after the file", async () => {
+  const page = await loadApp({ maxClipSeconds: "15" });
+  setDecoded([SONG]);
+  // As a phone lays it out, with 100 MiB of picture before each piece of sound.
+  const made = movie({ picture: 100 * 1024 * 1024 });
+  assert.ok(made.size > 4 * OVER_CAP);
+  const video = { name: "IMG_0042.MOV", ...fileOf(made.segments, made.size) };
+  const input = page.el("file");
+  input.files = [video];
+  await Promise.all(input.dispatch("change"));
+  await settle();
+  assert.equal(page.el("editor").hidden, false);
+  assert.equal(page.el("file-status").classes.has("error"), false);
+  assert.match(page.el("file-status").textContent, /^IMG_0042\.MOV, 1:00\./);
+  assert.equal(page.el("name").value, "IMG_0042");
+  // The decoder got an M4A made of the sound, once; the video was never
+  // read whole.
+  const inputs = page.decodedInputs();
+  assert.equal(inputs.length, 1);
+  assert.equal(String.fromCharCode(...inputs[0].subarray(4, 12)), "ftypM4A ");
+  assert.equal(video.whole, 0);
+});
+
+test("a picked video with no sound says so", async () => {
+  const page = await loadApp({ maxClipSeconds: "15" });
+  setDecoded([SONG]);
+  const made = movie({ sounds: [] });
+  const input = page.el("file");
+  input.files = [{ name: "Silent.mov", ...fileOf(made.segments, made.size) }];
+  await Promise.all(input.dispatch("change"));
+  await settle();
+  assert.equal(page.el("editor").hidden, true);
+  assert.ok(page.el("file-status").classes.has("error"));
+  assert.equal(page.el("file-status").textContent, "This video has no sound.");
+  assert.deepEqual(page.decodedInputs(), []);
 });
 
 test("a picked file over 64 MB is refused with words for it, before any of it is read", async () => {

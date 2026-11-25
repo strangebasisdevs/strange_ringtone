@@ -137,7 +137,9 @@ without the fetcher.
 
 The browser checks a picked file and fetched audio alike twice: once before
 decoding and once after. Before decoding, `decode.js` refuses input over
-64 MiB (`MAX_INPUT_BYTES`) without reading any of it, and `fetch.js` refuses
+64 MiB (`MAX_INPUT_BYTES`) without reading it whole (for a video the cap
+counts the sound alone, and what is read first is in section 4.1), and
+`fetch.js` refuses
 a fetched audio over the same cap: by its `Content-Length` before reading the
 body, and, where the browser offers the body as a stream, by counting it as
 it arrives and stopping at most one chunk past the cap. Where it does not,
@@ -148,6 +150,227 @@ the decoded duration shows.
 
 Inside the fetcher, yt-dlp moves to a container of its own whose only way out
 is the image's forwarder (section 6.1, milestone 5's follow-up).
+
+### 4.1 A video's sound (decided 2026-11-24)
+
+The owner asked for a ringtone straight from a video in the iPhone's Photo
+Library, where picking a `.mov` ended in "could not be read as audio".
+
+**Found that day.**
+
+- Safari's `decodeAudioData` does not open the QuickTime `.mov` that the
+  Photo Library hands a page (WebKit bug 228971, open since iOS 14, with no
+  fix), while an `.mp4` works. WebKit replaced that decoder in March 2026
+  (bug 307632) with one that may read a `.mov`. None of its tests covers
+  one, and which Safari release carries it is not known.
+- By WebKit's source (`WKFileUploadPanel.mm`), a page whose field accepts no
+  image type gets the video as PhotoKit's "compatible" form, a `.mov` that
+  Safari does not transcode.
+- A video's bytes are mostly its picture, so the 64 MiB cap refused most
+  videos before any decoder saw them.
+
+**Decided with the owner**, one question at a time:
+
+1. The page takes the sound out of the video itself. The server does not
+   change, and the core still receives only PCM WAV.
+2. For a video the 64 MiB cap counts the sound alone. A video of any size
+   can be picked.
+3. The picker and the hint under it name videos, in every browser
+   (section 7.1).
+4. Only sound that plays is taken (2026-11-25, after the review below): a
+   disabled track is not used while another track is enabled, because it can
+   be other sound altogether, a commentary or another language. The cost: a
+   video over 64 MiB whose playing track is not AAC is refused even when it
+   carries an AAC copy switched off. Whether an iPhone's spatial-audio
+   recording is laid out that way is not known. Where a track could not be
+   looked at, it may be the one that plays, so a disabled track is not taken
+   then either. This binds what the page takes out itself. A video within
+   64 MiB that the page does not take from still goes whole to the browser's
+   decoder, as it did before this feature, and that decoder picks the track
+   by its own rule: Chrome's takes the first sound track, enabled or not
+   (seen 2026-11-25).
+
+**How** (`core/static/audio/movie.js`, dependency-free like the rest of the
+page).
+Nothing in it decodes audio: it copies the audio track's AAC frames,
+untouched, into an audio-only M4A in memory, and `decodeAudioData` gets that.
+
+- A movie is a file of the MP4 family (MP4 or QuickTime) with a picture
+  track, or a QuickTime file (brand `qt  `, or no `ftyp` at all). It is told
+  by content, never by name or type. An audio file of that family (an
+  `.m4a`) goes to the decoder whole, as before.
+- The page walks the file's top-level boxes to the index (`moov`) and reads
+  the index whole. Of the sound tracks that play (the enabled ones, or all
+  of them in a file that enables none, which is known only when every track
+  could be looked at) it takes the first whose sample
+  description is `mp4a` with an AAC `esds`, directly or inside QuickTime's
+  `wave` box (sound description versions 0, 1 and 2). AAC here is Main, LC,
+  SSR, LTP and HE-AAC (audio object types 1 to 5 and 29), whose frames hold
+  1024 samples or 960. An encrypted entry (`enca`) is not taken: its frames
+  are ciphertext.
+- From the track's tables (`stts`, `stsz`, `stsc`, `stco` or `co64`) it works
+  out where each frame lies. A video over 10 minutes is refused from the
+  index, before any sound is read, on two counts: the durations the index
+  states, and the frames it lists, each at least 960 samples at the stream's
+  own rate. The second is what the decoder goes by, so an index that
+  understates its durations gets at most 10 minutes 40 seconds decoded
+  before `decode.js` refuses it by the decoded length. An M4A that would
+  pass 64 MiB, header included, is refused before any sound is read too.
+- It reads the frames by byte range, in the order they lie in the file and
+  not the order they play in. Two pieces of sound at most 64 KiB apart come
+  in one read, the picture in between is dropped at once, and no read is
+  longer than 4 MiB (a longer piece is read in parts): an MP4 that
+  alternates sound and picture with every video frame would otherwise cost
+  tens of thousands of reads. In a phone's movie the pieces lie megabytes
+  apart, and the picture is not read at all. Because the reads go by place,
+  an index that names the same places over and over costs one read for each
+  place: about one read for every 64 KiB of the file at the most, and never
+  more than 65,536.
+- The M4A is the plainest there is: `ftyp` `M4A `, one track, one chunk, the
+  source's `esds` byte for byte (at most 256 bytes), and its frame sizes
+  and durations (every run of durations counts at least one frame).
+
+**When the sound cannot be taken out** (it is not AAC of those kinds, the
+track that plays is another codec, the movie has fragments, or the index
+is damaged), or the decoder refuses the M4A, a video within 64 MiB is handed
+to the decoder whole, so a browser that reads such a file today still does.
+Over 64 MiB it is refused with the reason. A movie whose index says it has
+fragments (an `mvex` box) is not taken from even when the index's own tables
+hold frames: they hold the beginning, the rest is in the fragments, and an
+M4A of the beginning would pass for the whole sound. An index that breaks
+off (a box in it that does not fit) gives no sound either: the box that says
+the movie has fragments may be the one at the break, or lie past it.
+
+A video that is too long is refused either way, and so is one with no sound
+track, provided every track could be looked at: where the index breaks off
+or is kept compressed (QuickTime's `cmov`, which the page does not unpack),
+a track does not say what it is, a sound track lacks its tables, its clock
+or its header, or there are more than 32, the sound may be in what was not
+seen, and the refusal is "could not be read", which leaves the whole file
+its try.
+
+**Bounds.** Every number in the index is checked against the box it is in
+and against the file before it is used as an offset, a length or a count.
+
+| Bound | Value |
+| --- | --- |
+| Top-level boxes looked at on the way to the index | 64, one 16-byte read each |
+| Index read (`MAX_INDEX_BYTES`) | 16 MiB, refused before it is read |
+| Tracks looked at | 32 |
+| Audio frames taken (`MAX_AUDIO_FRAMES`) | 262,144 (ten minutes at 96 kHz is 56,250) |
+| Length | 10 minutes, by the stated durations and by the frame count |
+| The M4A handed to the decoder | 64 MiB, header included |
+| Decoder configuration copied (`MAX_CONFIG_BYTES`) | 256 bytes |
+| One read of sound (`MAX_SPAN_BYTES`) | 4 MiB, through gaps of at most 64 KiB (`MAX_GAP_BYTES`) |
+| Reads of sound (`MAX_SOUND_READS`) | 65,536, refused before the first |
+
+What "before reading" now means: of any picked file the page reads the first
+16 bytes, and of a file of the MP4 family the index, before the 64 MiB cap
+applies, because only the index says whether the file is a video.
+
+`tests/js/movie.test.mjs` builds movies box by box, with the picture as a
+hole, so a test can stand in a video of several gigabytes and see which
+bytes were asked for. Each bound has a test that fails when the check is
+removed, and one test changes index bytes at random and requires that
+nothing throws and no read leaves the file.
+
+**Reviewed on 2026-11-24**, by a second session that read the change cold
+and attacked it with files of its own. It found no way past the caps and no
+read outside the file. What it did find, all changed the next day:
+
+- Reads were bounded only by the frame count: a crafted file of under 2 MB
+  cost 262,149 reads, 41 seconds in Chromium. They now go by place.
+- The cap counted the sound and not the header, which could carry 16 MiB
+  copied from the index.
+- The 10-minute refusal believed the durations the index stated.
+- Four bounds checks had no test, a disabled AAC track was taken over a
+  playing track of another codec (decision 4), and a damaged index could
+  end in "This video has no sound", which is final.
+
+**Reviewed again on 2026-11-25**, by GitHub's Copilot on the pull request.
+Two findings, each reproduced first and changed the same day:
+
+- A movie with fragments whose index holds the first frames itself gave
+  those frames as the whole sound: 2 seconds of 20 from a file made with
+  ffmpeg's `frag_keyframe`. It is now refused as fragmented whatever its
+  index holds.
+- A disabled AAC track was still taken when the track that plays could not
+  be looked at (its tables or its clock missing). The same held for a track
+  that does not say what it is, for tracks past the 32nd and for an index
+  that breaks off; all four are closed (decision 4).
+
+For that change the list of checks to remove in turn was made again from
+the file, branch by branch: 131 of them. Twelve older branches had no test
+of their own, two of them bounds: a run of chunks is looked for inside its
+table only, and the walk over the chunks ends with the last frame. Eleven
+have a test now; the twelfth, which could not change any outcome, is gone.
+
+**Reviewed a third time on 2026-11-25**: that change, by two fresh
+reviewers, one attacking it with files of its own and one running 79 files
+made with ffmpeg through the module before and after, and by Copilot's
+second pass. Every M4A the page built from those files was the whole sound
+of the track that plays. Found, each reproduced first and changed the same
+day:
+
+- Copilot: a QuickTime index kept compressed (`cmov`) ended in "This video
+  has no sound", which is final. Its tracks now count as not looked at.
+- One damaged byte in the size of the box that says a movie has fragments
+  broke the index off at that box, and the beginning was again taken for
+  the whole: 1.94 seconds of 20, where ffmpeg plays all 20. An index that
+  breaks off now gives no sound. Until then a break after a track that
+  plays had been accepted.
+- A sound track whose header is missing or too short does not say whether
+  it is enabled. It counted as disabled, so a disabled track before it was
+  taken. It now counts as a track not looked at.
+- One bound had no test: the frames counted for a chunk stop at the track's
+  last frame. Without it, one run of chunks claiming 4,294,967,295 frames
+  each cost a quarter of a minute. The list of checks had been made from
+  the conditions and held no clamp (`Math.min`); it has them now, 139
+  entries. Two halves of conditions that could not change any outcome are
+  gone, and three older branches of the sample description's reading have
+  tests.
+- The texts claimed more than the code does in two places, both corrected
+  here: what decision 4 binds (above), and what believing the box that says
+  fragments costs (below).
+
+**Accepted.**
+
+- Only AAC is taken out, and of AAC not the low-delay kinds or xHE-AAC.
+  Those, PCM, Apple Lossless, AC-3, a spatial-audio track on its own and
+  fragmented MP4 are left to the browser's decoder, within 64 MiB. Each
+  could be added the same way.
+- A movie that says it has fragments is refused as fragmented even when it
+  has none and its index holds every frame. That is a file the page could
+  have taken, and it is lost over 64 MiB always, and under it wherever the
+  browser's decoder does not open the file whole, a `.mov` in Safari among
+  them. ffmpeg writes such files: with `frag_keyframe` from a video with a
+  single keyframe or from a sound-only QuickTime file, and with
+  `frag_custom` never flushed. Looking for a fragment after the index would
+  tell the two apart; that is not built. Whether an iPhone's movie carries
+  the box is not yet seen, and if it does, this feature does not work for
+  that movie until the look is built.
+- An index that breaks off gives no sound even when the tracks before the
+  break were whole, and a sound track with no readable header is not taken
+  even when it is the only one. Both are damaged files, refused as "could
+  not be read", which leaves a file within 64 MiB its try with the decoder.
+- A file made to hide its fragments is taken at its beginning: with the box
+  that says so renamed to another that the page skips, ffmpeg still finds
+  the fragment records in it and plays everything, and the page takes what
+  the index holds. The same look for a fragment after the index would close
+  it. A track that says what it is twice (two handler boxes) is read at the
+  first. Both take a crafted file, and nothing but which sound, or how much
+  of it, is at stake.
+- The hint names MP4 and MOV videos. Any other video (WebM, Matroska) is
+  still measured whole against the 64 MiB, like an audio file.
+- The track's edit list is not carried over, so the sound can begin with
+  the encoder's lead-in, about 20 to 45 ms that a video player skips. For a
+  clip the user trims by ear it does not matter.
+- Checked on 2026-11-24 with a `.mov` and an `.mp4` made by ffmpeg: the M4A
+  decodes to the same samples as the video's own audio track, after that
+  lead-in. Seen in Chrome on 2026-11-25: a fragmented MP4 within 64 MiB,
+  refused by the page, decodes whole from the file (20.02 seconds of 20).
+  **Not yet seen on a phone**: whether Safari hands over what
+  WebKit's source says, and decodes the M4A, is for the owner to confirm.
 
 ## 5. Core image
 
@@ -1542,7 +1765,12 @@ yt-dlp's info JSON and the media server's bytes:
   by extension: `.m4a`, `.mp3`, `.wav`, `.aac`, `.aif`, `.aiff`, `.caf`,
   `.flac` and `.m4r`. Safari on iOS reads `audio/*` as movie types (WebKit bug
   242110), so with that alone the iPhone's Files picker greys out every audio
-  file and offers videos (found on 2026-11-11). The list only filters the
+  file and offers videos (found on 2026-11-11). Since 2026-11-24 the list
+  also names `video/*`, on purpose: a video is picked for its sound (section
+  4.1), and the iPhone's "Photo Library" entry no longer rests on that bug
+  alone. The field's label is "Audio or video file", and the hint under it
+  names MP4 and MOV videos and says the 64 MB is of audio. The list only
+  filters the
   picker. The page decodes by content and refuses what it cannot decode.
 - Buttons: **Hear final**, **Get on this iPhone**, and **Download .m4r**.
 
@@ -2444,6 +2672,8 @@ docs/PLAN.md
 - A short alert-tone preset (1 to 5 s). Phase 0 showed that custom tones already
   appear in the Text Tone list.
 - Beat-snapped edges.
+- Other sound in a video (section 4.1): PCM, Apple Lossless and fragmented
+  MP4 taken out by the page like AAC, and the track's edit list carried over.
 
 ## Sources
 
@@ -2472,3 +2702,6 @@ docs/PLAN.md
 - [Joshua Rogers: Squid security audit](https://joshua.hu/squid-security-audit-35-0days-45-exploits)
 - [Debian tracker: tinyproxy CVE-2023-49606](https://security-tracker.debian.org/tracker/CVE-2023-49606)
 - [Envoy: SNI dynamic forward proxy](https://www.envoyproxy.io/docs/envoy/latest/configuration/listeners/network_filters/sni_dynamic_forward_proxy_filter)
+- [WebKit bug 228971: decodeAudioData should support .mov files recorded by iPhone](https://bugs.webkit.org/show_bug.cgi?id=228971)
+- [WebKit bug 307632: MP4 with Opus track isn't usable with decodeAudioData (the decoder moves to AVAssetReader)](https://bugs.webkit.org/show_bug.cgi?id=307632)
+- [WebKit source: WKFileUploadPanel.mm (what the iPhone's picker offers and hands over)](https://github.com/WebKit/WebKit/blob/main/Source/WebKit/UIProcess/ios/forms/WKFileUploadPanel.mm)

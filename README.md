@@ -11,8 +11,11 @@ iOS 26's **Share → Use as Ringtone**. No GarageBand, no computer and no cable.
 ## How it works
 
 1. Open the app in Safari on an iPhone running iOS 26 or later and pick an
-   audio file (up to 10 minutes and 64 MB). The phone decodes it; nothing is
-   uploaded yet. Where the server runs the optional fetcher, you can paste or
+   audio file (up to 10 minutes and 64 MB), or a video from the Photo
+   Library for its sound. The phone decodes it; nothing is
+   uploaded yet. Of a video the page reads only the sound track (AAC), so
+   the 64 MB counts the sound and the video itself can be any size. Where
+   the server runs the optional fetcher, you can paste or
    share a YouTube link instead ([below](#from-a-youtube-link)).
 2. The app pre-selects the loudest stretch, up to `MAX_CLIP_SECONDS` (30 s by
    default), and moves its start to a quiet moment. Drag the handles or nudge
