@@ -3,6 +3,7 @@
 // a file to. The movies are made box by box in movie_fixture.mjs.
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { deflateSync } from "node:zlib";
 
 import * as movieModule from "../../core/static/audio/movie.js";
 import {
@@ -233,6 +234,18 @@ test("a disabled track is not taken while a track the index cannot show may be t
   // 33rd, which plays, is never seen.
   const many = movie({ extraTracks: 30, sounds: [{ enabled: false, frames: other }, {}] });
   assertRefused((await take(many)).result, UNREADABLE, false);
+  // The track that plays comes second, and the header that would say so
+  // is missing, or there and empty. The first is switched off: not the
+  // video's sound, though it is the only one whose header can be read.
+  const hidden = withIndex(movie({ sounds: [{ enabled: false, frames: other }, {}] }), (bytes) => {
+    bytes.set(ascii("free"), lastBox(bytes, "tkhd") + 4);
+  });
+  const mute = movie({ sounds: [{ enabled: false, frames: other }, { tkhd: new Uint8Array(0) }] });
+  for (const made of [hidden, mute]) {
+    const { result, file } = await take(made);
+    assertRefused(result, UNREADABLE, false);
+    assert.deepEqual(soundReads(file, made), []);
+  }
   // An index that breaks off after the disabled track, at a box shorter
   // than its own header: what came after it is not known.
   const cut = movie({ sounds: [{ enabled: false, frames: other }], tail: concat([u32(4), ascii("free"), u32(0)]) });
@@ -294,6 +307,14 @@ test("a run of chunks is looked for inside its table only", async () => {
   assertM4a((await take(made)).result, frames);
 });
 
+test("a chunk said to hold more frames than the track has is walked to the last frame only", async () => {
+  // One run for every chunk, of 4,294,967,295 frames each, and a track of
+  // seven frames in one chunk. Walked by what the run says, that is four
+  // thousand million steps, a quarter of a minute before anything else.
+  const made = movie({ sounds: [{ perChunk: 7, tables: { stsc: u32(0, 1, 1, 0xffffffff, 1) } }] });
+  assertM4a((await take(made)).result, made.sounds[0].frames);
+});
+
 test("chunks the index lists past the last frame are not looked at", async () => {
   // Three chunks hold the seven frames. Two more are listed, at places far
   // outside the file.
@@ -309,6 +330,25 @@ test("the first decoder configuration in a sample description is the one used", 
   new DataView(entry.buffer).setUint32(0, entry.length);
   const made = movie({ sounds: [{ entry }] });
   assertM4a((await take(made)).result, made.sounds[0].frames);
+});
+
+test("a box of another kind before the decoder configuration is passed over", async () => {
+  // MP4 allows other boxes in a sample description, a bit rate box among
+  // them, and nothing says the esds comes first.
+  const plain = soundEntry();
+  const entry = concat([plain.subarray(0, 36), box("btrt", new Uint8Array(12)), plain.subarray(36)]);
+  new DataView(entry.buffer).setUint32(0, entry.length);
+  const made = movie({ sounds: [{ entry }] });
+  assertM4a((await take(made)).result, made.sounds[0].frames);
+});
+
+test("a descriptor of another kind before the one looked for is passed over", async () => {
+  // Version and flags, a descriptor with a tag of its own, then the stream
+  // descriptor as it always is.
+  const real = esdsPayload();
+  const esds = concat([real.subarray(0, 4), Uint8Array.from([0x06, 1, 2]), real.subarray(4)]);
+  const made = movie({ sounds: [{ entry: soundEntry({ esds }) }] });
+  assertM4a((await take(made)).result, made.sounds[0].frames, { esds });
 });
 
 test("a channel layout the configuration does not name counts as two channels", async () => {
@@ -486,6 +526,28 @@ test("something with no slice, or no size, is not looked at", async () => {
 test("a video with no sound track is refused for good", async () => {
   const made = movie({ sounds: [] });
   assertRefused((await take(made)).result, /has no sound/, true);
+});
+
+test("an index kept compressed is not called a video with no sound", async () => {
+  // QuickTime can hold its whole index deflated in a cmov box, and files
+  // that old often have no ftyp. The page does not unpack it, so no track
+  // was looked at: "no sound" is not known, and the whole file is still
+  // worth a try with a decoder that reads such an index.
+  for (const brand of ["qt  ", null]) {
+    const plain = movie({ brand });
+    const moov = plain.segments.find((segment) => segment.name === "moov");
+    const packed = box("moov", box("cmov",
+      box("dcom", ascii("zlib")),
+      box("cmvd", u32(moov.bytes.length), deflateSync(moov.bytes))));
+    const made = {
+      ...plain,
+      size: plain.index.at + packed.length,
+      segments: plain.segments.map((segment) => (segment === moov ? { ...segment, bytes: packed } : segment)),
+    };
+    const { result, file } = await take(made);
+    assertRefused(result, UNREADABLE, false);
+    assert.deepEqual(soundReads(file, made), [], String(brand));
+  }
 });
 
 test("sound that is not AAC is refused, and the whole file is still worth a try", async () => {
@@ -700,6 +762,8 @@ test("a sound track the index cannot show is not taken for a movie without sound
     "its tables are missing": (bytes) => bytes.set(ascii("free"), lastBox(bytes, "stbl") + 4),
     "the box its tables are in is missing": (bytes) => bytes.set(ascii("free"), lastBox(bytes, "minf") + 4),
     "its clock is missing": (bytes) => bytes.set(ascii("free"), lastBox(bytes, "mdhd") + 4),
+    // The header that says whether the track is enabled.
+    "its header is missing": (bytes) => bytes.set(ascii("free"), lastBox(bytes, "tkhd") + 4),
     // The handler box of the track's media, not the data handler after it.
     "what it is, is missing": (bytes) => bytes.set(ascii("free"), lastBox(bytes, "hdlr", 2) + 4),
   };
@@ -721,10 +785,34 @@ test("a track too short to say what it is does not borrow the bytes after it", a
   assert.equal((await take(made)).result, null);
 });
 
+test("an index that breaks off gives no sound: the box that says fragments may be at the break or past it", async () => {
+  // A movie with fragments, and one damaged byte in the size of the box
+  // that says so: it runs past the index, or is shorter than its own
+  // header. The tables before it hold the beginning of the sound only.
+  const fragmented = movie({ tail: MVEX });
+  const grown = withIndex(fragmented, (bytes, view) => {
+    const at = lastBox(bytes, "mvex");
+    view.setUint32(at, view.getUint32(at) + 256);
+  });
+  const shrunk = withIndex(fragmented, (bytes, view) => view.setUint32(lastBox(bytes, "mvex"), 4));
+  // The break is at a box before it, which hides it.
+  const hidden = withIndex(movie({ tail: concat([box("free", new Uint8Array(8)), MVEX]) }), (bytes, view) => {
+    view.setUint32(lastBox(bytes, "free"), 4);
+  });
+  // No such box anywhere: after a break that is not known either.
+  const plain = movie({ tail: concat([u32(4), ascii("free"), u32(0)]) });
+  for (const made of [grown, shrunk, hidden, plain]) {
+    const { result, file } = await take(made);
+    assertRefused(result, UNREADABLE, false);
+    assert.deepEqual(soundReads(file, made), []);
+  }
+});
+
 test("a 64-bit size in the last bytes of the index is not read past them", async () => {
   // A size of 1 promises eight more bytes of size, and the index ends.
+  // The walk stops there, and an index that breaks off gives no sound.
   const made = movie({ tail: concat([u32(1), ascii("free")]) });
-  assertM4a((await take(made)).result, made.sounds[0].frames);
+  assertRefused((await take(made)).result, UNREADABLE, false);
 });
 
 test("a few bytes left over at the end of the index, too few for a box, are not read as one", async () => {

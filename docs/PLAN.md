@@ -184,7 +184,11 @@ Library, where picking a `.mov` ended in "could not be read as audio".
    carries an AAC copy switched off. Whether an iPhone's spatial-audio
    recording is laid out that way is not known. Where a track could not be
    looked at, it may be the one that plays, so a disabled track is not taken
-   then either.
+   then either. This binds what the page takes out itself. A video within
+   64 MiB that the page does not take from still goes whole to the browser's
+   decoder, as it did before this feature, and that decoder picks the track
+   by its own rule: Chrome's takes the first sound track, enabled or not
+   (seen 2026-11-25).
 
 **How** (`core/static/audio/movie.js`, dependency-free like the rest of the
 page).
@@ -233,13 +237,17 @@ to the decoder whole, so a browser that reads such a file today still does.
 Over 64 MiB it is refused with the reason. A movie whose index says it has
 fragments (an `mvex` box) is not taken from even when the index's own tables
 hold frames: they hold the beginning, the rest is in the fragments, and an
-M4A of the beginning would pass for the whole sound.
+M4A of the beginning would pass for the whole sound. An index that breaks
+off (a box in it that does not fit) gives no sound either: the box that says
+the movie has fragments may be the one at the break, or lie past it.
 
 A video that is too long is refused either way, and so is one with no sound
-track, provided every track could be looked at: where the index breaks off,
-a track does not say what it is, or there are more than 32, the sound may
-be in what was not seen, and the refusal is "could not be read", which
-leaves the whole file its try.
+track, provided every track could be looked at: where the index breaks off
+or is kept compressed (QuickTime's `cmov`, which the page does not unpack),
+a track does not say what it is, a sound track lacks its tables, its clock
+or its header, or there are more than 32, the sound may be in what was not
+seen, and the refusal is "could not be read", which leaves the whole file
+its try.
 
 **Bounds.** Every number in the index is checked against the box it is in
 and against the file before it is used as an offset, a length or a count.
@@ -295,7 +303,35 @@ For that change the list of checks to remove in turn was made again from
 the file, branch by branch: 131 of them. Twelve older branches had no test
 of their own, two of them bounds: a run of chunks is looked for inside its
 table only, and the walk over the chunks ends with the last frame. Eleven
-have a test now; the twelfth, which no file could reach, is gone.
+have a test now; the twelfth, which could not change any outcome, is gone.
+
+**Reviewed a third time on 2026-11-25**: that change, by two fresh
+reviewers, one attacking it with files of its own and one running 79 files
+made with ffmpeg through the module before and after, and by Copilot's
+second pass. Every M4A the page built from those files was the whole sound
+of the track that plays. Found, each reproduced first and changed the same
+day:
+
+- Copilot: a QuickTime index kept compressed (`cmov`) ended in "This video
+  has no sound", which is final. Its tracks now count as not looked at.
+- One damaged byte in the size of the box that says a movie has fragments
+  broke the index off at that box, and the beginning was again taken for
+  the whole: 1.94 seconds of 20, where ffmpeg plays all 20. An index that
+  breaks off now gives no sound. Until then a break after a track that
+  plays had been accepted.
+- A sound track whose header is missing or too short does not say whether
+  it is enabled. It counted as disabled, so a disabled track before it was
+  taken. It now counts as a track not looked at.
+- One bound had no test: the frames counted for a chunk stop at the track's
+  last frame. Without it, one run of chunks claiming 4,294,967,295 frames
+  each cost a quarter of a minute. The list of checks had been made from
+  the conditions and held no clamp (`Math.min`); it has them now, 139
+  entries. Two halves of conditions that could not change any outcome are
+  gone, and three older branches of the sample description's reading have
+  tests.
+- The texts claimed more than the code does in two places, both corrected
+  here: what decision 4 binds (above), and what believing the box that says
+  fragments costs (below).
 
 **Accepted.**
 
@@ -304,14 +340,26 @@ have a test now; the twelfth, which no file could reach, is gone.
   fragmented MP4 are left to the browser's decoder, within 64 MiB. Each
   could be added the same way.
 - A movie that says it has fragments is refused as fragmented even when it
-  has none and its index holds every frame; over 64 MiB that is a refusal
-  of a file the page could have taken. ffmpeg's `frag_keyframe` writes such
-  a file from a video with a single keyframe. Looking for a fragment after
-  the index would tell the two apart; that is not built. Whether an iPhone's
-  movie carries the box is part of what is not yet seen on a phone.
-- Where the index breaks off after a track that plays, that track is still
-  taken. A box past the break that said the movie has fragments is not
-  seen.
+  has none and its index holds every frame. That is a file the page could
+  have taken, and it is lost over 64 MiB always, and under it wherever the
+  browser's decoder does not open the file whole, a `.mov` in Safari among
+  them. ffmpeg writes such files: with `frag_keyframe` from a video with a
+  single keyframe or from a sound-only QuickTime file, and with
+  `frag_custom` never flushed. Looking for a fragment after the index would
+  tell the two apart; that is not built. Whether an iPhone's movie carries
+  the box is not yet seen, and if it does, this feature does not work for
+  that movie until the look is built.
+- An index that breaks off gives no sound even when the tracks before the
+  break were whole, and a sound track with no readable header is not taken
+  even when it is the only one. Both are damaged files, refused as "could
+  not be read", which leaves a file within 64 MiB its try with the decoder.
+- A file made to hide its fragments is taken at its beginning: with the box
+  that says so renamed to another that the page skips, ffmpeg still finds
+  the fragment records in it and plays everything, and the page takes what
+  the index holds. The same look for a fragment after the index would close
+  it. A track that says what it is twice (two handler boxes) is read at the
+  first. Both take a crafted file, and nothing but which sound, or how much
+  of it, is at stake.
 - The hint names MP4 and MOV videos. Any other video (WebM, Matroska) is
   still measured whole against the 64 MiB, like an audio file.
 - The track's edit list is not carried over, so the sound can begin with
@@ -319,7 +367,9 @@ have a test now; the twelfth, which no file could reach, is gone.
   clip the user trims by ear it does not matter.
 - Checked on 2026-11-24 with a `.mov` and an `.mp4` made by ffmpeg: the M4A
   decodes to the same samples as the video's own audio track, after that
-  lead-in. **Not yet seen on a phone**: whether Safari hands over what
+  lead-in. Seen in Chrome on 2026-11-25: a fragmented MP4 within 64 MiB,
+  refused by the page, decodes whole from the file (20.02 seconds of 20).
+  **Not yet seen on a phone**: whether Safari hands over what
   WebKit's source says, and decodes the M4A, is for the owner to confirm.
 
 ## 5. Core image

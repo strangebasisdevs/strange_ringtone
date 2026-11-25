@@ -178,19 +178,19 @@ function* boxes(bytes, view, start, end, walk = null) {
   while (end - at >= 8) {
     let length = view.getUint32(at);
     let header = 8;
-    let fits = true;
     if (length === 1) {
       // A 64-bit size needs its sixteen bytes to be there, and inside an
-      // index of at most MAX_INDEX_BYTES its high word is zero.
-      fits = end - at >= HEADER_BYTES && view.getUint32(at + 8) === 0;
-      if (fits) {
+      // index of at most MAX_INDEX_BYTES its high word is zero. One that
+      // is not so leaves the size at 1, less than any header, and the
+      // check below ends the walk.
+      if (end - at >= HEADER_BYTES && view.getUint32(at + 8) === 0) {
         length = view.getUint32(at + 12);
         header = HEADER_BYTES;
       }
     } else if (length === 0) {
       length = end - at;
     }
-    if (!fits || length < header || length > end - at) {
+    if (length < header || length > end - at) {
       if (walk !== null) walk.broken = true;
       return;
     }
@@ -315,11 +315,12 @@ function soundEntry(bytes, view, stbl) {
 
 /**
  * The index's tracks.
- * @returns {{video: boolean, sounds: object[], partial: boolean, fragments: boolean}}
+ * @returns {{video: boolean, sounds: object[], partial: boolean, fragments: boolean, broken: boolean}}
  *   whether one is a picture; the sound tracks that play, in the file's
  *   order; whether some track could not be looked at, so that neither "no
- *   sound track" nor "no track is enabled" is known for sure; and whether
- *   the index says the movie has fragments
+ *   sound track" nor "no track is enabled" is known for sure; whether the
+ *   index says the movie has fragments; and whether the index breaks off,
+ *   so that what it says after the break is not known
  */
 function readTracks(bytes, view) {
   let video = false;
@@ -330,6 +331,9 @@ function readTracks(bytes, view) {
   const sounds = [];
   for (const top of boxes(bytes, view, 0, bytes.length, walk)) {
     if (top.type === "mvex") fragments = true;
+    // QuickTime can keep its whole index deflated inside this box, tracks
+    // and all. It is not unpacked here, so its tracks were not looked at.
+    if (top.type === "cmov") partial = true;
     if (top.type !== "trak") continue;
     count += 1;
     if (count > MAX_TRACKS) {
@@ -351,14 +355,15 @@ function readTracks(bytes, view) {
     const minf = child(bytes, view, mdia, "minf");
     const stbl = minf === null ? null : child(bytes, view, minf, "stbl");
     const mdhd = child(bytes, view, mdia, "mdhd");
-    if (stbl === null || mdhd === null) {
+    const tkhd = child(bytes, view, top, "tkhd");
+    // Its tables, its clock, and the header whose flags say whether it is
+    // enabled: a sound track without one of them could not be looked at.
+    if (stbl === null || mdhd === null || tkhd === null || tkhd.end - tkhd.start < 4) {
       partial = true;
       continue;
     }
-    const tkhd = child(bytes, view, top, "tkhd");
     // The low flag bit is "enabled".
-    const enabled = tkhd !== null && tkhd.end - tkhd.start >= 4 && (bytes[tkhd.start + 3] & 1) === 1;
-    sounds.push({ enabled, mdhd, stbl });
+    sounds.push({ enabled: (bytes[tkhd.start + 3] & 1) === 1, mdhd, stbl });
   }
   // What plays is what is enabled, and only that is taken (the owner's
   // decision, 2026-11-25): a disabled track can be other sound altogether,
@@ -368,7 +373,9 @@ function readTracks(bytes, view) {
   // and then a disabled track is not taken in its place.
   const unseen = partial || walk.broken;
   const playing = sounds.filter((track) => track.enabled);
-  return { video, sounds: playing.length > 0 || unseen ? playing : sounds, partial: unseen, fragments };
+  return {
+    video, sounds: playing.length > 0 || unseen ? playing : sounds, partial: unseen, fragments, broken: walk.broken,
+  };
 }
 
 /**
@@ -512,7 +519,7 @@ function planReads(ranges, at) {
   for (const piece of pieces) {
     const end = piece[0] + piece[1];
     if (current !== null && piece[0] - current.end <= MAX_GAP_BYTES
-        && Math.max(end, current.end) - current.start <= MAX_SPAN_BYTES) {
+        && end - current.start <= MAX_SPAN_BYTES) {
       current.end = Math.max(end, current.end);
       current.pieces.push(piece);
     } else {
@@ -636,7 +643,7 @@ export async function movieAudio(file, { maxBytes, maxSeconds }) {
     if (found.length > MAX_INDEX_BYTES) throw new Refused(INDEX_TOO_LARGE, false);
     const index = await read(file, found.start, found.length);
     const view = viewOf(index);
-    const { video, sounds, partial, fragments } = readTracks(index, view);
+    const { video, sounds, partial, fragments, broken } = readTracks(index, view);
     if (!video && !found.quicktime) return null;
     // "No sound" is for good only when every track was looked at. A damaged
     // index hides tracks, and then the whole file is still worth a try.
@@ -646,6 +653,10 @@ export async function movieAudio(file, { maxBytes, maxSeconds }) {
     // beginning, and an M4A made of them would pass for the whole sound, so
     // nothing is taken, however full the tables are.
     if (fragments) throw new Refused(FRAGMENTS, false);
+    // Where the index breaks off, the box that says so may be the one at
+    // the break or lie past it, unseen, and the same beginning would be
+    // taken for the whole. An index not read to its end gives no sound.
+    if (broken) throw new Refused(UNREADABLE, false);
     let track = null;
     let entry = null;
     for (const candidate of sounds) {
