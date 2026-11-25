@@ -483,6 +483,7 @@ class StaticTest(ServerTestCase):
             "share.js": "text/javascript; charset=utf-8",
             "fetch.js": "text/javascript; charset=utf-8",
             "audio/decode.js": "text/javascript; charset=utf-8",
+            "audio/movie.js": "text/javascript; charset=utf-8",
             "audio/wav.js": "text/javascript; charset=utf-8",
             "audio/loudness.js": "text/javascript; charset=utf-8",
             "audio/suggest.js": "text/javascript; charset=utf-8",

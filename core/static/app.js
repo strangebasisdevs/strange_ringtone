@@ -679,8 +679,11 @@ function resetForNewFile() {
 }
 
 function fileHint() {
-  return "Any audio file up to " + Math.round(MAX_INPUT_SECONDS / 60) + " minutes long and "
-    + MAX_INPUT_BYTES / (1024 * 1024) + " MB. It is decoded on this device; only the selection is sent.";
+  // A video counts by its sound alone (audio/movie.js): its picture is not
+  // what the size limit is about.
+  return "Any audio file, or a video for its sound, up to " + Math.round(MAX_INPUT_SECONDS / 60)
+    + " minutes long, with up to " + MAX_INPUT_BYTES / (1024 * 1024) + " MB of audio. "
+    + "It is decoded on this device; only the selection is sent.";
 }
 
 // What placed the selection (docs/PLAN.md 7.2), in the status line's words.

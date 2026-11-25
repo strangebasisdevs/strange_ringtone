@@ -137,7 +137,9 @@ without the fetcher.
 
 The browser checks a picked file and fetched audio alike twice: once before
 decoding and once after. Before decoding, `decode.js` refuses input over
-64 MiB (`MAX_INPUT_BYTES`) without reading any of it, and `fetch.js` refuses
+64 MiB (`MAX_INPUT_BYTES`) without reading it whole (for a video the cap
+counts the sound alone, and what is read first is in section 4.1), and
+`fetch.js` refuses
 a fetched audio over the same cap: by its `Content-Length` before reading the
 body, and, where the browser offers the body as a stream, by counting it as
 it arrives and stopping at most one chunk past the cap. Where it does not,
@@ -148,6 +150,100 @@ the decoded duration shows.
 
 Inside the fetcher, yt-dlp moves to a container of its own whose only way out
 is the image's forwarder (section 6.1, milestone 5's follow-up).
+
+### 4.1 A video's sound (decided 2026-11-24)
+
+The owner asked for a ringtone straight from a video in the iPhone's Photo
+Library, where picking a `.mov` ended in "could not be read as audio".
+
+**Found that day.**
+
+- Safari's `decodeAudioData` does not open the QuickTime `.mov` that the
+  Photo Library hands a page (WebKit bug 228971, open since iOS 14, with no
+  fix), while an `.mp4` works. WebKit replaced that decoder in March 2026
+  (bug 307632) with one that may read a `.mov`. None of its tests covers
+  one, and which Safari release carries it is not known.
+- By WebKit's source (`WKFileUploadPanel.mm`), a page whose field accepts no
+  image type gets the video as PhotoKit's "compatible" form, a `.mov` that
+  Safari does not transcode.
+- A video's bytes are mostly its picture, so the 64 MiB cap refused most
+  videos before any decoder saw them.
+
+**Decided with the owner**, one question at a time:
+
+1. The page takes the sound out of the video itself. The server does not
+   change, and the core still receives only PCM WAV.
+2. For a video the 64 MiB cap counts the sound alone. A video of any size
+   can be picked.
+3. The picker and the hint under it name videos, in every browser
+   (section 7.1).
+
+**How** (`core/static/audio/movie.js`, dependency-free like the rest of the
+page).
+Nothing in it decodes audio: it copies the audio track's AAC frames,
+untouched, into an audio-only M4A in memory, and `decodeAudioData` gets that.
+
+- A movie is a file of the MP4 family (MP4 or QuickTime) with a picture
+  track, or a QuickTime file (brand `qt  `, or no `ftyp` at all). It is told
+  by content, never by name or type. An audio file of that family (an
+  `.m4a`) goes to the decoder whole, as before.
+- The page walks the file's top-level boxes to the index (`moov`), reads the
+  index whole, and takes the first enabled sound track whose sample
+  description is `mp4a` with an AAC `esds`, directly or inside QuickTime's
+  `wave` box (sound description versions 0, 1 and 2). An encrypted entry
+  (`enca`) is not taken: its frames are ciphertext.
+- From the track's tables (`stts`, `stsz`, `stsc`, `stco` or `co64`) it works
+  out where each frame lies. A video over 10 minutes is refused from the
+  index alone, and so is sound over 64 MiB, both before any sound is read.
+- It reads the frames by byte range. Two pieces of sound at most 64 KiB
+  apart come in one read, which is never longer than 4 MiB, and the picture
+  in between is dropped at once: an MP4 that alternates sound and picture
+  with every video frame would otherwise cost tens of thousands of reads. In
+  a phone's movie the pieces lie megabytes apart, and the picture is not
+  read at all.
+- The M4A is the plainest there is: `ftyp` `M4A `, one track, one chunk, the
+  source's `esds` byte for byte, and its frame sizes and durations.
+
+**When the sound cannot be taken out** (it is not AAC, the frames are in
+fragments, or the index is damaged), or the decoder refuses the M4A, a video
+within 64 MiB is handed to the decoder whole, so a browser that reads such a
+file today still does. Over 64 MiB it is refused with the reason. A video
+with no sound track, or one that is too long, is refused either way.
+
+**Bounds.** Every number in the index is checked against the box it is in
+and against the file before it is used as an offset, a length or a count.
+
+| Bound | Value |
+| --- | --- |
+| Top-level boxes looked at on the way to the index | 64, one 16-byte read each |
+| Index read (`MAX_INDEX_BYTES`) | 16 MiB, refused before it is read |
+| Tracks looked at | 32 |
+| Audio frames taken (`MAX_AUDIO_FRAMES`) | 262,144 (ten minutes at 96 kHz is 56,250) |
+| Sound | 10 minutes and 64 MiB, the page's own limits |
+| One read through gaps | 4 MiB, over gaps of at most 64 KiB |
+
+What "before reading" now means: of any picked file the page reads the first
+16 bytes, and of a file of the MP4 family the index, before the 64 MiB cap
+applies, because only the index says whether the file is a video.
+
+`tests/js/movie.test.mjs` builds movies box by box, with the picture as a
+hole, so a test can stand in a video of several gigabytes and see which
+bytes were asked for. Each bound has a test that fails when the check is
+removed, and one test changes index bytes at random and requires that
+nothing throws and no read leaves the file.
+
+**Accepted.**
+
+- Only AAC is taken out. PCM, Apple Lossless, AC-3, a spatial-audio track on
+  its own and fragmented MP4 are left to the browser's decoder, within
+  64 MiB. Each could be added the same way.
+- The track's edit list is not carried over, so the sound can begin with
+  the encoder's lead-in, about 20 to 45 ms that a video player skips. For a
+  clip the user trims by ear it does not matter.
+- Checked on 2026-11-24 with a `.mov` and an `.mp4` made by ffmpeg: the M4A
+  decodes to the same samples as the video's own audio track, after that
+  lead-in. **Not yet seen on a phone**: whether Safari hands over what
+  WebKit's source says, and decodes the M4A, is for the owner to confirm.
 
 ## 5. Core image
 
@@ -1542,7 +1638,11 @@ yt-dlp's info JSON and the media server's bytes:
   by extension: `.m4a`, `.mp3`, `.wav`, `.aac`, `.aif`, `.aiff`, `.caf`,
   `.flac` and `.m4r`. Safari on iOS reads `audio/*` as movie types (WebKit bug
   242110), so with that alone the iPhone's Files picker greys out every audio
-  file and offers videos (found on 2026-11-11). The list only filters the
+  file and offers videos (found on 2026-11-11). Since 2026-11-24 the list
+  also names `video/*`, on purpose: a video is picked for its sound (section
+  4.1), and the iPhone's "Photo Library" entry no longer rests on that bug
+  alone. The field's label is "Audio or video file", and the hint under it
+  says the 64 MB is of audio. The list only filters the
   picker. The page decodes by content and refuses what it cannot decode.
 - Buttons: **Hear final**, **Get on this iPhone**, and **Download .m4r**.
 
@@ -2444,6 +2544,8 @@ docs/PLAN.md
 - A short alert-tone preset (1 to 5 s). Phase 0 showed that custom tones already
   appear in the Text Tone list.
 - Beat-snapped edges.
+- Other sound in a video (section 4.1): PCM, Apple Lossless and fragmented
+  MP4 taken out by the page like AAC, and the track's edit list carried over.
 
 ## Sources
 
@@ -2472,3 +2574,6 @@ docs/PLAN.md
 - [Joshua Rogers: Squid security audit](https://joshua.hu/squid-security-audit-35-0days-45-exploits)
 - [Debian tracker: tinyproxy CVE-2023-49606](https://security-tracker.debian.org/tracker/CVE-2023-49606)
 - [Envoy: SNI dynamic forward proxy](https://www.envoyproxy.io/docs/envoy/latest/configuration/listeners/network_filters/sni_dynamic_forward_proxy_filter)
+- [WebKit bug 228971: decodeAudioData should support .mov files recorded by iPhone](https://bugs.webkit.org/show_bug.cgi?id=228971)
+- [WebKit bug 307632: MP4 with Opus track isn't usable with decodeAudioData (the decoder moves to AVAssetReader)](https://bugs.webkit.org/show_bug.cgi?id=307632)
+- [WebKit source: WKFileUploadPanel.mm (what the iPhone's picker offers and hands over)](https://github.com/WebKit/WebKit/blob/main/Source/WebKit/UIProcess/ios/forms/WKFileUploadPanel.mm)
