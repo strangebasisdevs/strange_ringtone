@@ -2425,6 +2425,7 @@ tests/  tests/corpus/  tests/image/  tests/image_fetcher/  tests/compose/  tests
 tests/fmp4_fixture.py       # a fragmented MP4 in YouTube's layout, with no audio, for the window program's tests
 scripts/{check_pr_title.py,check_contract_change.py,check_ffmpeg_release.py,check_release_tag.py}   # stdlib checks CI runs
 tools/spike/phase0.py       # regenerates the iOS test tones into spike-out/
+tools/spike/phone_encode/   # spike (2026-11-21), not part of the app: a static page that encodes a tone with the browser's AudioEncoder and writes the M4A itself, to test "Use as Ringtone" with no server; result pending the owner's phone test
 tools/dev_fetch_stack.py    # loopback dev stack: core, runner with the two stubs, fetcher, one origin, for the offline product check
 .github/{dependabot.yml,sbom/Dockerfile,workflows/{ci,pr-checks,security_gate,release-please,publish,ffmpeg-watch}.yml}
 release-please-config.json  .release-please-manifest.json
