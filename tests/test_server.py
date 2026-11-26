@@ -489,6 +489,13 @@ class StaticTest(ServerTestCase):
             "audio/suggest.js": "text/javascript; charset=utf-8",
             "audio/fades.js": "text/javascript; charset=utf-8",
             "audio/request.js": "text/javascript; charset=utf-8",
+            # The render on the device (docs/PLAN.md 15.4). The page does not
+            # load these yet; they are served like every script under static/.
+            "audio/process.js": "text/javascript; charset=utf-8",
+            "audio/limiter.js": "text/javascript; charset=utf-8",
+            "audio/encode.js": "text/javascript; charset=utf-8",
+            "audio/m4a.js": "text/javascript; charset=utf-8",
+            "audio/names.js": "text/javascript; charset=utf-8",
         }
         # Written out, so a file dropped from the allowlist or given another
         # type fails here; the template is the one listed name never served.

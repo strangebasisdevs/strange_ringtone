@@ -4,10 +4,16 @@
 // the same with a stretch of a picked song, to measure the bit rate on real
 // music. Nothing is uploaded.
 //
-// Serve this directory from any HTTPS origin the phone trusts (WebCodecs and
-// Web Share both need a secure context); on a desktop, loopback counts:
+// The M4A writer is the app's own, core/static/audio/m4a.js (it began here),
+// and this page imports it from beside itself. So copy this directory's
+// files and that one file into an empty directory, and serve that directory
+// from any HTTPS origin the phone trusts (WebCodecs and Web Share both need
+// a secure context). Never serve the repository's root for this: it holds
+// .git and whatever else is in a checkout. On a desktop, loopback counts:
 //
-//     python -I -m http.server 8081 --bind 127.0.0.1 --directory tools/spike/phone_encode
+//     mkdir /tmp/phone_encode
+//     cp tools/spike/phone_encode/* core/static/audio/m4a.js /tmp/phone_encode/
+//     python -I -m http.server 8081 --bind 127.0.0.1 --directory /tmp/phone_encode
 import { AAC_FRAME_SAMPLES, audioSpecificConfig, splitAdts, writeM4a } from "./m4a.js";
 
 // The server's renders are 44.1 kHz stereo at 256 kbit/s

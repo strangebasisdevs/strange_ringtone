@@ -14,6 +14,7 @@ for the fetcher and fetch.js, once fetcher/ is in the checkout.
 """
 from __future__ import annotations
 
+import inspect
 import json
 import re
 import shutil
@@ -24,7 +25,8 @@ import unittest
 from pathlib import Path
 
 import helpers
-from strange_ringtone import wav
+from strange_ringtone import names as server_names
+from strange_ringtone import render, wav
 from strange_ringtone.config import Settings
 from strange_ringtone.wav import WavError, inspect_wav
 
@@ -260,6 +262,69 @@ class FetchMessagesCoverFetcherCodesTest(unittest.TestCase):
                 # Its own words, not the http_<status> fallback either.
                 self.assertNotIn("(HTTP ", message)
 
+
+
+class DeviceRenderMatchesServerTest(unittest.TestCase):
+    """The render on the device uses the server's numbers (docs/PLAN.md 15.4).
+
+    process.js, encode.js and names.js restate what render.py, config.py and
+    names.py decide, because a tone made on the device never reaches them.
+    Each number is read out of the module itself and compared here, so
+    neither side can change alone.
+    """
+
+    @unittest.skipIf(NODE is None, NO_NODE)
+    def test_the_modules_export_the_servers_numbers(self) -> None:
+        script = (
+            "import { pathToFileURL } from 'node:url';"
+            "const load = (name) => import(pathToFileURL(process.argv[1] + '/' + name).href);"
+            "const [p, e, n, w] = await Promise.all(['process.js', 'encode.js', 'names.js', 'wav.js'].map(load));"
+            "process.stdout.write(JSON.stringify({"
+            "ceilingDb: p.CEILING_DB, ceiling: p.CEILING, gainClampDb: p.GAIN_CLAMP_DB,"
+            "correctionLu: p.CORRECTION_THRESHOLD_LU, processRate: p.SAMPLE_RATE,"
+            "minSeconds: p.MIN_SECONDS, maxSeconds: p.MAX_SECONDS, wavMinSeconds: w.MIN_SECONDS,"
+            "encodeRate: e.SAMPLE_RATE, bitrates: e.BITRATES, encodeMaxSeconds: e.MAX_SECONDS,"
+            "defaultName: n.DEFAULT_NAME, maxNamePoints: n.MAX_NAME_POINTS}));"
+        )
+        proc = run_node(["--input-type=module", "-e", script, AUDIO.as_posix()], timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        page = json.loads(proc.stdout)
+
+        self.assertEqual(page["ceilingDb"], render.LIMITER_CEILING_DB)
+        self.assertAlmostEqual(page["ceiling"], 10 ** (render.LIMITER_CEILING_DB / 20), places=15)
+        self.assertEqual(page["gainClampDb"], render.GAIN_CLAMP_DB)
+        self.assertEqual(page["correctionLu"], render.CORRECTION_THRESHOLD_LU)
+        self.assertEqual(page["processRate"], render.SAMPLE_RATE)
+        self.assertEqual(page["encodeRate"], render.SAMPLE_RATE)
+        # The encoder refuses a longer tone than the chain does, by itself.
+        self.assertEqual(page["encodeMaxSeconds"], page["maxSeconds"])
+        # The server's rate comes first; the others are only for an encoder
+        # that refuses it.
+        self.assertEqual(f"{page['bitrates'][0] // 1000}k", render.BITRATE)
+        self.assertEqual(page["bitrates"], sorted(page["bitrates"], reverse=True))
+        self.assertEqual(page["defaultName"], server_names.DEFAULT_NAME)
+        self.assertEqual(page["maxNamePoints"], server_names.MAX_NAME_POINTS)
+        # The shortest clip is the one wav.py and wav.js already agree on
+        # (EncoderAcceptedByServerTest above).
+        self.assertEqual(page["minSeconds"], page["wavMinSeconds"])
+        self.assertEqual(page["minSeconds"], 0.5)
+
+    @unittest.skipIf(NODE is None, NO_NODE)
+    def test_the_longest_clip_is_the_contracts_ceiling(self) -> None:
+        # MAX_CLIP_SECONDS may be set up to this and no higher; the device
+        # render refuses anything longer, whatever the page asks of it.
+        source = inspect.getsource(Settings.from_env)
+        bounds = re.search(r'_parse_int\(environ, "MAX_CLIP_SECONDS", (\d+), (\d+), (\d+)\)', source)
+        self.assertIsNotNone(bounds, "config.py no longer states MAX_CLIP_SECONDS's bounds this way")
+        assert bounds is not None
+        script = (
+            "import { pathToFileURL } from 'node:url';"
+            "const p = await import(pathToFileURL(process.argv[1]).href);"
+            "process.stdout.write(JSON.stringify(p.MAX_SECONDS));"
+        )
+        proc = run_node(["--input-type=module", "-e", script, (AUDIO / "process.js").as_posix()], timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(json.loads(proc.stdout), int(bounds.group(3)))
 
 
 class PageByteCapDocumentedTest(unittest.TestCase):
