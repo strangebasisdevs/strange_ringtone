@@ -6,7 +6,8 @@ decided on 2026-11-03), built in two PRs. Milestone 6, the release flow and
 the contract, is built (section 12). v0.1.0 itself waits for the owner, and
 section 12 has the list: a repository setting and two labels, a rehearsal
 of the publish workflow, the phone tests of the share sheet and the
-Shortcut, and the release they make by hand.
+Shortcut, and the release they make by hand. A public, browser-only site
+was decided on 2026-11-25 (section 15); none of it is built.
 This file is the design record; the README's "Deployment contract" is the
 source of truth for operators from v0.1.0 on.
 
@@ -2425,7 +2426,7 @@ tests/  tests/corpus/  tests/image/  tests/image_fetcher/  tests/compose/  tests
 tests/fmp4_fixture.py       # a fragmented MP4 in YouTube's layout, with no audio, for the window program's tests
 scripts/{check_pr_title.py,check_contract_change.py,check_ffmpeg_release.py,check_release_tag.py}   # stdlib checks CI runs
 tools/spike/phase0.py       # regenerates the iOS test tones into spike-out/
-tools/spike/phone_encode/   # spike (2026-11-21), not part of the app: a static page that encodes a tone with the browser's AudioEncoder and writes the M4A itself, to test "Use as Ringtone" with no server; result pending the owner's phone test
+tools/spike/phone_encode/   # spike (2026-11-21), not part of the app: a static page that encodes a tone with the browser's AudioEncoder and writes the M4A itself, to test "Use as Ringtone" with no server. Result (2026-11-25, one iPhone, Safari 27.0.1): the owner reports that iOS took the 12 s tone and the one of exactly 30.0 s, both written with an edit list; the encoder's priming is 2112 samples with timestamps from 0; its `description` is a whole ES descriptor, not the two config bytes, so the page keeps building its own. A second run the same day encoded 30 s of a real song: with `bitrateMode: "constant"` the rate asked for is the rate made (256 and 128 kbit/s, measured), and with "variable", the default, Safari ignores the number (about 65 kbit/s for either; the synthetic tone had come out near 37). The owner heard no difference between the four and iOS took the tone, so a phone encode must ask for a constant rate to get 256 kbit/s. Chrome on the same iPhone made the same files to the byte (it runs on the same WebKit), and iOS took its tone too
 tools/dev_fetch_stack.py    # loopback dev stack: core, runner with the two stubs, fetcher, one origin, for the offline product check
 .github/{dependabot.yml,sbom/Dockerfile,workflows/{ci,pr-checks,security_gate,release-please,publish,ffmpeg-watch}.yml}
 release-please-config.json  .release-please-manifest.json
@@ -2625,6 +2626,17 @@ docs/PLAN.md
    and set the two packages public if its scan can't pull them; the phone
    tests of the share sheet and the Shortcut; then merge the release PR
    and publish the release.
+7. **The public site (section 15, decided on 2026-11-25).** Three PRs,
+   then the deployer's set-up (15.8) and a release. None of it is built.
+   - **7a, `feat/device-render`:** the render on the device (15.4), as
+     modules with their tests. The page does not change.
+   - **7b, `feat/static-site`:** the page's `device` mode (15.3, 15.5,
+     15.7), the bundle and its `_headers` (15.6). Product check in a
+     desktop browser from loopback, then on the owner's iPhone from an
+     HTTPS address: a real song, through **Get on this iPhone**, to "Use as
+     Ringtone".
+   - **7c, `feat/site-publish`:** the `site` job and `publish_site.py`
+     (15.8), the README, and the job's entry in the workflow tests.
 
 ## 13. Privacy notes
 
@@ -2676,6 +2688,295 @@ docs/PLAN.md
 - Other sound in a video (section 4.1): PCM, Apple Lossless and fragmented
   MP4 taken out by the page like AAC, and the track's edit list carried over.
 
+## 15. A public, browser-only site (decided 2026-11-25)
+
+Self-hosting asks for Docker, a certificate the phone trusts and a computer
+that stays on (sections 4 and 7.3), which is too much for someone who only
+wants a ringtone. The public site is the same page, served as static files,
+and it makes the tone on the visitor's own device: no audio is uploaded, and
+the project runs no server for it. The fetcher has no part in it.
+
+### 15.1 Decisions (interview, 2026-11-21 to 2026-11-25)
+
+| # | Question | Decision |
+| --- | --- | --- |
+| P1 | YouTube on the public site | None. The fetcher stays a self-host feature. |
+| P2 | Where the tone is made | On the visitor's device, with no server taking part. The spike of 15.2 came first. |
+| P3 | Bit rate | A constant 256 kbit/s, the server's rate. A lower rate only where the browser's encoder refuses 256. |
+| P4 | Paying for it | No ads, and nothing loaded from a third party. A static site has no server bill for ads to cover. |
+| P5 | Which page | The app's own page with a second render path. The self-hosted app keeps rendering on its server. |
+| P6 | Host | A static host that sends response headers from a `_headers` file and gives the site an origin of its own. The maintainer's is Cloudflare. GitHub Pages was turned down: it sends no custom headers, and a project page shares its origin with every other page of the same account. |
+| P7 | Publishing | A job of this repository's release workflow, so a release updates the site with no further step. Its token is the secret of a GitHub environment that only release tags reach. A separate site repository that pins a release was turned down as one step too many for each update. |
+| P8 | Address | The deployer's own domain, with none of Apple's trademarks in its name: Apple's guidelines for third parties bar them in a domain name. Like every deployment's address, it is not written in this repository. |
+
+Defaults I chose (overrule any of these before milestone 7b):
+
+- No sponsor link in the first version.
+- A browser that can't encode gets a plain message and a link to this
+  repository (15.5).
+- The page's notice (15.7).
+- **Hear final** plays the processed audio before it is encoded (15.3).
+
+Not decided: whether the README links to the public site. It would be the
+first deployment address in this repository.
+
+### 15.2 What the spike showed (2026-11-25)
+
+`tools/spike/phone_encode/` is a static page that encodes audio with the
+browser's `AudioEncoder`, writes the M4A itself and hands it to the share
+sheet. It ran from an HTTPS address on one iPhone, in Safari 27.0.1 and in
+Chrome on the same phone, which runs on the same WebKit and made the same
+files to the byte.
+
+| Question | Result |
+| --- | --- |
+| Does iOS take a tone the phone encoded? | Yes: a 12 s tone, one of exactly 30.0 s, and 30 s of a real song, each through the share sheet's "Use as Ringtone". |
+| Is the bit rate asked for the one made? | Only with `bitrateMode: "constant"`: 256 561 and 128 250 bit/s measured for 256 and 128 kbit/s. With "variable", the default, the number is ignored: 65 493 bit/s for either. |
+| How fast is it? | 30 s of stereo in about 270 ms. |
+| The encoder's `description` | A whole ES descriptor, not the two AudioSpecificConfig bytes. The writer builds the two bytes itself. |
+| Priming | 2112 samples, with timestamps that start at 0, so the encoder doesn't say so: 12 s of input came out 2256 samples longer, the priming and the last frame's padding. |
+| Edit list | Needed. With it the file presents the exact length (30.000000 s). Without it the 12 s tone presents 12.051 s by its boxes, which would put a full tone over 30.0 s. |
+| Decoding the result on the phone | `decodeAudioData` drops 2112 samples twice from a file with an edit list, 48 ms of its start. An `<audio>` element reports the exact length. |
+| Chrome on Windows | Refuses 256 kbit/s and takes 192, 160 and 128; makes the rate asked for in either mode; has no priming to skip. |
+
+### 15.3 One page, two render paths
+
+`<main id="app">` gets one more attribute, `data-render`: `server` or
+`device`. The core image always writes `server` and has no setting for it,
+so the deployment contract (5.7) does not change. Only the static bundle
+(15.6) writes `device`.
+
+Everything before the render is the same in both modes, a video's sound
+included (4.1): the page has always decoded, drawn and trimmed on the
+device.
+
+In `device` mode the page:
+
+- makes no request once its own files have loaded: no `/api/`, no
+  `/fetch/`. The CSP's `connect-src 'none'` (15.6) enforces it, so a
+  mistake fails closed.
+- has no YouTube box, and ignores a `#yt=` fragment.
+- renders with the chain of 15.4 where the server path calls `render()` and
+  `fetchResult()` (`renderFinal` in `app.js`, the one place the page talks
+  to the core), and shows the same duration, loudness and gain.
+- keeps the finished tone in memory until the next render, a new file or a
+  reload. Nothing expires, so the expiry timer of server mode does not run.
+- offers the same **Get on this iPhone** share and the two downloads. The
+  downloads are `blob:` links made for that tone and revoked with it.
+- plays the processed audio for **Hear final**: the samples after the gain,
+  the limiter and the fades, before the encoder. Decoding the finished file
+  would lose 48 ms on the phone (15.2). The cost: the preview has none of
+  the encoder's own artefacts, which at 256 kbit/s are not audible.
+
+### 15.4 The render on the device
+
+The same steps as the server's (5.3), on the selection the page already
+holds as 44.1 kHz floating-point samples in one or two channels. Each step
+is a pure function on `Float32Array` channels under `core/static/audio/`,
+so `node --test` runs it unchanged. Only the encoder needs a browser.
+
+1. **Measure** the integrated loudness with the page's BS.1770 meter
+   (`loudness.js`). Here it is the authority: there is no ffmpeg to defer
+   to.
+2. **Gain:** the target minus the measured loudness, clamped to ±20 dB, or
+   0 dB with normalising off.
+3. **Limit** at −1.5 dBFS (`limiter.js`, new): a look-ahead limiter with the
+   channels linked, 5 ms attack and 50 ms release like `alimiter`'s
+   defaults, and its delay taken back out so the length is exact. It is
+   specified by what it guarantees, not by matching ffmpeg sample for
+   sample: no output sample is above the ceiling; audio that never reaches
+   the ceiling comes out unchanged; the gain it applies never jumps.
+4. **Fade** with the quarter sine that `fades.js` already draws.
+5. **Measure again and correct:** if the result misses the target by more
+   than 0.5 LU, run steps 2 to 4 once more from the selection, with the
+   gain moved by the error. The loudness shown is that of the final run.
+6. **Encode** (`encode.js`, new) with `AudioEncoder`: AAC-LC (`mp4a.40.2`),
+   44.1 kHz, `bitrateMode: "constant"`, 256 kbit/s. `isConfigSupported` is
+   asked first, and 192, 160 and 128 kbit/s are tried in that order where
+   256 is refused; the page says which rate it used when it is not 256.
+   The samples go in as `f32-planar` blocks. An encoder error, or no output
+   within a deadline, fails the render in plain words.
+7. **Write the file** (`m4a.js`, moved from the spike with its tests):
+   `ftyp` `M4A `, `moov` before `mdat`, and an edit list that skips the
+   priming and presents exactly the selection's samples. The priming is the
+   first chunk's negative timestamp where the encoder gives one; 2112 where
+   the timestamps start at 0 and the frames hold at least that many samples
+   more than the input (Apple's encoder); and otherwise the whole frames of
+   surplus. The two config bytes are built from the rate and the channel
+   count, never taken from the encoder. ADTS headers are stripped where an
+   encoder emits them. No title is written: iOS names the tone after the
+   file (5.3). The page's other M4A writer, inside `movie.js` (4.1), stays
+   as it is and shares no code with this one: that one copies a video's
+   frames and their config untouched for the decoder to read, this one
+   writes what our own encoder made, and joining them would reopen a
+   reviewed parser for a few lines of box helpers.
+8. **Name the file** (`names.js`, new): the rules of 5.6 in JavaScript. The
+   two implementations share one file of test vectors, so they can't drift.
+
+The selection's limits stay the page's: half a second to
+`max_clip_seconds`. The true peak after encoding is not measured, as on the
+server. The −1.5 dBFS ceiling is the margin, and 5.3 measured it for
+ffmpeg's encoder only, so the product check of milestone 7b decodes one
+loud tone made on the phone and reads its peak.
+
+### 15.5 A browser that can't encode
+
+In `device` mode the page asks `AudioEncoder.isConfigSupported` at start-up.
+Where there is no `AudioEncoder`, or it takes AAC-LC at none of the four
+rates, the page says so before a file is picked. It says what it needs: an
+iPhone on iOS 26 or later, in any browser, which is also what "Use as
+Ringtone" needs, or a desktop browser with an AAC encoder. It links to this
+repository for running one's own copy, whose server renders for any
+browser. Nothing else on the page is offered in that state.
+
+### 15.6 The static bundle
+
+`scripts/build_site.py` (stdlib) writes the site into an empty directory:
+
+- `index.html`, rendered by the server's own `render_index` with
+  `data-render="device"`, the fetcher off, the release's version, and
+  `source_url` set to the tag's tree (7.5)
+- the files of `static.ALLOWED` under `static/<version>/`, the addresses
+  the server gives them
+- `_headers`, and nothing else
+
+`_headers` carries the headers of `http_guard.security_headers()` for an
+https origin, built from that function so the two can't drift. The one
+difference is a stricter CSP: `default-src 'none'; script-src 'self';
+style-src 'self'; img-src 'self'; connect-src 'none'; base-uri 'none';
+form-action 'none'; frame-ancestors 'none'`. The page sends nothing, so it
+is allowed to send nothing. `/static/*` is cached as immutable, like the
+server's, and the page itself is revalidated on every visit. Its
+`Cache-Control` also says `no-transform`: a host that sits in front of the
+page as a proxy may rewrite HTML or add a script of its own (the
+maintainer's obfuscates addresses, injects an analytics beacon and a bot
+check unless told not to), and `no-transform` is the documented way to
+refuse that from the page's side. The CSP would block such a script, but
+the page should arrive as it was built.
+
+The bundle holds no address, account or name of any deployment. It runs on
+any static host that reads `_headers`. On one that doesn't, the headers are
+missing, and the framing ban with them, which is why P6 went as it did.
+
+### 15.7 What the page says in `device` mode
+
+In the footer, beside **Source**:
+
+- "Your audio stays on this device. This page cannot send it anywhere."
+- "Use audio you have the right to use."
+- "Not affiliated with Apple. iPhone is a trademark of Apple Inc."
+
+### 15.8 Publishing from a release
+
+`publish.yml` gains one job, `site`, after `tag`, so a release that the
+image scan stopped never reaches the site. It runs only for a release, and
+only where the repository has the environment's variables set, so a fork's
+releases skip it.
+
+- **Environment:** `public-site`, limited to `v*` tags by its deployment
+  rules. Its secret `CLOUDFLARE_API_TOKEN` and its variables
+  `CLOUDFLARE_ACCOUNT_ID`, `SITE_NAME` and `SITE_URL` exist only there. The
+  workflow file names them and holds none of their values, and no pull
+  request or branch build can read them.
+- **Permissions:** `contents: read` and nothing else. The job checks out
+  the tagged commit without keeping credentials, builds the bundle (15.6)
+  and runs `scripts/publish_site.py`.
+- **`publish_site.py`** (stdlib) uses Cloudflare's direct upload for
+  Workers static assets, the product Cloudflare names for new static
+  sites. No CLI and no package is installed in the job that holds the
+  token. Its steps:
+  1. An upload session (`…/workers/scripts/<name>/assets-upload-session`)
+     with the manifest: every file's path, a hash of 32 hexadecimal
+     characters and its size. `_headers` is not in it.
+  2. The files Cloudflare doesn't already hold, one request for each
+     bucket the session names, each file with the type it is to be served
+     as, under the session's one-hour token.
+  3. The deployment (`PUT …/workers/scripts/<name>`) with the completion
+     token, a pinned `compatibility_date`, and the contents of `_headers`
+     in the assets' configuration, which is how that file reaches the
+     host.
+  4. The `workers.dev` address and the per-version preview addresses
+     turned off, so the site answers on one origin.
+  5. A read-back from `SITE_URL`: the page, one static file and a path
+     that doesn't exist. The job fails unless the page is the bundle's to
+     the byte and every header of `_headers` is on each answer the host
+     documents them for.
+
+  The script talks to one fixed API host over verified TLS, follows no
+  redirect, bounds every answer and every wait, and never prints a token
+  or an answer that holds one.
+- **Open until 7c tries it:** Cloudflare's reference contradicts itself on
+  whether a deployment may carry no script at all. If it must carry one,
+  it is the smallest documented one, which hands the request back to the
+  files and runs only for a path that matches none. The reference also
+  doesn't say whether `_headers` applies to a missing path, or takes
+  `Strict-Transport-Security`; the read-back answers both.
+- **The token** is the deployer's to create: one account, the account
+  permission "Workers Scripts: Edit", and nothing for DNS, zones or
+  billing. If that permission can't create a site that doesn't exist yet,
+  the deployer creates the empty one once by hand.
+- **Once, by the deployer:** the Cloudflare account and the token; the
+  environment and its four values; the custom domain attached to the site
+  in the dashboard, which the token has no permission for; "Always Use
+  HTTPS" on; and these features of the zone off, each of which rewrites
+  pages, adds a script or adds a reporting header: Email Address
+  Obfuscation, Web Analytics, Rocket Loader, Bot Fight Mode, Speed Brain,
+  Network Error Logging and Zaraz.
+- **Cost:** on Cloudflare's free plan requests for static files are free
+  and unlimited, and the plan has no overage charge.
+- A failed `site` job leaves the release as it is: run the job again.
+
+### 15.9 Security and privacy
+
+- **Nothing of ours to attack.** There is no upload, no render, no storage
+  and no account, so what section 8 guards on the core does not exist
+  here. Heavy use costs the deployer nothing: the visitor's device does the
+  work, and a static host serves the files.
+- **What a visitor trusts** is the code they are served. Whoever controls
+  the host account, the domain or this repository's releases can change
+  it, and a changed page could read the audio a visitor picks. The guards
+  are the protected `main` and `v*` tags (9.2, 9.3), the environment that
+  only those tags reach, a token that can do one thing, and the strict
+  CSP, which stops an injected script from loading or sending anything.
+- **What the host sees:** the visitor's address and browser, for the
+  page's own files, like any website. No audio, no tone name and no
+  selection.
+- **No telemetry**, no ads, and no fonts or scripts from elsewhere (section
+  13). The page keeps nothing between visits: no cookie and no stored data.
+- **Copyright:** the public site fetches nothing. A visitor brings a file
+  they already have, and the page tells them to use audio they have the
+  right to use.
+- **Trademark:** the name and the address use none of Apple's marks. The
+  page names the iPhone only to say what the tone is for, and says it is
+  not affiliated.
+
+### 15.10 Tests
+
+Every check below has a test that fails when the check is removed.
+
+- `limiter.js`: the three guarantees of 15.4, on signals built to break
+  each one. The chain: the loudness lands within 0.5 LU of the target or
+  the correction ran, and the length is the selection's to the sample.
+- `encode.js`, against a fake `AudioEncoder`: the constant mode is asked
+  for, the rates are tried in order, and an error or a stall fails the
+  render.
+- `m4a.js`: the spike's layout tests, and the three priming rules.
+- `names.js` and `names.py`: one shared file of vectors.
+- The page in `device` mode, under Node with a `fetch` that throws: a
+  render completes, and nothing asked for the network.
+- `build_site.py`: the exact list of files; `data-render="device"`; no
+  placeholder left; `_headers` equal to the server's headers but for the
+  CSP; `connect-src 'none'` in that CSP; `no-transform` on the page.
+- The core image still writes `data-render="server"` and has no new
+  setting.
+- `publish_site.py`, against a fake API on loopback: the shape of each
+  request; each token only in the header of the requests that need it;
+  nothing secret in the output; a redirect, another host and an oversized
+  answer refused; a read-back that differs by one byte or lacks one
+  header fails the job.
+- `tests/test_release_workflows.py`: the `site` job's permissions, its
+  environment, what it needs and when it runs.
+
 ## Sources
 
 - AppleInsider: [Custom ringtones are now slightly easier to add in iOS 26](https://appleinsider.com/articles/25/06/12/custom-ringtones-are-now-slightly-easier-to-add-in-ios-26)
@@ -2706,3 +3007,11 @@ docs/PLAN.md
 - [WebKit bug 228971: decodeAudioData should support .mov files recorded by iPhone](https://bugs.webkit.org/show_bug.cgi?id=228971)
 - [WebKit bug 307632: MP4 with Opus track isn't usable with decodeAudioData (the decoder moves to AVAssetReader)](https://bugs.webkit.org/show_bug.cgi?id=307632)
 - [WebKit source: WKFileUploadPanel.mm (what the iPhone's picker offers and hands over)](https://github.com/WebKit/WebKit/blob/main/Source/WebKit/UIProcess/ios/forms/WKFileUploadPanel.mm)
+- [Apple: Guidelines for Using Apple Trademarks and Copyrights](https://www.apple.com/legal/intellectual-property/guidelinesfor3rdparties.html)
+- [Cloudflare Workers: static assets, direct upload](https://developers.cloudflare.com/workers/static-assets/direct-upload/)
+- [Cloudflare Workers: headers for static assets](https://developers.cloudflare.com/workers/static-assets/headers/)
+- [Cloudflare Workers: static assets, billing and limitations](https://developers.cloudflare.com/workers/static-assets/billing-and-limitations/)
+- [Cloudflare API: upload a Worker script](https://developers.cloudflare.com/api/resources/workers/subresources/scripts/methods/update/)
+- [Cloudflare: API token permissions](https://developers.cloudflare.com/fundamentals/api/reference/permissions/)
+- [Cloudflare: Email Address Obfuscation](https://developers.cloudflare.com/waf/tools/scrape-shield/email-address-obfuscation/)
+- [Cloudflare Web Analytics: getting started](https://developers.cloudflare.com/web-analytics/get-started/)
