@@ -7,7 +7,9 @@ the contract, is built (section 12). v0.1.0 itself waits for the owner, and
 section 12 has the list: a repository setting and two labels, a rehearsal
 of the publish workflow, the phone tests of the share sheet and the
 Shortcut, and the release they make by hand. A public, browser-only site
-was decided on 2026-11-25 (section 15); none of it is built.
+was decided on 2026-11-25 (section 15). Its first part, the render on the
+device, is built as modules that the page does not use yet (milestone 7a);
+the rest is not.
 This file is the design record; the README's "Deployment contract" is the
 source of truth for operators from v0.1.0 on.
 
@@ -2411,7 +2413,8 @@ core/
   __main__.py               # checkout entry point: python -I core
   strange_ringtone/{__main__.py,config.py,server.py,http_guard.py,static.py,wav.py,render.py,names.py,results.py}
   static/{index.html,style.css,app.js,waveform.js,zoom.js,loop.js,player.js,share.js,fetch.js}   # zoom.js, loop.js: the magnified view and the loop bars' rules (7.1); fetch.js: link parser, /fetch/ client
-  static/audio/{decode,wav,loudness,suggest,fades,request}.js   # pure audio code, unit-tested under Node
+  static/audio/{decode,movie,wav,loudness,suggest,fades,request}.js   # pure audio code, unit-tested under Node
+  static/audio/{process,limiter,encode,m4a,names}.js   # the render on the device (15.4): served, and not loaded by the page until milestone 7b
   static/package.json       # {"type": "module"} for the Node tests only: not served, not in the image
 fetcher/
   Dockerfile  requirements.in  requirements.txt   # yt-dlp and yt-dlp-ejs, hashed lock, installed into the /opt/yt-dlp venv
@@ -2627,9 +2630,15 @@ docs/PLAN.md
    tests of the share sheet and the Shortcut; then merge the release PR
    and publish the release.
 7. **The public site (section 15, decided on 2026-11-25).** Three PRs,
-   then the deployer's set-up (15.8) and a release. None of it is built.
+   then the deployer's set-up (15.8) and a release. 7a is built; 7b and
+   7c are not.
    - **7a, `feat/device-render`:** the render on the device (15.4), as
-     modules with their tests. The page does not change.
+     modules with their tests. The page does not change. **Built
+     (2026-11-26)** as `process.js`, `limiter.js`, `encode.js`, `m4a.js`
+     and `names.js`; what was settled while building is in 15.4. It has
+     run against a fake encoder in the tests and, by hand, in one desktop
+     browser (Chromium on Windows, at 192 kbit/s, from a scratch page);
+     the first encode on an iPhone is 7b's product check.
    - **7b, `feat/static-site`:** the page's `device` mode (15.3, 15.5,
      15.7), the bundle and its `_headers` (15.6). Product check in a
      desktop browser from loopback, then on the owner's iPhone from an
@@ -2774,6 +2783,13 @@ The same steps as the server's (5.3), on the selection the page already
 holds as 44.1 kHz floating-point samples in one or two channels. Each step
 is a pure function on `Float32Array` channels under `core/static/audio/`,
 so `node --test` runs it unchanged. Only the encoder needs a browser.
+Steps 1 to 5 are `processSelection` in `process.js`; steps 6 and 7 are
+`encodeTone` in `encode.js`; step 8 is `toneName` in `names.js`.
+
+The selection is first held to the range the server would have seen:
+every sample in [−1, 1] and silence where one is not a number, as the
+WAV of 5.2 holds it. (That file is also rounded to 16 bits; this is not.)
+A mono selection stays mono, as it does through ffmpeg.
 
 1. **Measure** the integrated loudness with the page's BS.1770 meter
    (`loudness.js`). Here it is the authority: there is no ffmpeg to defer
@@ -2786,10 +2802,20 @@ so `node --test` runs it unchanged. Only the encoder needs a browser.
    specified by what it guarantees, not by matching ffmpeg sample for
    sample: no output sample is above the ceiling; audio that never reaches
    the ceiling comes out unchanged; the gain it applies never jumps.
+   As built: the gain comes down in a straight line over the 5 ms before a
+   peak and is exactly what the peak needs when it arrives; after a peak
+   the reduction falls to 1/e of itself every 50 ms, and within a second
+   it is gone and the audio is bit for bit the input again; from one
+   sample to the next the gain moves by at most 1/222. It takes audio at
+   up to 384 kHz and samples up to a million times over the ceiling, and
+   refuses anything past either, where these statements stop being true.
 4. **Fade** with the quarter sine that `fades.js` already draws.
 5. **Measure again and correct:** if the result misses the target by more
    than 0.5 LU, run steps 2 to 4 once more from the selection, with the
    gain moved by the error. The loudness shown is that of the final run.
+   The device compares at full precision where the server compares
+   ffmpeg's one-decimal figures, so right at the threshold the two can
+   decide differently, and the device then lands nearer the target.
 6. **Encode** (`encode.js`, new) with `AudioEncoder`: AAC-LC (`mp4a.40.2`),
    44.1 kHz, `bitrateMode: "constant"`, 256 kbit/s. `isConfigSupported` is
    asked first, and 192, 160 and 128 kbit/s are tried in that order where
@@ -2800,21 +2826,56 @@ so `node --test` runs it unchanged. Only the encoder needs a browser.
    `ftyp` `M4A `, `moov` before `mdat`, and an edit list that skips the
    priming and presents exactly the selection's samples. The priming is the
    first chunk's negative timestamp where the encoder gives one; 2112 where
-   the timestamps start at 0 and the frames hold at least that many samples
-   more than the input (Apple's encoder); and otherwise the whole frames of
-   surplus. The two config bytes are built from the rate and the channel
+   that timestamp is not negative and the frames hold at least that many
+   samples more than the input (Apple's encoder, which stamps its first
+   chunk 0); and otherwise the whole frames of surplus. The frames must
+   then be exactly as many as the audio and that delay fill, which is
+   what both measured encoders emit. The two config bytes are built from the rate and the channel
    count, never taken from the encoder. ADTS headers are stripped where an
-   encoder emits them. No title is written: iOS names the tone after the
+   encoder emits them on every chunk; output that is ADTS only in part is
+   refused. No title is written: iOS names the tone after the
    file (5.3). The page's other M4A writer, inside `movie.js` (4.1), stays
    as it is and shares no code with this one: that one copies a video's
    frames and their config untouched for the decoder to read, this one
    writes what our own encoder made, and joining them would reopen a
    reviewed parser for a few lines of box helpers.
 8. **Name the file** (`names.js`, new): the rules of 5.6 in JavaScript. The
-   two implementations share one file of test vectors, so they can't drift.
+   two implementations share one file of test vectors
+   (`tests/name_vectors.json`), so they can't drift. The typed name goes
+   through the header the page would have sent (trimmed, at most 512 bytes
+   encoded) before it is sanitised, so both ways of rendering name a tone
+   alike. One difference is left: which characters are letters or symbols
+   comes from the Unicode tables of whatever runs the code, so a character
+   newer than Python's tables is kept by a browser that knows it and
+   dropped by the server. What is dropped for safety is the same in both.
+
+What the encoder hands back is not trusted to be an encode of what went
+in. `encode.js` holds at most eight frames more than the input fills and
+no chunk over 1545 bytes (the largest AAC-LC frame of two channels, with
+an ADTS header); requires every chunk's timestamp to follow the one
+before by one frame, to within half a frame; stops feeding an encoder
+whose output it refused; and fails the render unless the frames are
+exactly as many as the audio and its delay fill. One deadline of 30 s
+covers the whole call, and the questions about support have 5 s of it
+between them. What goes in is checked as well: at most 40 s, and every
+sample a number within [−1, 1].
+
+One thing it cannot tell (found by the review of 7a, 2026-11-26). Rules 2
+and 3 of step 7 read the encoder's delay off its frame count, so an
+encoder that drops whole frames from the end of its output and still
+reports success looks like one with a shorter delay. The tone then
+starts up to 48 ms late and ends as much early; its length stays exact.
+A frame lost anywhere else shows in the timestamps. Closing this needs
+the delay from somewhere other than the count: taking only the two
+measured encoders (an unmeasured browser is then refused), or a short
+calibration encode before each tone. Neither is built, and which, if
+either, is the owner's call.
 
 The selection's limits stay the page's: half a second to
-`max_clip_seconds`. The true peak after encoding is not measured, as on the
+`max_clip_seconds`. `processSelection` holds the outer ones itself, half a
+second and the contract's ceiling of 40 s, and `encodeTone` holds the
+40 s again, so a page bug can't set a phone to processing ten minutes of
+audio. The true peak after encoding is not measured, as on the
 server. The −1.5 dBFS ceiling is the margin, and 5.3 measured it for
 ffmpeg's encoder only, so the product check of milestone 7b decodes one
 loud tone made on the phone and reads its peak.
@@ -2959,8 +3020,11 @@ Every check below has a test that fails when the check is removed.
   the correction ran, and the length is the selection's to the sample.
 - `encode.js`, against a fake `AudioEncoder`: the constant mode is asked
   for, the rates are tried in order, and an error or a stall fails the
-  render.
-- `m4a.js`: the spike's layout tests, and the three priming rules.
+  render. So do a chunk whose timestamp does not follow the one before,
+  a frame too many or too few, output past the bounds, and input that
+  is too long or not within range; and one deadline covers the call.
+- `m4a.js`: the spike's layout tests, field by field; the three priming
+  rules and the exact frame count; ADTS taken off whole or refused.
 - `names.js` and `names.py`: one shared file of vectors.
 - The page in `device` mode, under Node with a `fetch` that throws: a
   render completes, and nothing asked for the network.

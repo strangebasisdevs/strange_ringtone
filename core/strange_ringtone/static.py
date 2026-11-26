@@ -42,6 +42,14 @@ ALLOWED = {
     "audio/suggest.js": _JS,
     "audio/fades.js": _JS,
     "audio/request.js": _JS,
+    # The render on the device (docs/PLAN.md 15.4), for the public site. The
+    # page served here renders on the server and does not load these; they
+    # are listed because every script under static/ is.
+    "audio/process.js": _JS,
+    "audio/limiter.js": _JS,
+    "audio/encode.js": _JS,
+    "audio/m4a.js": _JS,
+    "audio/names.js": _JS,
 }
 
 # index.html is a template rendered once with the settings, and is never

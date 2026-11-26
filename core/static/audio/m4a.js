@@ -1,6 +1,7 @@
-// A minimal M4A (MP4 audio) writer for AAC-LC frames, for the phone-encode
-// spike: can a tone encoded by the phone's own AudioEncoder, in a container
-// written here, be handed to iOS's "Use as Ringtone"?
+// A minimal M4A (MP4 audio) writer for AAC-LC frames: the file of a tone
+// made on the device (docs/PLAN.md 15.4), from what the browser's own
+// AudioEncoder emits. The phone-encode spike (tools/spike/phone_encode)
+// showed that iOS takes a tone in this container for "Use as Ringtone".
 //
 // The layout copies what the server's ffmpeg writes with `-f ipod
 // -movflags +faststart` (core/strange_ringtone/render.py), which Phase 0
@@ -8,10 +9,19 @@
 // that file has and a player doesn't need: the title tag (iOS names a tone
 // after the file) and the roll-recovery sample groups.
 //
+// The page's other M4A writer, inside movie.js, shares nothing with this
+// one: that one copies a video's frames and their config untouched for the
+// decoder to read, and this one writes only what our own encoder made.
+//
 // Pure: no DOM, no WebCodecs, so node:test covers it (tests/js/m4a.test.mjs).
 
 /** Samples in one AAC-LC frame. */
 export const AAC_FRAME_SAMPLES = 1024;
+/**
+ * The delay of Apple's AAC encoder, in samples (Technical Note TN2258). On an
+ * iPhone the encoder's timestamps start at 0 and do not say so.
+ */
+export const APPLE_PRIMING = 2112;
 
 // MPEG-4 Audio's sampling_frequency_index table (ISO/IEC 14496-3).
 const SAMPLE_RATES = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350];
@@ -41,8 +51,8 @@ export function audioSpecificConfig(sampleRate, channels) {
 
 /**
  * Split an ADTS stream into its raw AAC frames. WebCodecs encoders emit raw
- * frames by default; this is for one that emits ADTS anyway, and for feeding
- * the writer from an `.aac` file when checking it against ffprobe.
+ * frames by default; this is for one that emits ADTS anyway (rawFrames), and
+ * for feeding the writer from an `.aac` file when checking it against ffprobe.
  * @param {Uint8Array} bytes
  * @returns {{frames: Uint8Array[], sampleRate: number, channels: number}}
  */
@@ -74,6 +84,109 @@ export function splitAdts(bytes) {
   }
   if (frames.length === 0) throw new Error("no ADTS frames");
   return { frames, sampleRate, channels };
+}
+
+// The start of every ADTS frame: twelve 1 bits, then the two layer bits,
+// which are always 0. A raw AAC frame that began like this would be saying,
+// in its first three bits, that it holds nothing at all. (A chunk of one
+// byte has no second byte to match, and so is not ADTS.)
+function startsLikeAdts(chunk) {
+  return chunk[0] === 0xff && (chunk[1] & 0xf6) === 0xf0;
+}
+
+/**
+ * The encoder's chunks as raw AAC frames. An encoder that wraps every chunk
+ * in an ADTS header has the headers taken off, because an MP4 holds raw
+ * frames; chunks that are raw already come back as they are.
+ *
+ * There is no third kind. Where no chunk starts like ADTS, they are raw.
+ * Where any does, every chunk must be exactly one ADTS frame of its own
+ * length, in the format that was asked for; anything else (some chunks ADTS
+ * and some not, two frames in a chunk, a byte too many) is refused, because
+ * it would otherwise be written into the file with its headers on.
+ * @param {Uint8Array[]} chunks what the encoder emitted, in order
+ * @param {number} sampleRate the rate the encoder was set up for
+ * @param {number} channels the channel count it was set up for
+ * @returns {Uint8Array[]} raw frames
+ */
+export function rawFrames(chunks, sampleRate, channels) {
+  if (!Array.isArray(chunks) || chunks.length === 0) throw new RangeError("no frames");
+  let claims = 0;
+  for (const chunk of chunks) {
+    if (!(chunk instanceof Uint8Array) || chunk.length === 0) {
+      throw new TypeError("a frame must be a non-empty Uint8Array");
+    }
+    if (startsLikeAdts(chunk)) claims += 1;
+  }
+  if (claims === 0) return chunks;
+  if (claims !== chunks.length) throw new Error("the encoder's frames are part ADTS and part not");
+  return chunks.map((chunk) => {
+    // Throws for a chunk that is not ADTS all the way through.
+    const adts = splitAdts(chunk);
+    if (adts.frames.length !== 1) throw new Error("more than one ADTS frame in one chunk");
+    // The headers state a format too, and one that is not what was asked
+    // for would go into a file whose own header says otherwise.
+    if (adts.sampleRate !== sampleRate || adts.channels !== channels) {
+      throw new Error("the encoder's ADTS frames are not in the format that was asked for");
+    }
+    return adts.frames[0];
+  });
+}
+
+/**
+ * How many samples of encoder delay ("priming") the frames start with, which
+ * the edit list has to skip (docs/PLAN.md 15.2 and 15.4).
+ *
+ *   1. A first chunk with a negative timestamp says so itself.
+ *   2. A first timestamp that is not negative, and at least Apple's 2112
+ *      samples more in the frames than went in: Apple's encoder, which
+ *      delays by 2112 and stamps its first chunk 0.
+ *   3. Otherwise the whole frames of surplus, the usual delay of an encoder
+ *      that has less to spare (none, for the one measured on Windows).
+ *
+ * Then the frames must be exactly as many as the audio and that delay fill:
+ * no fewer, and not a whole frame more. Both encoders that were measured
+ * (plan 15.2) emit exactly that many.
+ *
+ * What this cannot see: rules 2 and 3 read the delay off the frame count,
+ * so an encoder that loses whole frames from the END of its output looks
+ * like one with a shorter delay. The tone then starts up to 48 ms late and
+ * ends as much early; its length stays exact. (A frame lost anywhere else
+ * shows in the timestamps, which encode.js checks.)
+ *
+ * @param {object} options
+ * @param {number} options.firstTimestamp the first chunk's timestamp, in microseconds
+ * @param {number} options.sampleRate in Hz
+ * @param {number} options.frames how many frames the encoder emitted
+ * @param {number} options.samples how many samples went in
+ * @returns {number} whole samples; priming + samples always fits in the frames
+ */
+export function primingSamples({ firstTimestamp, sampleRate, frames, samples }) {
+  if (!Number.isFinite(firstTimestamp)) throw new RangeError("the first timestamp must be a finite number");
+  if (!(Number.isFinite(sampleRate) && sampleRate > 0)) throw new RangeError("sample rate out of range");
+  if (!Number.isInteger(frames) || frames < 1) throw new RangeError("frames must be a whole number, at least 1");
+  if (!Number.isInteger(samples) || samples < 1) throw new RangeError("samples must be a whole number, at least 1");
+  const surplus = frames * AAC_FRAME_SAMPLES - samples;
+  let priming;
+  if (firstTimestamp < 0) {
+    priming = Math.round((-firstTimestamp * sampleRate) / 1e6);
+  } else if (surplus >= APPLE_PRIMING) {
+    priming = APPLE_PRIMING;
+  } else {
+    priming = Math.floor(surplus / AAC_FRAME_SAMPLES) * AAC_FRAME_SAMPLES;
+  }
+  // Fewer samples came out than went in, or the timestamp claims a delay the
+  // frames have no room for: an edit list written from that would present
+  // audio that is not there.
+  if (surplus < 0 || priming > surplus) {
+    throw new RangeError("the encoder returned less audio than it was given");
+  }
+  // A whole frame or more past the audio and its delay: frames that belong
+  // to nothing that went in, or a delay none of the rules knows.
+  if (surplus - priming >= AAC_FRAME_SAMPLES) {
+    throw new RangeError("the encoder returned more frames than the audio fills");
+  }
+  return priming;
 }
 
 function concat(parts) {
@@ -139,7 +252,7 @@ const UNITY_MATRIX = u32(0x00010000, 0, 0, 0, 0x00010000, 0, 0, 0, 0x40000000);
  * and the file plays every sample of every frame.
  *
  * @param {object} options
- * @param {number} options.sampleRate at most 48000
+ * @param {number} options.sampleRate a rate AAC has, at most 65535 (the sample entry holds it in 16 bits)
  * @param {number} options.channels 1 or 2
  * @param {Uint8Array[]} options.frames raw AAC-LC frames (no ADTS header)
  * @param {number} [options.priming=0] samples to skip at the start

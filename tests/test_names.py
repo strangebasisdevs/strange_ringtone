@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import email.message
+import json
 import re
 import unicodedata
 import unittest
@@ -25,6 +26,8 @@ VS16 = "\ufe0f"
 FAMILY = "\U0001f468\u200d\U0001f469\u200d\U0001f467"  # man ZWJ woman ZWJ girl
 HEART = "\u2764\ufe0f"  # red heart with VS16
 FORBIDDEN = set('/\\"*:<>?|')
+# The cases names.js is held to as well (tests/js/names.test.mjs reads the same file).
+VECTORS = Path(__file__).resolve().parent / "name_vectors.json"
 
 
 class ConstantsTest(unittest.TestCase):
@@ -250,6 +253,35 @@ class SanitiseTest(unittest.TestCase):
                 if category == "Cf":
                     self.assertEqual(char, ZWJ)
             self.assertFalse(name.startswith((" ", ".")) or name.endswith((" ", ".")), repr(name))
+
+
+class SharedVectorsTest(unittest.TestCase):
+    """names.py and the page's names.js answer one file of cases alike (docs/PLAN.md 15.4).
+
+    A tone made on the device is named by names.js, with no server to
+    sanitise the name. A rule changed here without its vector, or a vector
+    changed without both implementations, fails one of the two test suites.
+    """
+
+    def setUp(self) -> None:
+        # read_text opens and closes the file itself.
+        self.cases = json.loads(VECTORS.read_text(encoding="ascii"))["sanitise"]
+
+    def test_the_file_holds_the_cases(self) -> None:
+        # Guards the file: an emptied list would pass the test below.
+        self.assertGreaterEqual(len(self.cases), 200)
+        for case in self.cases:
+            self.assertEqual([type(part) for part in case], [str, str], case)
+        raws = [raw for raw, _ in self.cases]
+        self.assertEqual(len(raws), len(set(raws)), "a case is listed twice")
+        # Every ASCII character has its case, so the two can't differ on one.
+        for code in range(128):
+            self.assertIn("a" + chr(code) + "b", raws)
+
+    def test_every_vector(self) -> None:
+        for raw, expected in self.cases:
+            with self.subTest(raw=raw):
+                self.assertEqual(sanitise(raw), expected)
 
 
 class AsciiFallbackTest(unittest.TestCase):
