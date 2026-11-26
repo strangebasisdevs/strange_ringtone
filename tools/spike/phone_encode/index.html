@@ -15,11 +15,23 @@ file written in JavaScript, and offers it to the share sheet. No audio leaves
 the phone and no server takes part.</p>
 
 <p><button id="make" type="button">Make the test tones</button></p>
+
+<h2>A real song</h2>
+<p>The loop is too simple to show what bit rate the encoder really gives.
+Pick an audio file and the page encodes 30 seconds of it four ways: at a
+constant and at a variable rate, at a high and at a low bit rate. The song
+stays on the phone, and the report doesn't name it.</p>
+<p class="field"><label for="song">Audio file</label>
+  <input id="song" type="file" accept="audio/*"></p>
+<p class="field"><label for="song-start">Start at second</label>
+  <input id="song-start" type="number" inputmode="numeric" min="0" step="1" value="30"></p>
+<p><button id="make-song" type="button" disabled>Encode the song</button></p>
+
 <p id="status" role="status"></p>
 
 <ol id="cases"></ol>
 
-<h2>What to check</h2>
+<h2>What to check: the test tones</h2>
 <ol>
   <li>Tap <strong>Make the test tones</strong>. Each tone gets a player:
     does it play to its end? (Each starts with a tenth of a second of
@@ -40,6 +52,21 @@ the phone and no server takes part.</p>
 </ol>
 <p>Afterwards, remove the test tones by swiping left on them in the
 Ringtone list.</p>
+
+<h2>What to check: the song</h2>
+<ol>
+  <li>Pick an audio file with a busy stretch of music, set where the 30
+    seconds start, and tap <strong>Encode the song</strong>.</li>
+  <li>With headphones, play <strong>S1</strong> and <strong>S2</strong>,
+    the two at the high rate. Does either sound worse than the song
+    itself?</li>
+  <li>Play <strong>S3</strong> and <strong>S4</strong>, the two at the low
+    rate. Can you hear a difference from S1 and S2?</li>
+  <li>Share the one you like best and set it as a ringtone: does iOS
+    accept it?</li>
+  <li>Tap <strong>Copy report</strong> and send the report back, with what
+    you heard.</li>
+</ol>
 
 <h2>Report</h2>
 <p><button id="copy" type="button">Copy report</button> <span id="copied" role="status"></span></p>

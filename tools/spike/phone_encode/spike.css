@@ -24,6 +24,21 @@ a.download {
   padding: 0.6rem 1rem;
 }
 
+input {
+  font: inherit;
+  max-width: 100%;
+}
+
+.field label {
+  display: block;
+  font-weight: 600;
+}
+
+#song-start {
+  padding: 0.4rem;
+  width: 6rem;
+}
+
 #cases {
   list-style: none;
   padding: 0;

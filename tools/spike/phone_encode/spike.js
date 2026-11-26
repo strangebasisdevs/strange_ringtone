@@ -1,6 +1,8 @@
 // The phone-encode spike's page: synthesise a loop, encode it with the
 // browser's AudioEncoder, wrap it with m4a.js, and offer the files to the
-// share sheet, with a report of what the encoder did. Nothing is uploaded.
+// share sheet, with a report of what the encoder did. A second check does
+// the same with a stretch of a picked song, to measure the bit rate on real
+// music. Nothing is uploaded.
 //
 // Serve this directory from any HTTPS origin the phone trusts (WebCodecs and
 // Web Share both need a secure context); on a desktop, loopback counts:
@@ -42,7 +44,19 @@ const CHORDS = [
   [98.0, [392.0, 493.88, 587.33, 783.99]],
 ];
 
+// The song check. The loop is too simple to show the rate an encoder really
+// gives (the first phone test asked for 256 kbit/s and got 37), so a stretch
+// of real music is encoded in both rate modes, at the highest rate this
+// encoder takes and at the lowest of BITRATES: the measured rates say
+// whether the mode and the number asked for change anything.
+const SONG_SECONDS = 30;
+const SONG_MAX_BYTES = 200 * 1024 * 1024;
+const RATE_MODES = ["constant", "variable"];
+
 const makeButton = document.getElementById("make");
+const songInput = document.getElementById("song");
+const songStartInput = document.getElementById("song-start");
+const songButton = document.getElementById("make-song");
 const statusLine = document.getElementById("status");
 const caseList = document.getElementById("cases");
 const reportBox = document.getElementById("report");
@@ -94,14 +108,42 @@ function synthesize(seconds) {
       addNote(beat + Math.round(i * 0.25 * SAMPLE_RATE), frequency, 0.4, i % 2 === 0 ? 0.35 : 0.65);
     });
   }
-  // A short fade-out, so the tone doesn't end on a click.
-  const fade = Math.round(0.3 * SAMPLE_RATE);
-  for (let i = 0; i < fade; i += 1) {
-    const gain = i / fade;
-    left[total - 1 - i] *= gain;
-    right[total - 1 - i] *= gain;
-  }
+  fadeEdges([left, right], 0, Math.round(0.3 * SAMPLE_RATE));
   return [left, right];
+}
+
+/** Ramp the first `rise` and the last `fall` samples, so a tone doesn't start or end on a click. */
+function fadeEdges(channels, rise, fall) {
+  for (const channel of channels) {
+    const total = channel.length;
+    for (let i = 0; i < Math.min(rise, total); i += 1) channel[i] *= i / rise;
+    for (let i = 0; i < Math.min(fall, total); i += 1) channel[total - 1 - i] *= i / fall;
+  }
+}
+
+/** Up to SONG_SECONDS of a picked file, from `startSeconds`, as two channels at SAMPLE_RATE. */
+async function loadSong(file, startSeconds) {
+  // An OfflineAudioContext needs no output device, and decodes to its own
+  // rate whatever the file's is.
+  const decoded = await new OfflineAudioContext(CHANNELS, 1, SAMPLE_RATE).decodeAudioData(await file.arrayBuffer());
+  if (decoded.sampleRate !== SAMPLE_RATE) throw new Error(`the song decoded at ${decoded.sampleRate} Hz`);
+  const length = Math.min(SONG_SECONDS * SAMPLE_RATE, decoded.length);
+  if (length < SAMPLE_RATE) throw new Error("that file holds less than a second of audio");
+  const start = Math.min(Math.round(startSeconds * SAMPLE_RATE), decoded.length - length);
+  // Mono goes to both sides; of more than two channels, the first two.
+  const pcm = [0, 1].map((c) => decoded.getChannelData(Math.min(c, decoded.numberOfChannels - 1))
+    .slice(start, start + length));
+  fadeEdges(pcm, Math.round(0.01 * SAMPLE_RATE), Math.round(0.3 * SAMPLE_RATE));
+  let peak = 0;
+  for (const channel of pcm) {
+    for (let i = 0; i < length; i += 1) peak = Math.max(peak, Math.abs(channel[i]));
+  }
+  // The file's name stays out of the report, which gets pasted elsewhere.
+  log(`song: type ${file.type || "unknown"}, ${file.size} bytes, decodes to `
+    + `${(decoded.length / SAMPLE_RATE).toFixed(1)} s, ${decoded.numberOfChannels} ch`);
+  log(`using ${(length / SAMPLE_RATE).toFixed(3)} s from ${(start / SAMPLE_RATE).toFixed(3)} s; `
+    + `peak level ${peak.toFixed(3)}`);
+  return pcm;
 }
 
 /** The first sample louder than ONSET_LEVEL in any channel, or -1. */
@@ -254,6 +296,28 @@ function interpret(encoded, samples) {
   return { frames, priming };
 }
 
+/** The measured rate of raw frames that hold `samples` of audio, logged with how even the frames are. */
+function describeRate(frames, samples, milliseconds) {
+  const sizes = frames.map((frame) => frame.length).sort((a, b) => a - b);
+  const bytes = sizes.reduce((sum, size) => sum + size, 0);
+  const rate = Math.round((bytes * 8) / (samples / SAMPLE_RATE));
+  log(`  encode time: ${Math.round(milliseconds)} ms; frames out: ${frames.length}`);
+  log(`  bytes: ${bytes} (${rate} bit/s measured)`);
+  // A constant rate shows as frames of nearly one size.
+  log(`  frame bytes: smallest ${sizes[0]}, median ${sizes[sizes.length >> 1]}, largest ${sizes[sizes.length - 1]}`);
+  return rate;
+}
+
+/** The frames as a file that skips the priming and presents exactly `samples`, or all there is. */
+function writeTrimmed(frames, priming, samples) {
+  const mediaSamples = frames.length * AAC_FRAME_SAMPLES;
+  const skipped = Math.min(priming, mediaSamples - 1);
+  const presented = Math.min(samples, mediaSamples - skipped);
+  log(`  edit list: skip ${skipped}, present ${presented} of ${mediaSamples} samples`);
+  const bytes = writeM4a({ sampleRate: SAMPLE_RATE, channels: CHANNELS, frames, priming: skipped, samples: presented });
+  return { bytes, presented };
+}
+
 /** Decode a finished file the way the app decodes a picked one, and say where its audio starts. */
 async function describeDecode(bytes, originalOnset) {
   try {
@@ -268,7 +332,7 @@ async function describeDecode(bytes, originalOnset) {
   }
 }
 
-function addCase(spec, bytes, seconds) {
+function addCase(spec, bytes, seconds, detail) {
   const file = new File([bytes], `${spec.name}.m4a`, { type: "audio/mp4" });
   const url = URL.createObjectURL(file);
   objectUrls.push(url);
@@ -277,14 +341,25 @@ function addCase(spec, bytes, seconds) {
   const title = document.createElement("strong");
   title.textContent = file.name;
   const facts = document.createElement("div");
-  facts.textContent = `${seconds.toFixed(3)} s, ${bytes.length} bytes, `
-    + (spec.editList ? "with an edit list" : "no edit list");
+  facts.textContent = `${seconds.toFixed(3)} s, ${bytes.length} bytes, ${detail}`;
   const player = document.createElement("audio");
   player.controls = true;
   player.preload = "metadata";
   player.src = url;
-  player.addEventListener("loadedmetadata", () => log(`${spec.id} player: duration ${player.duration}`));
-  player.addEventListener("error", () => log(`${spec.id} player: ERROR code ${player.error && player.error.code}`));
+  // Resolves once the player has said what it makes of the file, so its line
+  // lands under its own case in the report; a player that says nothing
+  // doesn't hold the run up.
+  const heard = new Promise((resolve) => {
+    player.addEventListener("loadedmetadata", () => {
+      log(`${spec.id} player: duration ${player.duration}`);
+      resolve();
+    });
+    player.addEventListener("error", () => {
+      log(`${spec.id} player: ERROR code ${player.error && player.error.code}`);
+      resolve();
+    });
+    setTimeout(resolve, 3000);
+  });
 
   const actions = document.createElement("div");
   actions.className = "actions";
@@ -322,16 +397,18 @@ function addCase(spec, bytes, seconds) {
   item.append(title, facts, player, actions);
   caseList.append(item);
   log(`  file: ${file.name}, ${bytes.length} bytes, presents ${seconds.toFixed(6)} s, can share: ${canShare}`);
+  return heard;
 }
 
-async function run() {
+/** Clear the last run and start a report; throws where there is no encoder. */
+function startReport(title) {
   for (const url of objectUrls) URL.revokeObjectURL(url);
   objectUrls = [];
   caseList.replaceChildren();
   reportLines.length = 0;
   copiedLine.textContent = "";
 
-  log("Phone encode spike report");
+  log(title);
   log(`when: ${new Date().toISOString()}`);
   log(`user agent: ${navigator.userAgent}`);
   log(`secure context: ${globalThis.isSecureContext}`);
@@ -342,7 +419,10 @@ async function run() {
       ? "This browser has no AudioEncoder. On an iPhone it needs iOS 26 or later."
       : "This page is not in a secure context, where AudioEncoder doesn't exist. Open it over https.");
   }
+}
 
+async function run() {
+  startReport("Phone encode spike report");
   const config = await pickConfig();
 
   // P1 and P2 are one encode in two containers, so encode once per length.
@@ -367,35 +447,95 @@ async function run() {
     let bytes;
     let presented;
     if (spec.editList) {
-      const skipped = Math.min(priming, mediaSamples - 1);
-      presented = Math.min(samples, mediaSamples - skipped);
-      bytes = writeM4a({ sampleRate: SAMPLE_RATE, channels: CHANNELS, frames, priming: skipped, samples: presented });
-      log(`  edit list: skip ${skipped}, present ${presented} of ${mediaSamples} samples`);
+      ({ bytes, presented } = writeTrimmed(frames, priming, samples));
     } else {
       presented = mediaSamples;
       bytes = writeM4a({ sampleRate: SAMPLE_RATE, channels: CHANNELS, frames });
       log(`  no edit list: every one of ${mediaSamples} samples`);
     }
-    addCase(spec, bytes, presented / SAMPLE_RATE);
+    await addCase(spec, bytes, presented / SAMPLE_RATE, spec.editList ? "with an edit list" : "no edit list");
     await describeDecode(bytes, originalOnset);
   }
   log("");
   log("Made every file.");
 }
 
-makeButton.addEventListener("click", async () => {
-  makeButton.disabled = true;
-  try {
-    await run();
-    statusLine.textContent = "Done. Play each tone, then follow the checklist below.";
-  } catch (error) {
-    const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
-    log(`FAILED: ${message}`);
-    statusLine.textContent = `Failed. ${message}`;
-  } finally {
-    makeButton.disabled = false;
+async function runSong() {
+  const file = songInput.files[0];
+  startReport("Phone encode spike report: a real song");
+  if (file.size > SONG_MAX_BYTES) throw new Error("that file is too big for this check");
+  const config = await pickConfig();
+
+  statusLine.textContent = "Decoding the song…";
+  await sleep(20);
+  const asked = Number(songStartInput.value);
+  const pcm = await loadSong(file, Number.isFinite(asked) && asked > 0 ? asked : 0);
+  const samples = pcm[0].length;
+
+  const lowest = BITRATES[BITRATES.length - 1];
+  const rates = config.bitrate === lowest ? [lowest] : [config.bitrate, lowest];
+  let number = 0;
+  let made = 0;
+  for (const bitrate of rates) {
+    for (const bitrateMode of RATE_MODES) {
+      number += 1;
+      const spec = { id: `S${number}`, name: `S${number} song ${bitrateMode} ${bitrate / 1000}` };
+      log("");
+      log(`${spec.id}: ${bitrateMode} rate, ${bitrate} bit/s asked`);
+      statusLine.textContent = `Encoding ${spec.id}…`;
+      await sleep(20);
+      // One mode failing is a finding, not the end of the check.
+      try {
+        const caseConfig = { ...config, bitrate, bitrateMode };
+        const support = await AudioEncoder.isConfigSupported(caseConfig);
+        const echoed = support.config || {};
+        log(`  supported: ${support.supported}; the encoder's copy of the config has bitrateMode `
+          + `${echoed.bitrateMode}, bitrate ${echoed.bitrate}`);
+        if (!support.supported) continue;
+        const encoded = await encode(pcm, caseConfig);
+        const { frames, priming } = interpret(encoded, samples);
+        const rate = describeRate(frames, samples, encoded.milliseconds);
+        const { bytes, presented } = writeTrimmed(frames, priming, samples);
+        await addCase(spec, bytes, presented / SAMPLE_RATE,
+          `${Math.round(rate / 1000)} kbit/s measured, ${bitrate / 1000} asked, ${bitrateMode} rate`);
+        made += 1;
+      } catch (error) {
+        log(`  FAILED: ${error instanceof Error ? `${error.name}: ${error.message}` : String(error)}`);
+      }
+    }
   }
-});
+  log("");
+  log(`Made ${made} of ${number} files.`);
+  if (made === 0) throw new Error("no encode of the song worked");
+}
+
+/** Both checks share the list and the report, so one runs at a time; the song's needs a file. */
+function setBusy(busy) {
+  makeButton.disabled = busy;
+  songButton.disabled = busy || songInput.files.length === 0;
+}
+
+function wire(button, task, doneLine) {
+  button.addEventListener("click", async () => {
+    setBusy(true);
+    try {
+      await task();
+      statusLine.textContent = doneLine;
+    } catch (error) {
+      const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+      log(`FAILED: ${message}`);
+      statusLine.textContent = `Failed. ${message}`;
+    } finally {
+      setBusy(false);
+    }
+  });
+}
+
+wire(makeButton, run, "Done. Play each tone, then follow the checklist below.");
+wire(songButton, runSong, "Done. Listen to each file, then follow the song's checklist below.");
+songInput.addEventListener("change", () => setBusy(false));
+// A reload can keep the picked file; the button follows it.
+setBusy(false);
 
 copyButton.addEventListener("click", () => {
   const text = reportLines.join("\n");
