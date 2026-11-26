@@ -270,6 +270,7 @@ yourself, and nothing here tests them.
 | `compose.example.yaml` | A hardened Compose example, with no published ports, the fetcher and its runner on internal networks only and the forwarder the runner's one way out |
 | `.dockerignore` | An allowlist: only `core/` and `fetcher/` reach the build context the two images share |
 | `tools/spike/phase0.py` | Generates the test tones that established the share sheet's rules |
+| `tools/spike/phone_encode/` | A spike, not part of the app: a static page that encodes a test tone, or 30 seconds of a picked audio file, to AAC with the browser's own `AudioEncoder`, wraps it in an M4A file written in JavaScript (`m4a.js`) and offers it to the share sheet, to learn whether a phone can make a tone iOS accepts with no server. Serve the directory over HTTPS, or on loopback for a desktop browser; the command is at the top of `spike.js` |
 | `tools/dev_fetch_stack.py` | An offline development stack on loopback: the core, the fetcher, its runner with a stub yt-dlp and a stub window program, and one origin, for trying the YouTube flow without touching YouTube |
 | `scripts/` | Stdlib checks that CI runs: the PR title and contract checks on pull requests, the weekly FFmpeg release watch, and the publish workflow's check of a release's tag |
 | `release-please-config.json`, `.release-please-manifest.json` | What release-please reads to keep the release pull request: one package, and the last released version |
